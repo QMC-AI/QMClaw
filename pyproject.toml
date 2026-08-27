@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qmclaw"
+version = "0.1.0"
+description = "A scalable general-purpose framework for quantum measurement and control, providing reusable instruction bundles centered on SKILL.md."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "QMClaw Contributors" },
+]
+keywords = ["quantum", "qubit", "calibration", "measurement", "mcp", "skills"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+# Core dependencies — install with: pip install .
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# Data analysis & fitting: pip install .[analysis]
+analysis = [
+    "scipy>=1.10",
+]
+# Plotting: pip install .[plot]
+plot = [
+    "matplotlib>=3.9",
+    "plotly>=6.4.0",
+    "opencv-python-headless>=4.12",
+]
+# MCP protocol support: pip install .[mcp]
+mcp = [
+    "swiftmcp",      # or "mcp>=1.0" / "langchain-mcp-adapters>=0.2.1"
+]
+# All features: pip install .[full]
+full = [
+    "qmclaw[analysis,plot,mcp]",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/YOUR_USERNAME/qmclaw-skills"
+"Repository" = "https://github.com/YOUR_USERNAME/qmclaw-skills"
+"Bug Tracker" = "https://github.com/YOUR_USERNAME/qmclaw-skills/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["new_ctrl*", "new_templates*"]
+exclude = ["tests*", "docs*", "assets*", "skills*", "tmp*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.md", "*.json"]

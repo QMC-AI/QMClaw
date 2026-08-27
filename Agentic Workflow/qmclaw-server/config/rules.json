@@ -1,0 +1,73 @@
+{
+  "rules": [
+    {
+      "name": "snr_low",
+      "condition": "SNR < 1.5",
+      "symptom": "信噪比偏低，读出保真度不足",
+      "recommendations": [
+        {"fn": "sq.iqraw", "reason": "重新测量评估 SNR", "priority": 1},
+        {"fn": "sq.s21", "reason": "检查腔体耦合状态", "priority": 2}
+      ]
+    },
+    {
+      "name": "snr_very_low",
+      "condition": "SNR < 1.0",
+      "symptom": "信噪比非常低，读出几乎无法区分 |0⟩ 和 |1⟩",
+      "recommendations": [
+        {"fn": "sq.iqraw", "reason": "重新测量确认 SNR 数值", "priority": 1},
+        {"fn": "sq.single_shot", "reason": "单发测量优化读出方案", "priority": 2}
+      ]
+    },
+    {
+      "name": "fidelity_low",
+      "condition": "F0 < 0.9 or F1 < 0.9",
+      "symptom": "读出保真度偏低",
+      "recommendations": [
+        {"fn": "sq.iqraw", "reason": "重新测量评估读出保真度", "priority": 1},
+        {"fn": "sq.s21", "reason": "检查腔体频率是否偏移", "priority": 2}
+      ]
+    },
+    {
+      "name": "t1_short",
+      "condition": "T1 < 20",
+      "symptom": "弛豫时间偏短，量子比特退相干快",
+      "recommendations": [
+        {"fn": "sq.t1", "reason": "详细测量 T1 时间", "priority": 1},
+        {"fn": "sq.ramsey_df", "reason": "测量 T2 退相干时间", "priority": 2}
+      ]
+    },
+    {
+      "name": "t2_short",
+      "condition": "T2 < 200",
+      "symptom": "退相干时间偏短，门保真度受限",
+      "recommendations": [
+        {"fn": "sq.ramsey_df", "reason": "详细诊断 T2* 时间", "priority": 1},
+        {"fn": "sq.piamp", "reason": "检查 π 脉冲是否校准准确", "priority": 2}
+      ]
+    },
+    {
+      "name": "pi_amp_uncertain",
+      "condition": "true",
+      "symptom": "π 脉冲幅度需要校准",
+      "recommendations": [
+        {"fn": "sq.piamp", "reason": "校准 π 脉冲幅度", "priority": 1}
+      ]
+    },
+    {
+      "name": "gate_fidelity_low",
+      "condition": "true",
+      "symptom": "单比特门保真度需要评估",
+      "recommendations": [
+        {"fn": "sq.xeb", "reason": "测量单比特门保真度", "priority": 1}
+      ]
+    },
+    {
+      "name": "cavity_detuned",
+      "condition": "true",
+      "symptom": "腔体频率需要验证",
+      "recommendations": [
+        {"fn": "sq.s21", "reason": "测量腔体透射谱", "priority": 1}
+      ]
+    }
+  ]
+}

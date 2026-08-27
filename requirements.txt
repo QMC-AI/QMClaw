@@ -1,0 +1,15 @@
+# Core dependencies
+numpy>=1.26
+
+# Data analysis & fitting (pip install -r requirements.txt --extras analysis)
+scipy>=1.10
+
+# Plotting (optional: pip install -r requirements.txt --extras plot)
+matplotlib>=3.9
+plotly>=6.4.0
+opencv-python-headless>=4.12
+
+# MCP protocol support (optional)
+# swiftmcp                  # new_ctrl MCP service framework
+# mcp>=1.0                  # official MCP Python SDK (alternative)
+# langchain-mcp-adapters>=0.2.1  # LangChain MCP adapters (alternative)

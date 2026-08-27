@@ -1,0 +1,154 @@
+{
+  "models": [
+    {
+      "id": "model_default_001",
+      "name": "GPT-4o",
+      "provider": "openai",
+      "modelId": "gpt-4o",
+      "enabled": true,
+      "capabilities": [
+        "text",
+        "vision"
+      ],
+      "config": {
+        "temperature": 0.3,
+        "maxTokens": 500
+      },
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "id": "model_default_002",
+      "name": "GPT-4o Mini",
+      "provider": "openai",
+      "modelId": "gpt-4o-mini",
+      "enabled": true,
+      "capabilities": [
+        "text",
+        "vision"
+      ],
+      "config": {
+        "temperature": 0.3,
+        "maxTokens": 500
+      },
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "id": "model_default_003",
+      "name": "GPT-4 Turbo",
+      "provider": "openai",
+      "modelId": "gpt-4-turbo",
+      "enabled": true,
+      "capabilities": [
+        "text",
+        "vision"
+      ],
+      "config": {
+        "temperature": 0.3,
+        "maxTokens": 500
+      },
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "id": "model_default_004",
+      "name": "Claude 3.5 Sonnet",
+      "provider": "anthropic",
+      "modelId": "claude-3-5-sonnet-20241022",
+      "enabled": true,
+      "capabilities": [
+        "text",
+        "vision"
+      ],
+      "config": {
+        "temperature": 0.3,
+        "maxTokens": 500
+      },
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "id": "model_default_005",
+      "name": "DeepSeek Chat",
+      "provider": "deepseek",
+      "modelId": "deepseek-chat",
+      "enabled": true,
+      "capabilities": [
+        "text"
+      ],
+      "config": {
+        "temperature": 0.3,
+        "maxTokens": 500
+      },
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z"
+    },
+    {
+      "name": "MiniMax M2.7",
+      "provider": "minimax",
+      "modelId": "MiniMax-M2.7",
+      "baseUrl": "https://api.minimaxi.com/",
+      "enabled": true,
+      "capabilities": [
+        "text"
+      ],
+      "config": {
+        "temperature": 0.3,
+        "maxTokens": 500,
+        "systemPrompt": ""
+      },
+      "id": "model_default_006",
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2026-08-24T09:36:12.751Z"
+    },
+    {
+      "name": "MiniMax Text-01",
+      "provider": "minimax",
+      "modelId": "MiniMax-Text-01",
+      "enabled": true,
+      "capabilities": [
+        "text"
+      ],
+      "config": {
+        "temperature": 0.3,
+        "maxTokens": 500
+      },
+      "id": "model_1787551340750_0",
+      "createdAt": "2026-08-24T06:02:20.750Z",
+      "updatedAt": "2026-08-24T06:02:20.750Z"
+    },
+    {
+      "name": "MiniMax ABAB6.5S",
+      "provider": "minimax",
+      "modelId": "abab6.5s-chat",
+      "enabled": true,
+      "capabilities": [
+        "text"
+      ],
+      "config": {
+        "temperature": 0.3,
+        "maxTokens": 500
+      },
+      "id": "model_1787551340750_1",
+      "createdAt": "2026-08-24T06:02:20.750Z",
+      "updatedAt": "2026-08-24T06:02:20.750Z"
+    },
+    {
+      "name": "MiniMax ABAB6",
+      "provider": "minimax",
+      "modelId": "abab6-chat",
+      "enabled": true,
+      "capabilities": [
+        "text"
+      ],
+      "config": {
+        "temperature": 0.3,
+        "maxTokens": 500
+      },
+      "id": "model_1787551340750_2",
+      "createdAt": "2026-08-24T06:02:20.750Z",
+      "updatedAt": "2026-08-24T06:02:20.750Z"
+    }
+  ]
+}
