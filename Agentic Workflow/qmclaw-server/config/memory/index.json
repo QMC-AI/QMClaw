@@ -1,0 +1,33 @@
+{
+  "episodes": [
+    {
+      "id": "ep_20260903_200223_2b691ed4",
+      "timestamp": "2026-09-03T20:02:23.057327",
+      "qubit": null,
+      "status": "success",
+      "task_preview": "??25_7???iqraw"
+    },
+    {
+      "id": "ep_20260903_170551_22c337e4",
+      "timestamp": "2026-09-03T17:05:51.269415",
+      "qubit": null,
+      "status": "success",
+      "task_preview": "瀵筿25_7鍋氫竴涓猧qraw瀹為獙"
+    },
+    {
+      "id": "ep_20260903_152351_efe4c851",
+      "timestamp": "2026-09-03T15:23:51.131069",
+      "qubit": null,
+      "status": "success",
+      "task_preview": "鍦ㄥ悧"
+    }
+  ],
+  "skills": [
+    {
+      "id": "skill_20260903_4a9ff7",
+      "name": "任务输入验证与编码标准化",
+      "status": "active"
+    }
+  ],
+  "last_updated": "2026-09-03T20:02:33.847441"
+}

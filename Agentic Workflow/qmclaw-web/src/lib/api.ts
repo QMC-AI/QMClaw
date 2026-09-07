@@ -31,6 +31,9 @@ export interface ExperimentConfig {
   description: string;
   function: string;
   defaultPlotCommand: string;
+  defaultCommand?: string;
+  defaultAnalysisCommand?: string;
+  metricsToExtract?: string[];
   [key: string]: unknown;
 }
 
@@ -586,6 +589,109 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
+  /**
+   * Streaming agent chat via SSE.
+   * Returns an EventSource-compatible response.
+   * Use with fetch + ReadableStream for client-side SSE parsing.
+   */
+  agentChatStream: async function* (
+    message: string,
+    mode = "react",
+    context?: Record<string, unknown>
+  ): AsyncGenerator<{ type: string; data: any }> {
+    const response = await fetch(`${API_BASE}/api/agent/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, mode, context }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("No response body");
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("event: ")) {
+            const eventType = line.slice(7).trim();
+            // Wait for data line
+            const dataLineIdx = lines.indexOf(line) + 1;
+            if (dataLineIdx < lines.length && lines[dataLineIdx].startsWith("data: ")) {
+              const data = JSON.parse(lines[dataLineIdx].slice(6));
+              yield { type: eventType, data };
+            }
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  },
+
+  // Simpler SSE wrapper that parses the complete SSE response
+  agentChatSSE: async (message: string, mode = "react", context?: Record<string, unknown>) => {
+    const response = await fetch(`${API_BASE}/api/agent/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, mode, context }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const text = await response.text();
+    const events: { type: string; data: any }[] = [];
+
+    // Parse SSE format properly: event: TYPE\ndata: JSON\n\n
+    // Events are separated by \n\n, and JSON data can span multiple lines
+    const eventBlocks = text.split(/\n\n(?=event:)/);
+
+    for (const block of eventBlocks) {
+      if (!block.trim()) continue;
+
+      const lines = block.split("\n");
+      let eventType = "";
+      let jsonData = "";
+
+      for (const line of lines) {
+        if (line.startsWith("event: ")) {
+          eventType = line.slice(7).trim();
+        } else if (line.startsWith("data: ")) {
+          jsonData = line.slice(6).trim();
+        }
+      }
+
+      // Handle multi-line JSON by collecting all data: lines
+      const allDataLines = block.match(/^data: (.+)$/gm) || [];
+      jsonData = allDataLines.map(l => l.slice(6)).join("");
+
+      if (eventType && jsonData) {
+        try {
+          const data = JSON.parse(jsonData);
+          events.push({ type: eventType, data });
+        } catch (e) {
+          console.warn("Failed to parse SSE data:", jsonData);
+        }
+      }
+    }
+
+    return events;
+  },
+
   agentGetModes: async () => {
     const res = await fetch(`${API_BASE}/api/agent/modes`);
     return res.json();
@@ -593,6 +699,66 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
 
   agentResetSession: async () => {
     const res = await fetch(`${API_BASE}/api/agent/reset`, { method: "POST" });
+    return res.json();
+  },
+
+  // ── Memory & Reflection ──────────────────────────────────────────────────
+
+  memoryListEpisodes: async (limit = 50, qubit?: string, status?: string) => {
+    const res = await fetch(`${API_BASE}/api/agent/memory/episodes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit, qubit, status }),
+    });
+    return res.json();
+  },
+
+  memoryGetEpisode: async (episodeId: string) => {
+    const res = await fetch(`${API_BASE}/api/agent/memory/episodes/${episodeId}`, {
+      method: "GET",
+    });
+    return res.json();
+  },
+
+  memoryArchiveEpisode: async (episodeId: string) => {
+    const res = await fetch(`${API_BASE}/api/agent/memory/episodes/${episodeId}`, {
+      method: "DELETE",
+    });
+    return res.json();
+  },
+
+  memoryListSkills: async () => {
+    const res = await fetch(`${API_BASE}/api/agent/memory/skills`, { method: "GET" });
+    return res.json();
+  },
+
+  memoryDeleteSkill: async (skillId: string) => {
+    const res = await fetch(`${API_BASE}/api/agent/memory/skills/${skillId}`, {
+      method: "DELETE",
+    });
+    return res.json();
+  },
+
+  memoryStats: async () => {
+    const res = await fetch(`${API_BASE}/api/agent/memory/stats`, { method: "GET" });
+    return res.json();
+  },
+
+  memoryRecall: async (task: string, qubit?: string) => {
+    const res = await fetch(`${API_BASE}/api/agent/memory/recall`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task, qubit }),
+    });
+    return res.json();
+  },
+
+  memoryReflect: async (episodeId?: string, task?: string, resultData?: any) => {
+    const res = await fetch(`${API_BASE}/api/agent/memory/reflect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: episodeId, task, result_data: resultData }),
+    });
     return res.json();
   },
 

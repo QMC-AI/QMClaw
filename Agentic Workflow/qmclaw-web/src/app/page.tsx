@@ -15,15 +15,14 @@ import AnalysisCommandEditor from "../components/AnalysisCommandEditor";
 import JobManager from "../components/JobManager";
 import WorkflowDesigner from "../components/WorkflowDesigner";
 import { CompactSessionManager } from "../components/SessionManager";
-import DatasetBrowser from "../components/DatasetBrowser";
-import ServiceControlPanel from "../components/ServiceControlPanel";
 import ImageClassificationPanel from "../components/ImageClassificationPanel";
 import AgentChatPanel from "../components/AgentChatPanel";
-import AgentToolsPanel from "../components/AgentToolsPanel";
 import QubitParamsPanel from "../components/QubitParamsPanel";
 import ModelRegistry from "../components/ModelRegistry";
 import ExperimentConfigs from "../components/ExperimentConfigs";
 import { useModelStore } from "../store/modelStore";
+import ChatHistorySidebar from "../components/ChatHistorySidebar";
+import WorkflowHistorySidebar from "../components/WorkflowHistorySidebar";
 
 // Plots directory (must match Express server)
 // Uses relative path from project root, or PLOTS_DIR env var
@@ -110,7 +109,8 @@ function saveArray(key: string, value: string[]) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ }
 }
 
-type Tab = "experiments" | "jobs" | "workflow" | "services" | "images" | "agent" | "agent-tools";
+// Tab: experiments, workflow, agent, images (jobs/services/agent-tools/memory 作为从属)
+type Tab = "experiments" | "workflow" | "agent" | "images";
 type ExpType = "spectroscopy" | "s21" | "iqraw" | "t1" | "xeb" | "ramsey" | "piamp" | "s21_dis" | "allxy" | "single_shot" | "pulsed_spec" | "swap" | "drag_calibrate";
 
 // ── Default values (used for SSR and fallback) ────────────────────────────────
@@ -149,6 +149,8 @@ export default function Dashboard() {
   const [qubits, setQubits] = useState<string[]>(defaultQubits);
   const [selectedQubit, setSelectedQubitState] = useState<string>(defaultSelectedQubit);
   const [newQubitName, setNewQubitName] = useState<string>("");
+  const [qubitSearch, setQubitSearch] = useState<string>("");
+  const filteredQubits = qubits.filter(q => q.toLowerCase().includes(qubitSearch.toLowerCase()));
 
   // Qubit params panel state
   const [paramsQubit, setParamsQubit] = useState<string | null>(null);
@@ -165,6 +167,8 @@ export default function Dashboard() {
     description: string;
     function: string;
     defaultPlotCommand: string;
+    defaultAnalysisCommand?: string;
+    metricsToExtract?: string[];
   }>>({});
 
   // Load experiment configs from backend on mount
@@ -530,6 +534,27 @@ export default function Dashboard() {
     }
   };
 
+  // ── Save run command to config ─────────────────────────────────────────────
+  const handleSaveRunCommand = async (expType: string, command: string) => {
+    try {
+      await api.updateExperimentConfig(expType, {
+        defaultCommand: command,
+      });
+      // Reload configs to reflect the change
+      const data = await api.getExperimentConfigs();
+      if (data.success && data.configs) {
+        const configs = data.configs as unknown as Record<string, Record<string, ExperimentConfig>>;
+        if (configs.experiments) {
+          setExperimentConfigs(configs.experiments);
+        }
+      }
+      addLog(`✅ Run command for ${expType} saved`);
+    } catch (e: any) {
+      addLog(`❌ Failed to save: ${e.message}`, true);
+      throw e;
+    }
+  };
+
   // ── Save analysis command to config ─────────────────────────────────────
   const handleSaveAnalysisCommand = async (expType: string, analysisCommand: string, metrics: string[]) => {
     try {
@@ -636,102 +661,183 @@ export default function Dashboard() {
       {/* Body */}
       <div style={{ display: "grid", gridTemplateColumns: "220px 1fr 280px", flex: 1, overflow: "hidden" }}>
 
-        {/* ── Qubit sidebar ── */}
+        {/* ── Left sidebar: dynamic content based on active tab ── */}
         <aside style={{ borderRight: "1px solid #1e293b", display: "flex", flexDirection: "column", overflow: "hidden" }}>
-          <div style={{ padding: "0.75rem", flexShrink: 0 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" }}>
-              <span style={{ fontSize: "0.7rem", fontWeight: 600, color: "#475569", letterSpacing: "0.1em" }}>QUBITS</span>
+
+          {/* Tab-specific content (top area) */}
+          {activeTab === "experiments" && (
+            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", padding: "0.5rem" }}>
+              <JobManager
+                currentJobId={jobId}
+                onJobSelect={(id) => { setJobId(id); setActiveTab("experiments"); }}
+              />
+            </div>
+          )}
+
+          {activeTab === "workflow" && (
+            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", padding: "0.5rem" }}>
+              <WorkflowHistorySidebar
+                onSelectWorkflow={(id) => { console.log("Select workflow:", id); }}
+              />
+            </div>
+          )}
+
+          {activeTab === "agent" && (
+            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", padding: "0.5rem" }}>
+              <ChatHistorySidebar
+                currentSessionId={""}
+                onSelectSession={(id) => { console.log("Select session:", id); }}
+                onNewSession={() => { console.log("New session"); }}
+              />
+            </div>
+          )}
+
+          {activeTab === "images" && (
+            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", padding: "0.5rem" }}>
+              {/* Images tab doesn't need sidebar content */}
+            </div>
+          )}
+
+          {/* Compact Qubit selector (bottom, fixed height) - not for images tab */}
+          {activeTab !== "images" && (
+          <div style={{
+            borderTop: "1px solid #1e293b",
+            padding: "0.5rem",
+            background: "#0a0f1a",
+            flexShrink: 0,
+          }}>
+            {/* Qubit selector header with search */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.35rem" }}>
+              <span style={{ fontSize: "0.65rem", fontWeight: 600, color: "#475569", letterSpacing: "0.1em" }}>QUBIT</span>
               <button
                 onClick={loadQubits}
-                title="Reload qubits from current session"
+                title="Reload qubits"
                 style={{
-                  padding: "0.15rem 0.4rem",
+                  padding: "0.1rem 0.3rem",
                   background: "transparent", border: "1px solid #334155",
                   borderRadius: "0.2rem", color: "#64748b", cursor: "pointer",
-                  fontSize: "0.6rem",
+                  fontSize: "0.55rem",
                 }}
               >
                 ↻
               </button>
             </div>
-            <div style={{ overflow: "auto", maxHeight: "calc(100vh - 220px)", marginBottom: "0.5rem" }}>
-              {qubits.length === 0 && !flaskOk && (
-                <div style={{ padding: "0.5rem", color: "#475569", fontSize: "0.7rem", textAlign: "center" }}>
-                  Loading qubits...
-                </div>
-              )}
-              {qubits.length === 0 && flaskOk && (
-                <div style={{ padding: "0.5rem", color: "#f59e0b", fontSize: "0.7rem", textAlign: "center" }}>
-                  No qubits found.<br/>Switch session or add manually.
-                </div>
-              )}
-              {qubits.map((q) => (
-                <div key={q} style={{ display: "flex", alignItems: "center", gap: "0.25rem", marginBottom: "0.25rem" }}>
-                  <button
-                    onClick={() => setSelectedQubit(q)}
-                    style={{
-                      flex: 1, padding: "0.5rem 0.5rem", borderRadius: "0.375rem",
-                      border: "1px solid",
-                      borderColor: selectedQubit === q ? "#38bdf8" : "#1e293b",
-                      background: selectedQubit === q ? "#1e3a5f" : "#0f172a",
-                      color: selectedQubit === q ? "#38bdf8" : "#64748b",
-                      cursor: "pointer", textAlign: "left",
-                      fontFamily: "monospace", fontSize: "0.75rem",
-                    }}
-                  >
-                    {q}
-                  </button>
-                  <button
-                    onClick={() => setParamsQubit(q)}
-                    title="View/edit parameters"
-                    style={{
-                      padding: "0.2rem 0.35rem", borderRadius: "0.25rem",
-                      border: "1px solid #334155", background: "#1e293b",
-                      color: "#6366f1", cursor: "pointer", fontSize: "0.7rem",
-                      flexShrink: 0,
-                    }}
-                  >
-                    ⚙
-                  </button>
-                  <button
-                    onClick={() => removeQubit(q)}
-                    title="Remove qubit"
-                    style={{
-                      padding: "0.2rem 0.35rem", borderRadius: "0.25rem",
-                      border: "1px solid #334155", background: "#1e293b",
-                      color: "#64748b", cursor: "pointer", fontSize: "0.6rem",
-                      flexShrink: 0,
-                    }}
-                  >
-                    ✕
-                  </button>
-                </div>
-              ))}
+
+            {/* Search input */}
+            <input
+              value={qubitSearch}
+              onChange={(e) => setQubitSearch(e.target.value)}
+              placeholder="🔍 Search qubit..."
+              style={{
+                width: "100%", padding: "0.3rem 0.4rem", marginBottom: "0.35rem",
+                background: "#1e293b", color: "#e2e8f0",
+                border: "1px solid #334155", borderRadius: "0.25rem",
+                fontFamily: "monospace", fontSize: "0.7rem",
+                boxSizing: "border-box",
+              }}
+            />
+
+            {/* Selected qubit display */}
+            <div style={{
+              padding: "0.35rem 0.5rem", marginBottom: "0.35rem",
+              background: selectedQubit ? "#1e3a5f" : "#1e293b",
+              border: "1px solid", borderColor: selectedQubit ? "#38bdf8" : "#334155",
+              borderRadius: "0.25rem",
+              fontFamily: "monospace", fontSize: "0.75rem",
+              color: selectedQubit ? "#38bdf8" : "#64748b",
+              textAlign: "center",
+            }}>
+              {selectedQubit || "Select qubit"}
             </div>
-            <div style={{ display: "flex", gap: "0.25rem" }}>
+
+            {/* Qubit grid (filtered) */}
+            <div style={{ overflow: "auto", maxHeight: "80px", marginBottom: "0.35rem" }}>
+              {filteredQubits.length === 0 && qubitSearch && (
+                <div style={{ padding: "0.25rem", color: "#475569", fontSize: "0.65rem", textAlign: "center" }}>
+                  No match
+                </div>
+              )}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.2rem" }}>
+                {filteredQubits.slice(0, 12).map((q) => (
+                  <div key={q} style={{ display: "flex", alignItems: "center", gap: "0.15rem" }}>
+                    <button
+                      onClick={() => setSelectedQubit(q)}
+                      style={{
+                        padding: "0.2rem 0.4rem",
+                        borderRadius: "0.2rem",
+                        border: "1px solid",
+                        borderColor: selectedQubit === q ? "#38bdf8" : "#1e293b",
+                        background: selectedQubit === q ? "#1e3a5f" : "#0f172a",
+                        color: selectedQubit === q ? "#38bdf8" : "#64748b",
+                        cursor: "pointer",
+                        fontFamily: "monospace", fontSize: "0.6rem",
+                      }}
+                    >
+                      {q}
+                    </button>
+                    <button
+                      onClick={() => setParamsQubit(q)}
+                      title="Parameters"
+                      style={{
+                        padding: "0.15rem 0.25rem",
+                        borderRadius: "0.2rem",
+                        border: "1px solid #334155",
+                        background: "#1e293b",
+                        color: "#6366f1",
+                        cursor: "pointer",
+                        fontSize: "0.6rem",
+                        flexShrink: 0,
+                      }}
+                    >
+                      ⚙
+                    </button>
+                    <button
+                      onClick={() => removeQubit(q)}
+                      title="Remove"
+                      style={{
+                        padding: "0.15rem 0.25rem",
+                        borderRadius: "0.2rem",
+                        border: "1px solid #334155",
+                        background: "#1e293b",
+                        color: "#64748b",
+                        cursor: "pointer",
+                        fontSize: "0.6rem",
+                        flexShrink: 0,
+                      }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Add qubit input */}
+            <div style={{ display: "flex", gap: "0.2rem" }}>
               <input
                 value={newQubitName}
                 onChange={(e) => setNewQubitName(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && addQubit()}
-                placeholder="q3ld6..."
+                placeholder="Add..."
                 style={{
-                  flex: 1, padding: "0.35rem 0.5rem",
+                  flex: 1, padding: "0.2rem 0.3rem",
                   background: "#1e293b", color: "#e2e8f0",
-                  border: "1px solid #334155", borderRadius: "0.25rem",
-                  fontFamily: "monospace", fontSize: "0.7rem",
+                  border: "1px solid #334155", borderRadius: "0.2rem",
+                  fontFamily: "monospace", fontSize: "0.65rem",
                   minWidth: 0,
                 }}
               />
               <button onClick={addQubit} style={{
-                padding: "0.35rem 0.5rem", borderRadius: "0.25rem",
+                padding: "0.2rem 0.35rem", borderRadius: "0.2rem",
                 border: "1px solid #334155", background: "#1e3a5f",
-                color: "#38bdf8", cursor: "pointer", fontSize: "0.7rem",
+                color: "#38bdf8", cursor: "pointer", fontSize: "0.65rem",
                 flexShrink: 0,
               }}>
                 +
               </button>
             </div>
           </div>
+          )}  {/* End of Qubit selector conditional */}
         </aside>
 
         {/* ── Main content ── */}
@@ -739,7 +845,7 @@ export default function Dashboard() {
 
           {/* Tab bar */}
           <div style={{ display: "flex", gap: "0.5rem", flexShrink: 0 }}>
-            {(["experiments", "jobs", "workflow", "services", "images", "agent", "agent-tools"] as Tab[]).map((t) => (
+            {(["experiments", "workflow", "agent", "images"] as Tab[]).map((t) => (
               <button key={t} onClick={() => setActiveTab(t)} style={{
                 padding: "0.4rem 1rem", borderRadius: "0.375rem", border: "none",
                 background: activeTab === t ? "#38bdf8" : "#1e293b",
@@ -794,7 +900,9 @@ export default function Dashboard() {
               <EditableCommand
                 qubit={selectedQubit}
                 expType={selectedExp}
+                initialCommand={experimentConfigs[selectedExp]?.defaultPlotCommand || ""}
                 onRun={(cmd) => runCustom(cmd)}
+                onSave={(cmd) => handleSaveRunCommand(selectedExp, cmd)}
                 disabled={running}
               />
 
@@ -1056,40 +1164,6 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* JOBS TAB — DataVault history + Recent Jobs (side by side) */}
-          {activeTab === "jobs" && (
-            <div style={{ display: "flex", gap: "0.75rem", flex: 1, overflow: "hidden" }}>
-
-              {/* DataVault browser (left half, fills full height) */}
-              <DatasetBrowser />
-
-              {/* Recent jobs (right half) */}
-              <div style={{
-                flex: 1, border: "1px solid #1e293b", borderRadius: "0.5rem",
-                background: "#0a0f1a", overflow: "hidden",
-                display: "flex", flexDirection: "column",
-              }}>
-                <div style={{
-                  padding: "0.5rem 0.75rem",
-                  fontSize: "0.7rem", fontWeight: 600,
-                  color: "#475569", letterSpacing: "0.1em",
-                  borderBottom: "1px solid #1e293b",
-                  background: "#0f172a",
-                  flexShrink: 0,
-                }}>
-                  📋 RECENT JOBS
-                </div>
-                <div style={{ flex: 1, overflow: "auto" }}>
-                  <JobManager
-                    currentJobId={jobId}
-                    onJobSelect={(id) => { setJobId(id); setActiveTab("experiments"); }}
-                  />
-                </div>
-              </div>
-
-            </div>
-          )}
-
           {/* WORKFLOW TAB */}
           {activeTab === "workflow" && (
             <div style={{ flex: 1, overflow: "hidden" }}>
@@ -1098,10 +1172,6 @@ export default function Dashboard() {
           )}
 
           {/* SERVICES TAB */}
-          {activeTab === "services" && (
-            <ServiceControlPanel />
-          )}
-
           {/* IMAGES TAB */}
           {activeTab === "images" && (
             <ImageClassificationPanel />
@@ -1112,10 +1182,6 @@ export default function Dashboard() {
             <AgentChatPanel />
           )}
 
-          {/* AGENT-TOOLS TAB */}
-          {activeTab === "agent-tools" && (
-            <AgentToolsPanel />
-          )}
         </main>
 
         {/* ── Log panel ── */}

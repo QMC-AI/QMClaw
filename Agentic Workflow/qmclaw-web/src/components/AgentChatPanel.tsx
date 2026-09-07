@@ -2,7 +2,7 @@
 
 /**
  * Quantum Control Agent Chat Panel
- * Natural language interface for quantum measurement and control tasks
+ * Natural language interface with progress updates
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -18,18 +18,20 @@ interface AgentStep {
   retried?: boolean;
 }
 
-interface AgentResult {
-  response?: string;
-  steps?: AgentStep[];
-  results?: Record<string, number>;
-  charts?: string[];
-  error?: string;
-}
-
 interface ChatMessage {
   role: "user" | "agent";
   content: string;
-  result?: AgentResult;
+  steps?: AgentStep[];
+  results?: Record<string, number>;
+  charts?: string[];
+  reflectionReport?: string;
+  memoryContext?: {
+    relevantSkills?: any[];
+    recentEpisodes?: any[];
+  };
+  error?: string;
+  status?: "pending" | "running" | "done" | "error";
+  progress?: string;  // Current progress description
 }
 
 const AGENT_MODES = [
@@ -65,40 +67,156 @@ export default function AgentChatPanel() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  const updateMessage = useCallback((index: number, update: Partial<ChatMessage>) => {
+    setMessages(prev => {
+      const newMessages = [...prev];
+      if (newMessages[index]) {
+        newMessages[index] = { ...newMessages[index], ...update };
+      }
+      return newMessages;
+    });
+  }, []);
+
   const handleSend = useCallback(async () => {
     if (!input.trim() || running) return;
     const userMsg = input.trim();
     setInput("");
-    setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
+
+    // Add user message
+    setMessages(prev => [...prev, { role: "user", content: userMsg }]);
+
+    // Add placeholder agent message
+    setMessages(prev => [
+      ...prev,
+      {
+        role: "agent",
+        content: "⏳ 正在启动任务...",
+        status: "pending",
+        steps: [],
+      },
+    ]);
+
     setRunning(true);
 
     try {
-      const result = await api.agentChat(
-        userMsg,
-        mode,
-        { model_id: selectedModel }
-      ) as AgentResult & { error?: string };
+      const msgIndex = messages.length + 1;
 
-      if (result.error) {
-        setMessages((prev) => [
-          ...prev,
-          { role: "agent", content: `错误: ${result.error}`, result: {} },
-        ]);
-      } else {
-        setMessages((prev) => [
-          ...prev,
-          { role: "agent", content: result.response || "执行完成", result },
-        ]);
+      // Update to running state
+      updateMessage(msgIndex, {
+        status: "running",
+        content: "🔄 正在执行...",
+        progress: "初始化",
+      });
+
+      // Use the streaming endpoint (which collects all events)
+      const events = await api.agentChatSSE(userMsg, mode, { model_id: selectedModel });
+
+      // Process events and update UI progressively
+      let finalResponse = "";
+      let reflectionReport = "";
+      let steps: AgentStep[] = [];
+      let results: Record<string, number> = {};
+      let charts: string[] = [];
+
+      for (const event of events) {
+        const { type, data } = event;
+
+        switch (type) {
+          case "memory":
+            if (data.hasMemory && data.context) {
+              updateMessage(msgIndex, {
+                content: `📚 召回相关记忆:\n${data.context}`,
+              });
+            }
+            break;
+
+          case "thought":
+            updateMessage(msgIndex, {
+              progress: "LLM 思考中",
+              content: "🤔 LLM 正在思考下一步操作...",
+            });
+            break;
+
+          case "step":
+            const stepNum = data.step;
+            const newStep: AgentStep = {
+              tool: data.tool,
+              input: data.input,
+              observation: data.observation,
+            };
+            steps = [...steps, newStep];
+            updateMessage(msgIndex, {
+              steps: [...steps],
+              content: `⏳ 执行中 (Step ${stepNum})...`,
+              progress: `执行 Step ${stepNum}: ${data.tool}`,
+            });
+            break;
+
+          case "final":
+            finalResponse = data.content || "执行完成";
+            updateMessage(msgIndex, {
+              content: finalResponse,
+              progress: "完成",
+            });
+            break;
+
+          case "reflection":
+            reflectionReport = data.report || "";
+            updateMessage(msgIndex, {
+              reflectionReport,
+              content: finalResponse || "执行完成，正在反思...",
+              progress: "反思中",
+            });
+            break;
+
+          case "done":
+            // Final result
+            finalResponse = data.response || finalResponse;
+            results = data.results || {};
+            charts = data.charts || [];
+            updateMessage(msgIndex, {
+              content: finalResponse || "执行完成",
+              steps: data.steps || steps,
+              results,
+              charts,
+              reflectionReport: reflectionReport || data.reflection_report,
+              memoryContext: data.memoryContext,
+              status: "done",
+            });
+            break;
+
+          case "error":
+            updateMessage(msgIndex, {
+              content: `❌ 错误: ${data.error}`,
+              error: data.error,
+              status: "error",
+            });
+            break;
+        }
+
+        // Small delay to allow UI updates between events
+        await new Promise(resolve => setTimeout(resolve, 50));
       }
+
+      // Ensure final state is set
+      updateMessage(msgIndex, {
+        status: "done",
+        content: finalResponse || "执行完成",
+        steps: steps.length > 0 ? steps : undefined,
+        results: Object.keys(results).length > 0 ? results : undefined,
+      });
+
     } catch (e: any) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "agent", content: `请求失败: ${e.message}`, result: {} },
-      ]);
+      const msgIndex = messages.length;
+      updateMessage(msgIndex, {
+        content: `请求失败: ${e.message}`,
+        error: e.message,
+        status: "error",
+      });
     } finally {
       setRunning(false);
     }
-  }, [input, mode, selectedModel, running]);
+  }, [input, mode, selectedModel, running, messages.length, updateMessage]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", gap: "12px" }}>
@@ -200,8 +318,27 @@ export default function AgentChatPanel() {
                 </div>
               </div>
             ) : (
-              /* Agent bubble + result */
+              /* Agent bubble */
               <div>
+                {/* Status indicator */}
+                {msg.status === "running" && (
+                  <div style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    marginBottom: "8px",
+                    fontSize: "12px",
+                    color: "#38bdf8",
+                  }}>
+                    <div style={{
+                      width: "8px", height: "8px",
+                      background: "#38bdf8", borderRadius: "50%",
+                      animation: "pulse 1s infinite",
+                    }} />
+                    {msg.progress || "执行中..."}
+                  </div>
+                )}
+
                 <div style={{
                   padding: "10px 14px",
                   background: "#1e293b",
@@ -209,14 +346,15 @@ export default function AgentChatPanel() {
                   color: "#e2e8f0",
                   fontSize: "13px",
                   border: "1px solid #334155",
+                  whiteSpace: "pre-wrap",
                 }}>
                   {msg.content}
                 </div>
 
-                {/* Execution steps */}
-                {msg.result?.steps && msg.result.steps.length > 0 && (
+                {/* Steps */}
+                {msg.steps && msg.steps.length > 0 && (
                   <div style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "6px" }}>
-                    {msg.result.steps.map((step, si) => (
+                    {msg.steps.map((step, si) => (
                       <div key={si} style={{
                         background: "#0f172a",
                         border: "1px solid #1e293b",
@@ -263,11 +401,6 @@ export default function AgentChatPanel() {
                                 : String(step.observation)}
                             </div>
                           )}
-                          {step.reflection && (
-                            <div style={{ color: "#f59e0b", marginTop: "4px", fontSize: "10px" }}>
-                              🤔 反思: {step.reflection.slice(0, 100)}
-                            </div>
-                          )}
                         </div>
                       </div>
                     ))}
@@ -275,7 +408,7 @@ export default function AgentChatPanel() {
                 )}
 
                 {/* Results card */}
-                {msg.result?.results && Object.keys(msg.result.results).length > 0 && (
+                {msg.results && Object.keys(msg.results).length > 0 && (
                   <div style={{
                     marginTop: "8px",
                     background: "#0f172a",
@@ -287,7 +420,7 @@ export default function AgentChatPanel() {
                       📊 执行结果
                     </div>
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: "6px" }}>
-                      {Object.entries(msg.result.results).map(([k, v]) => (
+                      {Object.entries(msg.results).map(([k, v]) => (
                         <div key={k} style={{
                           background: "#1e293b",
                           borderRadius: "6px",
@@ -301,38 +434,30 @@ export default function AgentChatPanel() {
                         </div>
                       ))}
                     </div>
-                    {msg.result.charts && msg.result.charts.length > 0 && (
-                      <div style={{ marginTop: "8px", display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                        {msg.result.charts.map((chart, ci) => (
-                          <div key={ci} style={{
-                            padding: "4px 8px",
-                            background: "#1e293b",
-                            borderRadius: "4px",
-                            fontSize: "10px",
-                            color: "#38bdf8",
-                          }}>
-                            📈 {chart.split(/[/\\]/).pop()}
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                  </div>
+                )}
+
+                {/* Reflection report */}
+                {msg.reflectionReport && (
+                  <div style={{
+                    marginTop: "8px",
+                    background: "#0f172a",
+                    border: "1px solid #f59e0b40",
+                    borderRadius: "8px",
+                    padding: "10px 14px",
+                    fontSize: "12px",
+                    color: "#e2e8f0",
+                    whiteSpace: "pre-wrap",
+                    maxHeight: "300px",
+                    overflowY: "auto",
+                  }}>
+                    {msg.reflectionReport}
                   </div>
                 )}
               </div>
             )}
           </div>
         ))}
-
-        {running && (
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", color: "#38bdf8", fontSize: "13px" }}>
-            <div style={{
-              width: "8px", height: "8px",
-              background: "#38bdf8", borderRadius: "50%",
-              animation: "pulse 1s infinite",
-            }} />
-            智能体思考中...
-          </div>
-        )}
 
         <div ref={bottomRef} />
       </div>
@@ -402,3 +527,4 @@ export default function AgentChatPanel() {
     </div>
   );
 }
+

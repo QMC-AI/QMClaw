@@ -72,6 +72,34 @@ function getDefaultSessionPath(): string {
   return `${cfg.user}/${cfg.path.join('/')}`;
 }
 
+// ── JSONL Line Processor ────────────────────────────────────────────────────────
+
+function processJsonlLine(line: string): void {
+  try {
+    const obj = JSON.parse(line);
+    // Workflow progress
+    if (obj.type === "workflow_progress") {
+      handleWorkflowProgress(obj as { workflowId: string; nodeId: string; status: string });
+      return;
+    }
+    // Workflow result
+    if (obj.workflowId) {
+      handleWorkflowResult(obj as WorkflowResultMsg);
+      return;
+    }
+    // Flask result
+    if (obj.cid && obj.action) {
+      if (obj.error) {
+        console.log(`[Flask Error] cid=${obj.cid} action=${obj.action}: ${obj.error}`);
+      }
+      handleFlaskResult(obj as { cid: string; action: string; data?: unknown; error?: string });
+      return;
+    }
+    // Legacy job result
+    handleSubprocessResult(obj as { status: string; stdout: string; stderr: string; error: string });
+  } catch { /* ignore parse errors during init */ }
+}
+
 // ── Known experiment functions (from sq module) ────────────────────────────────
 // These are static — the actual sq.* functions are defined in the LabRAD backend.
 // User can browse/run any sq.* function via the experiments tab.
@@ -118,7 +146,7 @@ type FlaskPendingEntry = {
 const flaskPendingRequests = new Map<string, FlaskPendingEntry>();
 
 /** Send a Flask-style message to the subprocess and resolve via correlation ID */
-async function sendFlaskRequest(action: string, data: Record<string, unknown>, timeoutMs = 300_000): Promise<unknown> {
+async function sendFlaskRequest(action: string, data: Record<string, unknown>, timeoutMs = 30_000): Promise<unknown> {
   await ensureSubprocess();
   if (!pyProc || !pyProc.stdin) throw new Error("Worker not running");
 
@@ -131,8 +159,10 @@ async function sendFlaskRequest(action: string, data: Record<string, unknown>, t
     try {
       console.log(`[Flask Request] Writing: ${msg.trim().slice(0, 200)}`);
       if (!pyProc || !pyProc.stdin) throw new Error("Worker stdin not available");
-      const ok = pyProc.stdin.write(msg);
-      console.log(`[Flask Request] stdin.write ok=${ok}`);
+      pyProc.stdin.write(msg, () => {
+        console.log(`[Flask Request] stdin.write callback fired`);
+      });
+      console.log(`[Flask Request] stdin.write completed`);
     } catch (err: any) {
       flaskPendingRequests.delete(cid);
       reject(err);
@@ -142,6 +172,54 @@ async function sendFlaskRequest(action: string, data: Record<string, unknown>, t
       if (flaskPendingRequests.has(cid)) {
         flaskPendingRequests.delete(cid);
         reject(new Error("Flask request timeout"));
+      }
+    }, timeoutMs);
+  });
+}
+
+// ── Streaming support ───────────────────────────────────────────────────────────
+
+type StreamCallback = (data: string) => void;
+const activeStreams = new Map<string, StreamCallback>();
+
+/**
+ * Send a Flask-style message for streaming.
+ * SSE events from Python will be forwarded to the callback.
+ * Returns a promise that resolves when streaming completes.
+ */
+async function sendFlaskRequestStreaming(
+  action: string,
+  data: Record<string, unknown>,
+  onEvent: StreamCallback,
+  timeoutMs = 300_000
+): Promise<unknown> {
+  await ensureSubprocess();
+  if (!pyProc || !pyProc.stdin) throw new Error("Worker not running");
+
+  const cid = "stream_" + Date.now() + Math.random().toString(36).slice(2, 8);
+  const msg = JSON.stringify({ type: "flask", cid, action, data }) + "\n";
+  console.log(`[Flask Stream] cid=${cid} action=${action}`);
+
+  // Register the stream callback
+  activeStreams.set(cid, onEvent);
+
+  return new Promise((resolve, reject) => {
+    flaskPendingRequests.set(cid, { resolve, reject });
+    try {
+      if (!pyProc || !pyProc.stdin) throw new Error("Worker stdin not available");
+      const ok = pyProc.stdin.write(msg);
+      console.log(`[Flask Stream] stdin.write ok=${ok}`);
+    } catch (err: any) {
+      activeStreams.delete(cid);
+      flaskPendingRequests.delete(cid);
+      reject(err);
+    }
+    // Timeout
+    setTimeout(() => {
+      if (activeStreams.has(cid)) {
+        activeStreams.delete(cid);
+        flaskPendingRequests.delete(cid);
+        reject(new Error("Flask streaming timeout"));
       }
     }, timeoutMs);
   });
@@ -160,7 +238,7 @@ app.use(express.json());
 
 let pyProc: ReturnType<typeof spawn> | null = null;
 let pyProcReady = false;
-let pyProcBuffer = "";  // accumulates subprocess stdout
+let sseBuffer = "";  // accumulates subprocess stdout
 
 /** Spawn the persistent Python subprocess and set up I/O handlers */
 function ensureSubprocess(): Promise<void> {
@@ -207,33 +285,43 @@ function ensureSubprocess(): Promise<void> {
     });
 
     pyProc.stdout?.on("data", (data: Buffer) => {
-      pyProcBuffer += data.toString();
-      // Process line-by-line JSONL
-      const lines = pyProcBuffer.split("\n");
-      pyProcBuffer = lines.pop() ?? ""; // keep incomplete line in buffer
-      for (const line of lines) {
+      sseBuffer += data.toString();
+
+      // Process complete lines (ending with \n)
+      while (true) {
+        const nlIdx = sseBuffer.indexOf('\n');
+        if (nlIdx === -1) break; // no complete line
+
+        const line = sseBuffer.substring(0, nlIdx);
+        sseBuffer = sseBuffer.substring(nlIdx + 1);
+
         if (!line.trim()) continue;
-        try {
-          const obj = JSON.parse(line);
-          // Workflow progress: {"type":"workflow_progress", ...}
-          if (obj.type === "workflow_progress") {
-            handleWorkflowProgress(obj as { workflowId: string; nodeId: string; status: string });
-            continue;
+
+        // Check for SSE event prefix: "SSE: <cid>"
+        if (line.startsWith('SSE: ')) {
+          const cidMatch = line.match(/^SSE: (\S+)/);
+          if (cidMatch) {
+            const cid = cidMatch[1];
+            const callback = activeStreams.get(cid);
+            if (callback) {
+              // Collect SSE event body until double newline
+              const endIdx = sseBuffer.indexOf('\n\n');
+              if (endIdx === -1) {
+                // Not enough data yet; put line back and wait
+                sseBuffer = line + '\n' + sseBuffer;
+                return;
+              }
+              const body = sseBuffer.substring(0, endIdx + 2);
+              sseBuffer = sseBuffer.substring(endIdx + 2);
+              console.log(`[SSE Forward] cid=${cid} body=${body.substring(0, 80)}...`);
+              callback(body);
+            }
           }
-          // Workflow result: has workflowId field
-          if (obj.workflowId) {
-            handleWorkflowResult(obj as WorkflowResultMsg);
-            continue;
-          }
-          // Flask result: correlation ID based dispatch
-          if (obj.type === "flask_result" || (obj.cid && obj.action && !obj.workflowId)) {
-            console.log(`[Flask Result] cid=${obj.cid} action=${obj.action} hasError=${!!obj.error}`);
-            handleFlaskResult(obj as { cid: string; action: string; data?: unknown; error?: string });
-            continue;
-          }
-          // Job result: has status field
-          handleSubprocessResult(obj as { status: string; stdout: string; stderr: string; error: string });
-        } catch { /* ignore parse errors during init */ }
+          continue;
+        }
+
+        // Regular JSONL line
+        processJsonlLine(line);
       }
     });
 
@@ -266,6 +354,8 @@ function ensureSubprocess(): Promise<void> {
 type NodeResult = {
   status: string; type: string; stdout: string; stderr: string;
   error: string; plotPath?: string; metrics?: Record<string, number>;
+  duration?: number; input?: string; conversation?: any;
+  recommendations?: any[]; symptom?: string; reasoning?: string; matchedRules?: string[];
 };
 
 type WorkflowResultMsg = {
@@ -434,7 +524,7 @@ function killSubprocess(): void {
     setTimeout(() => { try { pyProc?.kill("SIGKILL"); } catch { /* ignore */ } }, 500);
     pyProc = null;
     pyProcReady = false;
-    pyProcBuffer = "";
+    sseBuffer = "";
   }
 }
 
@@ -1671,6 +1761,44 @@ app.post("/api/agent/chat", async (req, res) => {
   } catch (err: any) { res.status(502).json({ error: err.message }); }
 });
 
+/** POST /api/agent/chat/stream — streaming agent chat (SSE) */
+app.post("/api/agent/chat/stream", async (req, res) => {
+  try {
+    const { message, mode, context } = req.body as {
+      message?: string;
+      mode?: string;
+      context?: Record<string, unknown>;
+    };
+    if (!message) { res.status(400).json({ error: "message is required" }); return; }
+
+    // Set SSE headers
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering
+
+    // Use streaming request - events will be forwarded to res.write
+    const data = await sendFlaskRequestStreaming(
+      "agent_chat_stream",
+      { message, mode: mode || "react", context: context || {} },
+      (sseData) => {
+        // Forward SSE data to client immediately
+        res.write(sseData);
+      },
+      600_000 // 10 min timeout for long-running agent tasks
+    ) as Record<string, unknown>;
+
+    // Final result received
+    if (data?.error) {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: data.error })}\n\n`);
+    }
+    res.end();
+  } catch (err: any) {
+    res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
+    res.end();
+  }
+});
+
 /** GET /api/agent/modes — get available agent reasoning modes */
 app.get("/api/agent/modes", (_req, res) => {
   res.json({ modes: ["react", "plan_and_execute", "reflexion"] });
@@ -1691,6 +1819,87 @@ app.get("/api/agent/debug-env", async (_req, res) => {
   try {
     const data = await sendFlaskRequest("debug_env", {}) as Record<string, unknown>;
     res.json({ express: expressEnv, python: data });
+  } catch (err: any) { res.status(502).json({ error: err.message }); }
+});
+
+// ── Memory & Reflection API ─────────────────────────────────────────────────
+
+/** POST /api/agent/memory/episodes — list episodes */
+app.post("/api/agent/memory/episodes", async (req, res) => {
+  try {
+    const { limit, qubit, status } = req.body;
+    const data = await sendFlaskRequest("memory_list_episodes", { limit, qubit, status }) as Record<string, unknown>;
+    if (data.error) { res.status(502).json({ error: data.error }); return; }
+    res.json(data);
+  } catch (err: any) { res.status(502).json({ error: err.message }); }
+});
+
+/** GET /api/agent/memory/episodes/:id — get episode details */
+app.get("/api/agent/memory/episodes/:id", async (req, res) => {
+  try {
+    const data = await sendFlaskRequest("memory_get_episode", { episode_id: req.params.id }) as Record<string, unknown>;
+    if (data.error) { res.status(404).json({ error: data.error }); return; }
+    res.json(data);
+  } catch (err: any) { res.status(502).json({ error: err.message }); }
+});
+
+/** DELETE /api/agent/memory/episodes/:id — archive episode */
+app.delete("/api/agent/memory/episodes/:id", async (req, res) => {
+  try {
+    const data = await sendFlaskRequest("memory_archive_episode", { episode_id: req.params.id }) as Record<string, unknown>;
+    if (data.error) { res.status(502).json({ error: data.error }); return; }
+    res.json(data);
+  } catch (err: any) { res.status(502).json({ error: err.message }); }
+});
+
+/** GET /api/agent/memory/skills — list all skills */
+app.get("/api/agent/memory/skills", async (_req, res) => {
+  try {
+    const data = await sendFlaskRequest("memory_list_skills", {}) as Record<string, unknown>;
+    if (data.error) { res.status(502).json({ error: data.error }); return; }
+    res.json(data);
+  } catch (err: any) { res.status(502).json({ error: err.message }); }
+});
+
+/** DELETE /api/agent/memory/skills/:id — delete skill */
+app.delete("/api/agent/memory/skills/:id", async (req, res) => {
+  try {
+    const data = await sendFlaskRequest("memory_delete_skill", { skill_id: req.params.id }) as Record<string, unknown>;
+    if (data.error) { res.status(502).json({ error: data.error }); return; }
+    res.json(data);
+  } catch (err: any) { res.status(502).json({ error: err.message }); }
+});
+
+/** GET /api/agent/memory/stats — get memory stats */
+app.get("/api/agent/memory/stats", async (_req, res) => {
+  try {
+    const data = await sendFlaskRequest("memory_stats", {}) as Record<string, unknown>;
+    if (data.error) { res.status(502).json({ error: data.error }); return; }
+    res.json(data);
+  } catch (err: any) { res.status(502).json({ error: err.message }); }
+});
+
+/** POST /api/agent/memory/recall — recall relevant memories */
+app.post("/api/agent/memory/recall", async (req, res) => {
+  try {
+    const { task, qubit } = req.body;
+    const data = await sendFlaskRequest("memory_recall", { task, qubit }) as Record<string, unknown>;
+    if (data.error) { res.status(502).json({ error: data.error }); return; }
+    res.json(data);
+  } catch (err: any) { res.status(502).json({ error: err.message }); }
+});
+
+/** POST /api/agent/memory/reflect — trigger reflection */
+app.post("/api/agent/memory/reflect", async (req, res) => {
+  try {
+    const { episode_id, task, result_data } = req.body;
+    const data = await sendFlaskRequest("memory_reflect", {
+      episode_id,
+      task,
+      result_data
+    }) as Record<string, unknown>;
+    if (data.error) { res.status(502).json({ error: data.error }); return; }
+    res.json(data);
   } catch (err: any) { res.status(502).json({ error: err.message }); }
 });
 
