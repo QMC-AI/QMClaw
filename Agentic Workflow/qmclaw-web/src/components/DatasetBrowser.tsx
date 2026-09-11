@@ -381,27 +381,49 @@ export default function DatasetBrowser() {
         )}
       </div>
 
-      {/* Selected dataset plot */}
+      {/* Selected dataset actions */}
       {selectedDs && (
         <div style={{
           borderTop: "1px solid #1e293b",
-          padding: "0.5rem",
+          padding: "0.5rem 0.75rem",
           background: "#0f172a",
+          display: "flex",
+          flexDirection: "column",
+          gap: "0.35rem",
         }}>
           <div style={{
             fontSize: "0.65rem", color: "#475569",
-            marginBottom: "0.3rem", fontFamily: "monospace",
+            fontFamily: "monospace",
           }}>
             📊 {selectedDs.name}
           </div>
-          <img
-            src={api.datasetPlotUrl(selectedDs.id, path)}
-            alt={selectedDs.name}
-            style={{ display: "block", width: "100%", maxHeight: "300px", objectFit: "contain", borderRadius: "0.25rem" }}
-            onError={(e) => {
-              (e.target as HTMLImageElement).src = `data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='100'><text x='10' y='60' font-size='12' fill='%23f87171'>Plot unavailable</text></svg>`;
+          <button
+            onClick={() => {
+              // Dispatch event to plot this dataset in the experiments page
+              window.dispatchEvent(new CustomEvent("dataset:plot-in-experiments", {
+                detail: {
+                  name: selectedDs.id,
+                  path: path,
+                }
+              }));
             }}
-          />
+            style={{
+              padding: "0.35rem 0.75rem",
+              background: "#6366f1",
+              border: "none",
+              borderRadius: "0.25rem",
+              color: "#fff",
+              fontSize: "0.7rem",
+              fontWeight: 600,
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: "0.4rem",
+            }}
+          >
+            📊 在 Experiments 绘图
+          </button>
         </div>
       )}
     </div>

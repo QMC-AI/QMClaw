@@ -142,50 +142,100 @@ class LQCSBackend:
 
         try:
             # Import lqms components
+            print("[LQCS Backend] Importing labrad...", file=sys.stderr, flush=True)
             import labrad
-            from lqms.pyle.workflow import switchSession
+            print("[LQCS Backend] labrad imported", file=sys.stderr, flush=True)
+            print("[LQCS Backend] Importing lqms modules...", file=sys.stderr, flush=True)
             from lqms.utils.save_path import get_info_path
             from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
+            print("[LQCS Backend]   imported get_info_path, dc, QubitUpdater", file=sys.stderr, flush=True)
             from lqms.measure import generate_qubit, generate_coupler
+            print("[LQCS Backend]   imported generate_qubit, generate_coupler", file=sys.stderr, flush=True)
             from lqms.measure.basic import BasicTuner, util
+            print("[LQCS Backend]   imported BasicTuner, util", file=sys.stderr, flush=True)
             from lqms.measure.tuners import sq_nodes as sq_module
+            print("[LQCS Backend]   imported sq_nodes", file=sys.stderr, flush=True)
 
+            print("[LQCS Backend] All imports done, about to connect to LabRAD...", file=sys.stderr, flush=True)
             # Store generate functions for later use
             self._generate_qubit = generate_qubit
             self._generate_coupler = generate_coupler
 
             # Connect to LabRAD
+            print("[LQCS Backend] About to call labrad.connect()...", file=sys.stderr, flush=True)
+            sys.stderr.flush()
             self._cxn = labrad.connect()
+            print("[LQCS Backend] LabRAD connected!", file=sys.stderr, flush=True)
+            print("[LQCS Backend] Calling util.setWiringInfo()...", file=sys.stderr, flush=True)
             util.setWiringInfo(self._cxn)
+            print("[LQCS Backend] setWiringInfo done", file=sys.stderr, flush=True)
 
             # Determine session configuration
             if session_path is None:
                 session_path = self._load_session_config()
 
             self._current_session_path = session_path
+            print(f"[LQCS Backend] session_path = {session_path}", file=sys.stderr, flush=True)
 
-            # Create session switcher
+            # Create session switcher with timeout protection
+            import signal
             user = session_path[1] if len(session_path) > 1 else "LQHL"
-            self._s = switchSession(self._cxn, user=user)
+            print(f"[LQCS Backend] Creating session switcher for user = {user}...", file=sys.stderr, flush=True)
+
+            # Wrap switchSession with timeout using threading
+            result = {"session": None, "error": None}
+            def _switch_with_timeout():
+                try:
+                    from lqms.pyle.workflow import switchSession
+                    result["session"] = switchSession(self._cxn, user=user)
+                except Exception as e:
+                    result["error"] = e
+
+            switch_thread = threading.Thread(target=_switch_with_timeout)
+            switch_thread.daemon = True
+            switch_thread.start()
+            switch_thread.join(timeout=30)  # 30 second timeout
+
+            if switch_thread.is_alive():
+                print("[LQCS Backend] switchSession TIMEOUT after 30 seconds!", file=sys.stderr, flush=True)
+                raise TimeoutError("switchSession timed out after 30 seconds")
+            elif result["error"]:
+                raise result["error"]
+            else:
+                self._s = result["session"]
+            print("[LQCS Backend] switchSession done", file=sys.stderr, flush=True)
 
             # Initialize data lab
+            print("[LQCS Backend] Initializing DataLab...", file=sys.stderr, flush=True)
             dv = self._cxn.data_vault
             self._data = dc.DataLab(session_path, dv, dv_type="data_vault")
-
-            # Load or create info
+            # Load or create info - SKIP for now to avoid hanging on HDF5
+            print("[LQCS Backend] Loading info (SKIPPING to avoid hang)...", file=sys.stderr, flush=True)
+            print("[LQCS Backend]   calling get_info_path...", file=sys.stderr, flush=True)
             info_path = get_info_path(self._s)
-            info = dc.InfoBase(info_path) if os.path.exists(info_path) else None
+            print(f"[LQCS Backend]   get_info_path returned: {info_path}", file=sys.stderr, flush=True)
+            print("[LQCS Backend]   skipping InfoBase loading to avoid hang", file=sys.stderr, flush=True)
+            info = None
 
             # Initialize analysis tools
+            print("[LQCS Backend] Initializing QubitUpdater...", file=sys.stderr, flush=True)
+            print("[LQCS Backend]   calling QubitUpdater()...", file=sys.stderr, flush=True)
             self._qter = QubitUpdater(self._data, info)
+            print("[LQCS Backend] QubitUpdater initialized", file=sys.stderr, flush=True)
 
-            # Generate qubits (switchSession already loads qubits from registry)
+            # Generate qubits
+            print("[LQCS Backend] Generating qubits...", file=sys.stderr, flush=True)
             self._all_qubits = generate_qubit(
                 {"s": self._s}, info=info, sample=self._s
             )
+            print("[LQCS Backend] generate_qubit done", file=sys.stderr, flush=True)
+
+            # Generate couplers
+            print("[LQCS Backend] Generating couplers...", file=sys.stderr, flush=True)
             self._all_couplers = generate_coupler(
                 {"s": self._s}, info=info, sample=self._s
             )
+            print("[LQCS Backend] generate_coupler done", file=sys.stderr, flush=True)
 
             # No need to inject - switchSession loads qubits automatically
 

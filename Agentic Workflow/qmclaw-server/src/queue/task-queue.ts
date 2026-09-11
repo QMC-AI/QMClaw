@@ -205,7 +205,7 @@ export class TaskQueue {
         try {
           listener(job);
         } catch (err) {
-          console.error(`[TaskQueue] Listener error for job ${jobId}:`, err);
+          console.error(`[Worker] Listener error for job ${jobId}:`, err);
         }
       }
     }
@@ -217,7 +217,7 @@ export class TaskQueue {
         try {
           listener(job);
         } catch (err) {
-          console.error(`[TaskQueue] Global listener error:`, err);
+          console.error(`[Worker] Global listener error:`, err);
         }
       }
     }

@@ -25,6 +25,7 @@ import signal
 import traceback
 import tempfile
 import urllib.parse
+import threading
 
 # PLOTS_DIR shared with Express server
 PLOTS_DIR = os.environ.get("PLOTS_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "..", "qmclaw-web", "public", "plots"))
@@ -66,6 +67,11 @@ MEASURE_SCRIPTS = os.environ.get("MEASURE_SCRIPTS", os.path.join(_DEFAULT_ROOT, 
 
 sys.path.insert(0, MEASURE_SCRIPTS)
 sys.path.insert(0, BACKEND_DIR)
+
+# Debug: print sys.path
+print(f"INIT: sys.path after inserts: {sys.path[:5]}", file=sys.stderr, flush=True)
+print(f"INIT: BACKEND_DIR={BACKEND_DIR} exists={os.path.exists(BACKEND_DIR)}", file=sys.stderr, flush=True)
+print(f"INIT: MEASURE_SCRIPTS={MEASURE_SCRIPTS} exists={os.path.exists(MEASURE_SCRIPTS)}", file=sys.stderr, flush=True)
 
 # ── Image Classifier Paths ─────────────────────────────────────────────────────
 # D:\Documents\图像二分类代码
@@ -329,14 +335,27 @@ def init_backend(max_retries=3, delay=5):
 
     # Try using the new backends adapter first
     try:
+        print("INIT: Attempting to import backends...", file=sys.stderr, flush=True)
+        print(f"INIT: sys.path[0] = {sys.path[0]}", file=sys.stderr, flush=True)
+        import backends as _backends_module
+        print(f"INIT: backends.__file__ = {getattr(_backends_module, '__file__', 'N/A')}", file=sys.stderr, flush=True)
         from backends import init_backend as create_backend_adapter, BackendStatus
+        print("INIT: backends import succeeded", file=sys.stderr, flush=True)
+        print("INIT: init_backend function:", init_backend, file=sys.stderr, flush=True)
 
-        # Load session config
+        # Load session config and initialize backend adapter
         session_path = _get_full_session_path()
         print(f"INIT: Using backends adapter, session path = {session_path}", file=sys.stderr, flush=True)
-
-        # Create and initialize backend adapter
-        _BACKEND_ADAPTER = create_backend_adapter(session_path=session_path)
+        print("INIT: Calling create_backend_adapter()...", file=sys.stderr, flush=True)
+        print(f"INIT: create_backend_adapter type = {type(create_backend_adapter)}", file=sys.stderr, flush=True)
+        try:
+            _BACKEND_ADAPTER = create_backend_adapter(session_path=session_path)
+            print("INIT: create_backend_adapter() returned successfully", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"INIT: create_backend_adapter() raised exception: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            raise  # Re-raise to trigger fallback
 
         if _BACKEND_ADAPTER is not None and _BACKEND_ADAPTER.status == BackendStatus.READY:
             _update_globals_from_adapter()
@@ -376,9 +395,28 @@ def init_backend(max_retries=3, delay=5):
             _current_session_path = _get_full_session_path()
             print(f"INIT: Config session path = {_current_session_path}", file=sys.stderr, flush=True)
 
-            # Create session switcher
+            # Create session switcher with timeout protection
             user = _current_session_path[1] if len(_current_session_path) > 1 else 'LQHL'
-            _s = switchSession(_cxn, user=user)
+            print(f"INIT: Calling switchSession for user={user}...", file=sys.stderr, flush=True)
+            switch_result = {"session": None, "error": None}
+            def _switch_with_timeout():
+                import threading  # Ensure threading is available in nested scope
+                try:
+                    switch_result["session"] = switchSession(_cxn, user=user)
+                except Exception as e:
+                    switch_result["error"] = e
+            switch_thread = threading.Thread(target=_switch_with_timeout)
+            switch_thread.daemon = True
+            switch_thread.start()
+            switch_thread.join(timeout=30)
+            if switch_thread.is_alive():
+                print("INIT: switchSession TIMEOUT after 30 seconds!", file=sys.stderr, flush=True)
+                raise TimeoutError("switchSession timed out")
+            elif switch_result["error"]:
+                raise switch_result["error"]
+            else:
+                _s = switch_result["session"]
+            print("INIT: switchSession done", file=sys.stderr, flush=True)
 
             # Initialize data lab
             _data = dc.DataLab(_current_session_path, _cxn.data_vault, dv_type='data_vault')
@@ -497,6 +535,25 @@ def run_job(code_b64, job_id):
         else:
             print(f"EXEC: q10lu1 NOT in exec_globals", file=sys.stderr)
 
+        # Debug: check qubit existence before execution
+        if 'q25_7' in exec_globals:
+            val = exec_globals['q25_7']
+            print(f"EXEC: q25_7 type={type(val).__name__}, qName={getattr(val, 'qName', 'N/A')}", file=sys.stderr, flush=True)
+            # Check key attributes needed for iqraw
+            print(f"EXEC: q25_7 has qf={hasattr(val, 'qf')}, qread={hasattr(val, 'qread')}, qrr={hasattr(val, 'qrr')}", file=sys.stderr, flush=True)
+            # List all attributes that might be relevant
+            attrs = [a for a in dir(val) if not a.startswith('_')]
+            print(f"EXEC: q25_7 attributes: {attrs}", file=sys.stderr, flush=True)
+            # Check qf value if exists
+            if hasattr(val, 'qf'):
+                print(f"EXEC: q25_7.qf = {val.qf}", file=sys.stderr, flush=True)
+            # Check qread
+            if hasattr(val, 'qread'):
+                qr = val.qread
+                print(f"EXEC: q25_7.qread type={type(qr).__name__}, value={qr}", file=sys.stderr, flush=True)
+        else:
+            print(f"EXEC: q25_7 NOT in exec_globals", file=sys.stderr, flush=True)
+
         # Debug: log session info before execution
         print(f"EXEC DEBUG: _current_session_path={_current_session_path}", file=sys.stderr, flush=True)
         print(f"EXEC DEBUG: _data session={getattr(_data, 'session', 'N/A')}", file=sys.stderr, flush=True)
@@ -522,6 +579,10 @@ def run_job(code_b64, job_id):
         sys.stdout = old_out
         sys.stderr = old_err
         result_status = "error"
+        # Enhanced error reporting for debugging
+        error_trace = traceback.format_exc()
+        print(f"EXEC ERROR: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        print(f"EXEC ERROR TRACE: {error_trace}", file=sys.stderr, flush=True)
         result_error = traceback.format_exc()
 
     return {
@@ -2018,9 +2079,9 @@ def call_minimax_api(messages: list, model: str, api_key: str, temperature: floa
     data_bytes = json.dumps(payload).encode("utf-8")
     req = Request(endpoint, data=data_bytes, headers=headers, method="POST")
     try:
-        # Use shorter timeout to avoid blocking too long
-        print(f"[MiniMax API] Sending request...", file=sys.stderr, flush=True)
-        resp = urlopen(req, timeout=15)  # 15 second timeout
+        # Use longer timeout with retry for reliability
+        print(f"[MiniMax API] Sending request with 60s timeout...", file=sys.stderr, flush=True)
+        resp = urlopen(req, timeout=60)  # 60 second timeout
         print(f"[MiniMax API] Response received", file=sys.stderr, flush=True)
         result = json.loads(resp.read().decode("utf-8"))
 
@@ -2715,10 +2776,10 @@ def run_workflow(workflow_json: str, workflow_id: str):
     }
 
 
-# ── Flask-style endpoints (integrated, no separate Flask server) ──────────────────
+# ── backend-style endpoints (integrated, no separate backend server) ──────────────────
 
-def handle_flask_request(action, data):
-    """Handle Flask-style requests using the pre-initialized LabRAD connection."""
+def handle_backend_request(action, data):
+    """Handle backend-style requests using the pre-initialized LabRAD connection."""
     cid = data.get("cid", "")
 
     try:
@@ -2816,20 +2877,60 @@ def handle_flask_request(action, data):
             return {"cid": cid, "action": action, "data": {"tree": tree}}
 
         elif action == "switch_session":
+            import threading  # Ensure threading is available in this scope
+            print(f"[EVENT] switch_session starting, cid={cid}, data={data}", file=sys.stderr, flush=True)
             session_path = data.get("path", [])
-            with _labrad_lock:
+
+            # Use lock with timeout to prevent deadlock
+            lock_acquired = _labrad_lock.acquire(timeout=5.0)
+            if not lock_acquired:
+                print(f"[EVENT] switch_session lock timeout, cid={cid}", file=sys.stderr, flush=True)
+                return {"cid": cid, "action": action, "data": {"success": False, "error": "Lock timeout"}}
+
+            try:
                 dv = _cxn.data_vault
                 dv.cd('')  # absolute: go to root first
                 clean_path = session_path[1:] if session_path and session_path[0] == '' else session_path
                 dv.cd(clean_path)
+                print(f"[EVENT] switch_session DataVault cd done, cid={cid}", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[EVENT] switch_session DataVault error: {e}", file=sys.stderr, flush=True)
+                _labrad_lock.release()
+                lock_acquired = False  # Prevent finally from releasing again
+                return {"cid": cid, "action": action, "data": {"success": False, "error": str(e)}}
+            finally:
+                if lock_acquired:
+                    _labrad_lock.release()
 
             # Save session to config file
             user = clean_path[0] if clean_path else 'LQHL'
             path_segments = clean_path[1:] if len(clean_path) > 1 else []
             _save_session_config(user, path_segments)
 
-            # Reload qubits for the new session
-            reload_qubits(clean_path)
+            # Reload qubits for the new session - run in thread with timeout
+            print(f"[EVENT] switch_session calling reload_qubits, cid={cid}", file=sys.stderr, flush=True)
+            reload_result = {"success": False, "error": None}
+            def _reload():
+                import threading  # Ensure threading is available in nested scope
+                try:
+                    reload_qubits(clean_path)
+                    reload_result["success"] = True
+                except Exception as e:
+                    reload_result["error"] = str(e)
+                    print(f"[EVENT] reload_qubits error: {e}", file=sys.stderr)
+
+            reload_thread = threading.Thread(target=_reload)
+            reload_thread.daemon = True
+            reload_thread.start()
+            reload_thread.join(timeout=30)  # 30 second timeout for qubit reload
+
+            if reload_thread.is_alive():
+                print(f"[EVENT] switch_session reload_qubits TIMEOUT, cid={cid}", file=sys.stderr, flush=True)
+                return {"cid": cid, "action": action, "data": {"success": False, "error": "Reload timeout"}}
+
+            if reload_result["error"]:
+                print(f"[EVENT] switch_session reload_qubits failed: {reload_result['error']}", file=sys.stderr, flush=True)
+
             # Get list of qubits for response
             qubits = []
             if _s:
@@ -2844,6 +2945,7 @@ def handle_flask_request(action, data):
                             })
                         except:
                             qubits.append({"name": qname})
+            print(f"[EVENT] switch_session returning, cid={cid}, qubits_count={len(qubits)}", file=sys.stderr, flush=True)
             return {"cid": cid, "action": action, "data": {"success": True, "path": session_path, "qubits": qubits}}
 
         elif action == "debug_data":
@@ -3303,17 +3405,45 @@ def handle_flask_request(action, data):
 
         elif action == "quick_status":
             """Return quick status summary for header display."""
+            import time as _time
+            import threading
+            print(f"[EVENT] quick_status starting, cid={cid}", file=sys.stderr, flush=True)
             status = {"labrad": "error", "ray": "error", "datavault": "error", "message": ""}
             try:
-                if _cxn.connected:
+                # Check connection with timeout using threading
+                cxn_result = {"connected": False, "error": None}
+
+                def check_cxn():
+                    try:
+                        cxn_result["connected"] = _cxn.connected
+                    except Exception as e:
+                        cxn_result["error"] = str(e)
+
+                check_thread = threading.Thread(target=check_cxn)
+                check_thread.daemon = True
+                check_thread.start()
+                check_thread.join(timeout=5.0)  # 5 second timeout for connection check
+
+                print(f"[EVENT] quick_status LabRAD check done, cid={cid}, alive={check_thread.is_alive()}", file=sys.stderr, flush=True)
+
+                if check_thread.is_alive():
+                    status["message"] = "LabRAD connection check timeout"
+                    return {"cid": cid, "action": action, "data": status}
+
+                if cxn_result["error"]:
+                    status["message"] = f"Cannot connect to LabRAD: {cxn_result['error'][:50]}"
+                    return {"cid": cid, "action": action, "data": status}
+
+                if cxn_result["connected"]:
                     status["labrad"] = "ok"
                 else:
                     status["message"] = "LabRAD disconnected"
                     return {"cid": cid, "action": action, "data": status}
-            except:
-                status["message"] = "Cannot connect to LabRAD"
+            except Exception as e:
+                status["message"] = f"LabRAD check failed: {str(e)[:50]}"
                 return {"cid": cid, "action": action, "data": status}
 
+            print(f"[EVENT] quick_status checking Ray, cid={cid}", file=sys.stderr, flush=True)
             try:
                 import ray as _ray
                 if _ray.is_initialized():
@@ -3323,14 +3453,25 @@ def handle_flask_request(action, data):
             except:
                 status["ray"] = "warning"
 
-            try:
-                with _labrad_lock:
+            print(f"[EVENT] quick_status acquiring lock, cid={cid}", file=sys.stderr, flush=True)
+            # Use non-blocking lock with timeout to prevent hanging
+            lock_acquired = _labrad_lock.acquire(timeout=3.0)
+            print(f"[EVENT] quick_status lock acquired={lock_acquired}, cid={cid}", file=sys.stderr, flush=True)
+            if not lock_acquired:
+                status["datavault"] = "timeout"
+                status["message"] = "DataVault lock timeout"
+            else:
+                try:
                     dv = _cxn.data_vault
                     dv.cd([''])
                     status["datavault"] = "ok"
-            except:
-                status["datavault"] = "error"
-                status["message"] = "DataVault inaccessible"
+                except Exception as e:
+                    status["datavault"] = "error"
+                    status["message"] = f"DataVault error: {str(e)[:50]}"
+                finally:
+                    _labrad_lock.release()
+
+            print(f"[EVENT] quick_status returning, cid={cid}, status={status}", file=sys.stderr, flush=True)
 
             if status["labrad"] == "ok" and status["ray"] == "ok" and status["datavault"] == "ok":
                 status["message"] = "All systems ready"
@@ -3370,7 +3511,7 @@ def handle_flask_request(action, data):
                             content = ""
                     else:
                         content = ""
-                        print(f"FLASK_LLM: result is not a dict: {type(result)}", file=sys.stderr)
+                        print(f"BACKEND_LLM: result is not a dict: {type(result)}", file=sys.stderr)
                 else:
                     import openai
 
@@ -3482,6 +3623,58 @@ def handle_flask_request(action, data):
             except Exception as e:
                 return {"cid": cid, "action": action, "error": str(e)}
 
+        elif action == "agent_chat_stream":
+            # Streaming version of agent_chat - outputs SSE events for real-time progress
+            message = data.get("message", "")
+            mode = data.get("mode", "react")
+            context = data.get("context", {})
+            try:
+                result = _run_agent_chat_stream(cid, message, mode, context)
+                return {"cid": cid, "action": action, "data": result}
+            except Exception as e:
+                return {"cid": cid, "action": action, "error": str(e)}
+
+        elif action == "hermes_chat":
+            # Hermes-Agent based chat
+            message = data.get("message", "")
+            model = data.get("model")
+            base_url = data.get("base_url")
+            enabled_toolsets = data.get("enabled_toolsets")
+            session_id = data.get("session_id")
+            try:
+                from hermes_runner import _run_hermes_chat
+                result = _run_hermes_chat(
+                    message=message,
+                    model=model,
+                    base_url=base_url,
+                    enabled_toolsets=enabled_toolsets,
+                    session_id=session_id,
+                )
+                return {"cid": cid, "action": action, "data": result}
+            except Exception as e:
+                import traceback
+                return {"cid": cid, "action": action, "error": str(e), "traceback": traceback.format_exc()}
+
+        elif action == "hermes_chat_stream":
+            # Streaming Hermes-Agent chat
+            message = data.get("message", "")
+            model = data.get("model")
+            base_url = data.get("base_url")
+            session_id = data.get("session_id")
+            try:
+                from hermes_runner import _run_hermes_chat_stream
+                result = _run_hermes_chat_stream(
+                    cid=cid,
+                    message=message,
+                    model=model,
+                    base_url=base_url,
+                    session_id=session_id,
+                )
+                return {"cid": cid, "action": action, "data": result}
+            except Exception as e:
+                import traceback
+                return {"cid": cid, "action": action, "error": str(e), "traceback": traceback.format_exc()}
+
         elif action == "run_analysis":
             # Execute analysis command on the latest dataset
             command = data.get("command", "")
@@ -3551,6 +3744,93 @@ def handle_flask_request(action, data):
                 import traceback as tb
                 print(f"RUN_ANALYSIS: error={e}\n{tb.format_exc()}", file=sys.stderr, flush=True)
                 return {"cid": cid, "action": action, "error": str(e), "traceback": tb.format_exc()}
+
+        elif action == "plot_historical_dataset":
+            # Plot historical dataset with custom command
+            dataset_name = urllib.parse.unquote(data.get("name", ""))
+            path_str = urllib.parse.unquote(data.get("path", ""))
+            custom_command = data.get("command", "")
+
+            if not dataset_name:
+                return {"cid": cid, "action": action, "error": "name required"}
+
+            path_parts = [p for p in path_str.strip("/").split("/") if p] if path_str else []
+
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            plot_data = None
+            dataset_label = dataset_name
+            with _labrad_lock:
+                dv = _cxn.data_vault
+                dv.cd('')
+                dv.cd(path_parts)
+                dirs = dv.dir()
+                names = dirs[1]
+                if dataset_name not in names:
+                    return {"cid": cid, "action": action, "error": f"Dataset '{dataset_name}' not found in {names[:5]}..."}
+                idx = names.index(dataset_name) + 1
+                dv.open(idx)
+                dv_dirs = dv.dir()
+                dataset_label = dv_dirs[1][idx - 1]
+                plot_data = dv.get()
+
+            # Handle different data formats from LabRAD
+            if hasattr(plot_data, '__iter__') and not isinstance(plot_data, str):
+                if isinstance(plot_data, tuple) and len(plot_data) >= 2:
+                    x_data, y_data = plot_data[0], plot_data[1]
+                elif hasattr(plot_data, 'shape') and len(plot_data.shape) == 2:
+                    x_data = list(range(plot_data.shape[1]))
+                    y_data = plot_data[0]
+                else:
+                    x_data = list(range(len(plot_data)))
+                    y_data = plot_data
+            else:
+                x_data = list(range(len(plot_data) if hasattr(plot_data, '__len__') else 1))
+                y_data = plot_data
+
+            # Create figure and execute custom command if provided
+            fig = plt.figure(figsize=(8, 6))
+            ax = fig.add_subplot(111)
+
+            if custom_command:
+                # Execute custom command with data context
+                exec_globals = {
+                    "__name__": "__plot__",
+                    "plt": plt,
+                    "fig": fig,
+                    "ax": ax,
+                    "x": x_data,
+                    "y": y_data,
+                    "np": __import__("numpy"),
+                }
+                try:
+                    exec(custom_command, exec_globals)
+                except Exception as e:
+                    print(f"PLOT_HISTORICAL: custom command error: {e}", file=sys.stderr, flush=True)
+                    # Fall back to default plotting
+                    ax.plot(x_data, y_data, "b.-")
+                    ax.set_title(dataset_label)
+            else:
+                # Default plotting
+                ax.plot(x_data, y_data, "b.-")
+                ax.set_title(dataset_label)
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+
+            fig.tight_layout()
+            plot_file = os.path.join(PLOTS_DIR, f"hist_{abs(hash(dataset_name))}.png")
+            os.makedirs(PLOTS_DIR, exist_ok=True)
+            fig.savefig(plot_file, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+            print(f"PLOT_HISTORICAL: saved to {plot_file}", file=sys.stderr, flush=True)
+            return {"cid": cid, "action": action, "data": {
+                "plotPath": plot_file,
+                "name": dataset_label,
+                "success": True
+            }}
 
         else:
             return {"cid": cid, "action": action, "error": f"Unknown action: {action}"}
@@ -3915,11 +4195,19 @@ class SkillManager:
 class QuantumAgent:
     """Quantum Control Agent with ReAct / Plan-and-Execute / Reflexion modes."""
 
-    def __init__(self, mode="react", model_name=None):
+    def __init__(self, mode="react", model_name=None, sse_cid=None):
         self.mode = mode
         self.model_name = model_name or "gpt-4o"
         self.max_steps = 20
         self.tools = self._register_tools()
+        self.sse_cid = sse_cid  # If set, emit SSE events during execution
+
+    def _emit_sse(self, event_type, data):
+        """Emit an SSE event to stdout if sse_cid is set."""
+        if self.sse_cid:
+            sse_data = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+            print(f"SSE: {self.sse_cid}", flush=True)
+            print(sse_data, flush=True)
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -3999,23 +4287,33 @@ class QuantumAgent:
 
     def _react_loop(self, intent):
         print(f"[ReAct] Starting react loop, max_steps={self.max_steps}", file=sys.stderr, flush=True)
+        self._emit_sse("status", {"message": f"Starting ReAct loop (max {self.max_steps} steps)..."})
         steps = []
         observation = ""
         for step_idx in range(self.max_steps):
-            print(f"[ReAct] Step {step_idx+1}/{self.max_steps}", file=sys.stderr, flush=True)
+            step_num = step_idx + 1
+            print(f"[ReAct] Step {step_num}/{self.max_steps}", file=sys.stderr, flush=True)
+            self._emit_sse("step_start", {"step": step_num, "max_steps": self.max_steps})
+
             prompt = self._build_react_prompt(intent, steps, observation)
+            self._emit_sse("thinking", {"step": step_num, "message": "Calling LLM to analyze situation..."})
             print(f"[ReAct] Calling _call_llm...", file=sys.stderr, flush=True)
             response = self._call_llm(prompt)
             print(f"[ReAct] _call_llm returned, response length: {len(response)}", file=sys.stderr, flush=True)
             parsed = self._parse_llm_response(response)
             print(f"[ReAct] parsed type: {parsed.get('type')}, tool: {parsed.get('tool')}", file=sys.stderr, flush=True)
 
+            self._emit_sse("llm_response", {"step": step_num, "type": parsed.get("type"), "tool": parsed.get("tool")})
+
             if parsed["type"] == "finish":
-                print(f"[ReAct] Finish received, summarizing...", file=sys.stderr, flush=True)
-                return self._summarize(intent, steps, parsed["content"])
+                final_content = parsed.get("content", "")
+                print(f"[ReAct] Finish received, content length={len(final_content)}, content={final_content[:200]}...", file=sys.stderr, flush=True)
+                self._emit_sse("status", {"message": "Generating final response..."})
+                return self._summarize(intent, steps, final_content)
 
             tool_name = parsed.get("tool", "")
             tool_input = parsed.get("input", {})
+            self._emit_sse("tool_call", {"step": step_num, "tool": tool_name, "input": tool_input})
             print(f"[ReAct] Executing tool: {tool_name}", file=sys.stderr, flush=True)
             observation = self._execute_tool(tool_name, tool_input)
             print(f"[ReAct] Tool executed, observation type: {type(observation)}", file=sys.stderr, flush=True)
@@ -4025,7 +4323,9 @@ class QuantumAgent:
                 "input": tool_input,
                 "observation": observation,
             })
+            self._emit_sse("tool_result", {"step": step_num, "tool": tool_name, "result": str(observation)[:200]})
         print(f"[ReAct] Max steps reached, summarizing...", file=sys.stderr, flush=True)
+        self._emit_sse("status", {"message": "Max steps reached, generating response..."})
         return self._summarize(intent, steps, "执行达到最大步数限制")
 
     # ── Plan-and-Execute ───────────────────────────────────────────────────────
@@ -4081,17 +4381,18 @@ class QuantumAgent:
 
     def _call_llm(self, prompt, temperature=0.3):
         """Call LLM with a text prompt. Returns the response text."""
-        import sys as _sys
+        import traceback as _traceback
         # Check both if key exists AND if it's non-empty
         minimax_key = os.environ.get("MINIMAX_API_KEY", "")
         openai_key = os.environ.get("OPENAI_API_KEY", "")
-        _sys.stderr.write(f"[Agent LLM] Env check - MINIMAX_API_KEY exists={('MINIMAX_API_KEY' in os.environ)}, len={len(minimax_key)}, OPENAI_API_KEY exists={('OPENAI_API_KEY' in os.environ)}, len={len(openai_key)}\n")
-        _sys.stderr.flush()
+        print(f"[Agent LLM] Env check - MINIMAX_API_KEY len={len(minimax_key)}, OPENAI_API_KEY len={len(openai_key)}", file=sys.stderr, flush=True)
+
+        last_error = "Unknown error"
+        last_error_type = None
 
         # Try MiniMax first
         if minimax_key:
-            _sys.stderr.write(f"[Agent LLM] Calling MiniMax API...\n")
-            _sys.stderr.flush()
+            print(f"[Agent LLM] Calling MiniMax API with key starting: {minimax_key[:8]}...", file=sys.stderr, flush=True)
             try:
                 result = call_minimax_api(
                     messages=[{"role": "user", "content": prompt}],
@@ -4107,37 +4408,54 @@ class QuantumAgent:
                         if isinstance(msg, dict):
                             content = msg.get("content", "")
                             if content:
-                                _sys.stderr.write(f"[Agent LLM] MiniMax success, content length={len(content)}\n")
-                                _sys.stderr.flush()
+                                print(f"[Agent LLM] MiniMax success, content length={len(content)}", file=sys.stderr, flush=True)
                                 return content
-                _sys.stderr.write(f"[Agent LLM] MiniMax returned empty content\n")
-                _sys.stderr.flush()
+                            else:
+                                last_error = "Empty content"
+                        else:
+                            last_error = f"Message is not dict: {type(msg)}"
+                    else:
+                        last_error = f"No choices in response: {result}"
+                else:
+                    last_error = f"Invalid response type: {type(result)}"
             except Exception as e:
-                _sys.stderr.write(f"[Agent LLM] MiniMax error: {type(e).__name__}: {e}\n")
-                _sys.stderr.flush()
+                last_error = str(e)
+                last_error_type = type(e).__name__
+                print(f"[Agent LLM] MiniMax error ({last_error_type}): {last_error}", file=sys.stderr, flush=True)
 
-        # Fallback to OpenAI
+        print(f"[Agent LLM] Trying OpenAI fallback...", file=sys.stderr, flush=True)
         if openai_key:
-            _sys.stderr.write(f"[Agent LLM] Using OpenAI fallback...\n")
-            _sys.stderr.flush()
-            client = get_openai_client(openai_key, "openai", None)
             try:
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature,
-                    max_tokens=2048,
-                )
-                content = resp.choices[0].message.content or ""
-                return _sanitize_string(content)
+                from urllib.request import urlopen, Request
+                endpoint = "https://api.openai.com/v1/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 2048,
+                    "temperature": temperature,
+                }
+                req = Request(endpoint, data=json.dumps(payload).encode(), headers=headers)
+                resp = urlopen(req, timeout=60)
+                result = json.loads(resp.read())
+                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if content:
+                    return content
             except Exception as e:
-                _sys.stderr.write(f"[Agent LLM] OpenAI error: {type(e).__name__}: {e}\n")
-                _sys.stderr.flush()
-                return f"[LLM Error: {type(e).__name__}: {e}]"
+                last_error = str(e)
+                last_error_type = type(e).__name__
+                print(f"[Agent LLM] OpenAI error ({last_error_type}): {last_error}", file=sys.stderr, flush=True)
 
-        _sys.stderr.write(f"[Agent LLM] No API key available, returning error\n")
-        _sys.stderr.flush()
-        return "[LLM Error: No API key configured. Set MINIMAX_API_KEY or OPENAI_API_KEY environment variable.]"
+        # Return the actual error, not misleading "no API key" message
+        if last_error_type in ("TimeoutError", "URLError", "HTTPError"):
+            return f"[LLM Error: Network error - {last_error_type}: {last_error}]"
+        elif not minimax_key and not openai_key:
+            return "[LLM Error: No API key configured. Set MINIMAX_API_KEY or OPENAI_API_KEY environment variable.]"
+        else:
+            return f"[LLM Error: {last_error}]"
 
     def _build_react_prompt(self, intent, steps, observation):
         tools_desc = "\n".join(
@@ -4162,9 +4480,10 @@ class QuantumAgent:
 可用工具：
 {tools_desc}
 
-请按以下格式回复（仅返回 JSON，不要其他内容）：
+重要：只返回一个 JSON 对象，不要返回多个，不要在 JSON 前后添加任何文字说明。
+执行动作：
 {{"type": "action", "thought": "你的思考", "tool": "工具名", "input": {{"参数": "值"}}}}
-如果任务已完成：
+任务完成：
 {{"type": "finish", "content": "执行结果总结"}}
 """
 
@@ -4189,19 +4508,53 @@ class QuantumAgent:
 仅返回 JSON，不要其他内容。"""
 
     def _parse_llm_response(self, response):
-        """Parse LLM text response to extract action/finish."""
+        """Parse LLM text response to extract action/finish.
+
+        Handles cases where LLM returns multiple JSON blocks or extra text.
+        Only parses the first valid JSON object.
+        """
         # Sanitize the response first to remove problematic surrogate characters
         safe_response = _sanitize_string(response)
+        print(f"[ParseLLM] Raw response length: {len(safe_response)}, preview: {safe_response[:200]}", file=sys.stderr, flush=True)
+
         try:
-            # Try to find a JSON object in the response
+            # Strategy: find first '{' and try to parse incrementally
+            # This handles cases where LLM returns multiple JSON blocks
             start = safe_response.find("{")
-            end = safe_response.rfind("}") + 1
-            if start >= 0 and end > start:
-                obj = json.loads(safe_response[start:end])
-                return obj
-        except Exception:
-            pass
+            if start < 0:
+                print("[ParseLLM] No JSON object found, using fallback", file=sys.stderr, flush=True)
+                return {"type": "finish", "content": safe_response}
+
+            # Find the first complete JSON object starting from position start
+            # Use a depth counter to find matching closing brace
+            depth = 0
+            json_end = -1
+            for i in range(start, len(safe_response)):
+                c = safe_response[i]
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        json_end = i + 1
+                        break
+
+            if json_end < 0:
+                print("[ParseLLM] Incomplete JSON object, using fallback", file=sys.stderr, flush=True)
+                return {"type": "finish", "content": safe_response}
+
+            json_str = safe_response[start:json_end]
+            obj = json.loads(json_str)
+            print(f"[ParseLLM] Successfully parsed first JSON: type={obj.get('type')}, tool={obj.get('tool')}", file=sys.stderr, flush=True)
+            return obj
+
+        except json.JSONDecodeError as e:
+            print(f"[ParseLLM] JSON parse failed: {e}, response={safe_response[:200]}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[ParseLLM] Unexpected error: {e}", file=sys.stderr, flush=True)
+
         # Fallback: treat as finish with the raw response
+        print(f"[ParseLLM] Using fallback for response: {safe_response[:100]}", file=sys.stderr, flush=True)
         return {"type": "finish", "content": safe_response}
 
     def _is_ok(self, reflection_text):
@@ -4358,7 +4711,7 @@ def _run_single_experiment(qubit, fn, params):
 
 
 def _run_agent_chat(message, mode, context):
-    """Top-level handler for agent_chat Flask action."""
+    """Top-level handler for agent_chat backend action."""
     print(f"[Agent] Starting agent_chat: message='{message[:50]}...', mode={mode}", file=sys.stderr, flush=True)
 
     # Debug: Check environment variables - print all keys containing API or KEY
@@ -4393,51 +4746,95 @@ def _run_agent_chat(message, mode, context):
     return result
 
 
-# ── Flask background thread ──────────────────────────────────────────────────
-# Flask requests are handled in a dedicated thread so they never block
+def _emit_sse(cid, event_type, data):
+    """Emit an SSE event to stdout for streaming to frontend."""
+    sse_data = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    print(f"SSE: {cid}", flush=True)
+    print(sse_data, flush=True)
+
+
+def _run_agent_chat_stream(cid, message, mode, context):
+    """Streaming version of agent_chat - emits SSE events for real-time progress."""
+    print(f"[Agent] Starting agent_chat_stream: message='{message[:50]}...', mode={mode}, cid={cid}", file=sys.stderr, flush=True)
+
+    # Load API key if needed
+    if not os.environ.get("MINIMAX_API_KEY"):
+        env_file = os.path.join(os.path.dirname(__file__), "..", ".env")
+        if os.path.exists(env_file):
+            try:
+                with open(env_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            os.environ[key.strip()] = value.strip()
+                print(f"[Agent] Loaded .env", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[Agent] Failed to load .env: {e}", file=sys.stderr, flush=True)
+
+    ctx = dict(context) if context else {}
+    model_name = ctx.pop("model_name", None)
+    _emit_sse(cid, "status", {"message": "Initializing agent..."})
+    agent = QuantumAgent(mode=mode, model_name=model_name, sse_cid=cid)
+    _emit_sse(cid, "status", {"message": "Starting conversation..."})
+    result = agent.chat(message, ctx)
+    _emit_sse(cid, "done", result)
+    print(f"[Agent] agent_chat_stream completed, result keys: {list(result.keys()) if isinstance(result, dict) else 'not a dict'}", file=sys.stderr, flush=True)
+    return result
+
+
+# ── backend background thread ──────────────────────────────────────────────────
+# backend requests are handled in a dedicated thread so they never block
 # while a job/experiment is running in the main thread.
 
 import threading, queue as _queue
 
-_flask_queue: _queue.Queue = _queue.Queue()
-_flask_results: dict = {}  # cid -> result (populated by background thread)
+_backend_queue: _queue.Queue = _queue.Queue()
+_backend_results: dict = {}  # cid -> result (populated by background thread)
 _results_lock = threading.Lock()
 _stdin_lock = threading.Lock()  # protect stdout writes
 _labrad_lock = threading.Lock()  # protect shared LabRAD connection
 
-def _flask_worker():
-    """Background thread: process Flask requests from queue, write results."""
-    print("FLASK_WORKER: Started", file=sys.stderr, flush=True)
+def _backend_worker():
+    """Background thread: process backend requests from queue, write results."""
+    # Debug: check environment in background thread
+    api_keys_in_thread = [k for k in os.environ.keys() if 'KEY' in k.upper() or 'API' in k.upper()]
+    minimax_in_thread = os.environ.get("MINIMAX_API_KEY", "")
+    print(f"BACKEND_WORKER: Started, API keys={api_keys_in_thread}, MINIMAX first10='{minimax_in_thread[:10] if minimax_in_thread else 'EMPTY'}'", file=sys.stderr, flush=True)
     while True:
         try:
-            item = _flask_queue.get(timeout=0.5)
+            item = _backend_queue.get(timeout=0.5)
             if item is None:
                 break  # shutdown signal
             cid, action, data = item
-            print(f"FLASK_WORKER: Processing cid={cid} action={action}", file=sys.stderr, flush=True)
+            print(f"BACKEND_WORKER: Processing cid={cid} action={action}", file=sys.stderr, flush=True)
+            # Debug: show MINIMAX key when processing agent_chat
+            if action == "agent_chat":
+                minimax_key = os.environ.get("MINIMAX_API_KEY", "")
+                print(f"BACKEND_WORKER: agent_chat MINIMAX_API_KEY len={len(minimax_key)}, first10='{minimax_key[:10] if minimax_key else 'EMPTY'}'", file=sys.stderr, flush=True)
             try:
-                result = handle_flask_request(action, data)
-                print(f"FLASK_WORKER: handle_flask_request returned cid={cid}", file=sys.stderr, flush=True)
+                result = handle_backend_request(action, data)
+                print(f"BACKEND_WORKER: handle_backend_request returned cid={cid}", file=sys.stderr, flush=True)
             except Exception as e:
                 import traceback
                 result = {"cid": cid, "action": action, "error": str(e)}
-                print(f"FLASK_WORKER: Exception: {e}", file=sys.stderr, flush=True)
-                print(f"FLASK_WORKER: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+                print(f"BACKEND_WORKER: Exception: {e}", file=sys.stderr, flush=True)
+                print(f"BACKEND_WORKER: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
             with _results_lock:
-                _flask_results[cid] = result
+                _backend_results[cid] = result
                 # Write result directly so Express can collect it
                 with _stdin_lock:
-                    print(f"FLASK_WORKER: Writing result for cid={cid}", file=sys.stderr, flush=True)
+                    print(f"BACKEND_WORKER: Writing result for cid={cid}", file=sys.stderr, flush=True)
                     print(json.dumps(result), flush=True)
-                    print(f"FLASK_WORKER: Done writing result for cid={cid}", file=sys.stderr, flush=True)
-            _flask_queue.task_done()
+                    print(f"BACKEND_WORKER: Done writing result for cid={cid}", file=sys.stderr, flush=True)
+            _backend_queue.task_done()
         except _queue.Empty:
             continue
         except Exception:
             pass
 
-_flask_thread = threading.Thread(target=_flask_worker, daemon=True)
-_flask_thread.start()
+_backend_thread = threading.Thread(target=_backend_worker, daemon=True)
+_backend_thread.start()
 
 
 # ── Event loop ────────────────────────────────────────────────────────────────
@@ -4447,8 +4844,12 @@ def check_workflow_cancel(workflow_id=None):
     return os.path.exists(flag)
 
 print("READY", file=sys.stderr, flush=True)
+print('{"ready": true, "id": null}', flush=True)
+sys.stderr.flush()
+sys.stdout.flush()
 
-# Process Flask requests in the main thread to avoid threading issues with stdin
+# Process backend requests in the main thread to avoid threading issues with stdin
+print("[EVENT_LOOP] Starting event loop...", file=sys.stderr, flush=True)
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -4492,28 +4893,39 @@ for line in sys.stdin:
             result = run_workflow_node(node_data, node_results, workflow_ctx, check_workflow_cancel)
             print(json.dumps(result), flush=True)
 
-        elif msg_type == "flask":
-            # Process Flask requests in the main thread (non-blocking)
+        elif msg_type == "backend":
+            # Process backend requests - long-running tasks go to background queue
             cid = obj.get("cid", "")
             action = obj.get("action", "health")
-            flask_data = obj.get("data", {})  # Extract the data field
-            flask_data["cid"] = cid  # Pass cid in data for handle_flask_request
-            print(f"[EVENT] Flask request: cid={cid}, action={action}", file=sys.stderr, flush=True)
-            try:
-                result = handle_flask_request(action, flask_data)
-                print(f"[EVENT] handle_flask_request returned, cid={cid}", file=sys.stderr, flush=True)
-                output = json.dumps(result)
-                sys.stdout.write(output + "\n")
-                sys.stdout.flush()
-                print(f"[EVENT] Response written for cid={cid}", file=sys.stderr, flush=True)
-            except Exception as e:
-                import traceback
-                print(f"[EVENT] Exception in flask handling: {e}", file=sys.stderr, flush=True)
-                print(traceback.format_exc(), file=sys.stderr, flush=True)
-                result = {"cid": cid, "action": action, "error": str(e)}
-                output = json.dumps(result)
-                sys.stdout.write(output + "\n")
-                sys.stdout.flush()
+            backend_data = obj.get("data", {})  # Extract the data field
+            backend_data["cid"] = cid  # Pass cid in data for handle_backend_request
+            print(f"[EVENT] backend request: cid={cid}, action={action}", file=sys.stderr, flush=True)
+
+            # Long-running actions that should run in background thread
+            LONG_RUNNING_ACTIONS = {"agent_chat", "agent_chat_stream", "hermes_chat", "hermes_chat_stream"}
+
+            if action in LONG_RUNNING_ACTIONS:
+                # Put in background queue for async processing
+                print(f"[EVENT] Queuing {action} to background thread, cid={cid}", file=sys.stderr, flush=True)
+                _backend_queue.put((cid, action, backend_data))
+                # Don't write response here - background thread will do it
+            else:
+                # Fast actions: process in main thread (non-blocking)
+                try:
+                    result = handle_backend_request(action, backend_data)
+                    print(f"[EVENT] handle_backend_request returned, cid={cid}", file=sys.stderr, flush=True)
+                    output = json.dumps(result)
+                    sys.stdout.write(output + "\n")
+                    sys.stdout.flush()
+                    print(f"[EVENT] Response written for cid={cid}", file=sys.stderr, flush=True)
+                except Exception as e:
+                    import traceback
+                    print(f"[EVENT] Exception in backend handling: {e}", file=sys.stderr, flush=True)
+                    print(traceback.format_exc(), file=sys.stderr, flush=True)
+                    result = {"cid": cid, "action": action, "error": str(e)}
+                    output = json.dumps(result)
+                    sys.stdout.write(output + "\n")
+                    sys.stdout.flush()
             continue
 
         else:

@@ -17,6 +17,8 @@ export interface JobResult {
   submittedAt: number;
   completedAt?: number;
   plotPath?: string;
+  qubit?: string;
+  experiment?: string;
 }
 
 export interface Metrics {
@@ -231,6 +233,25 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
 
   datasetPlotUrl: (name: string, path: string) =>
     `${API_BASE}/datasets/plot?name=${encodeURIComponent(name)}&path=${encodeURIComponent(path)}`,
+
+  /**
+   * Load a specific historical dataset from DataVault and plot with custom command.
+   * Used when user clicks "Plot in Experiments" on a historical record.
+   */
+  plotHistoricalDataset: async (name: string, path: string, command: string): Promise<{
+    success: boolean;
+    plot_filename?: string;
+    dataset_name?: string;
+    analysis_output?: string;
+    error?: string;
+  }> => {
+    const res = await fetch(`${API_BASE}/sessions/plot-historical`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, path, command }),
+    });
+    return res.json();
+  },
 
   getSessionTree: async () => {
     const res = await fetch(`${API_BASE}/sessions/tree`);
@@ -699,6 +720,78 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
 
   agentResetSession: async () => {
     const res = await fetch(`${API_BASE}/api/agent/reset`, { method: "POST" });
+    return res.json();
+  },
+
+  // ── Hermes Agent ──────────────────────────────────────────────────────────
+
+  hermesChat: async (message: string, model?: string, base_url?: string, enabled_toolsets?: string[], session_id?: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, model, base_url, enabled_toolsets, session_id }),
+    });
+    return res.json();
+  },
+
+  hermesChatStream: async function* (
+    message: string,
+    model?: string,
+    session_id?: string
+  ): AsyncGenerator<{ type: string; data: any }> {
+    const response = await fetch(`${API_BASE}/api/hermes/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, model, session_id }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("No response body");
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let currentEventType = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        // Strip SSE routing prefix if present: "SSE: {cid} | " or just pass through
+        let cleanLine = line;
+        if (cleanLine.startsWith('SSE: ')) {
+          const pipeIdx = cleanLine.indexOf('|');
+          if (pipeIdx > 0) {
+            cleanLine = cleanLine.substring(pipeIdx + 1).trimStart();
+          }
+        }
+
+        if (cleanLine.startsWith("event: ")) {
+          currentEventType = cleanLine.slice(7).trim();
+        } else if (cleanLine.startsWith("data: ")) {
+          const jsonData = cleanLine.slice(6);
+          try {
+            const data = JSON.parse(jsonData);
+            yield { type: currentEventType || "message", data };
+            currentEventType = ""; // reset after yielding
+          } catch (e) {
+            console.warn("Failed to parse SSE data:", jsonData);
+          }
+        }
+      }
+    }
+  },
+
+  hermesGetModels: async () => {
+    const res = await fetch(`${API_BASE}/api/hermes/models`);
     return res.json();
   },
 

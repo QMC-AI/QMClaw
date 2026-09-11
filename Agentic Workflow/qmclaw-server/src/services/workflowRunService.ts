@@ -95,7 +95,7 @@ export function listWorkflowRuns(workflowId?: string, workflowName?: string): Wo
 
       runs.push(run);
     } catch (e) {
-      console.error(`[workflow-run-service] Failed to read ${file}:`, e);
+      console.error(`[Database] Failed to read ${file}:`, e);
     }
   }
 
@@ -122,7 +122,7 @@ export function getWorkflowRun(id: string): WorkflowRun | null {
     const content = fs.readFileSync(filePath, 'utf-8');
     return JSON.parse(content) as WorkflowRun;
   } catch (e) {
-    console.error(`[workflow-run-service] Failed to read run ${id}:`, e);
+    console.error(`[Database] Failed to read run ${id}:`, e);
     return null;
   }
 }
@@ -136,7 +136,7 @@ export function saveWorkflowRun(run: WorkflowRun): WorkflowRun {
   const filePath = path.join(DATA_DIR, `${run.id}.json`);
   fs.writeFileSync(filePath, JSON.stringify(run, null, 2), 'utf-8');
 
-  console.log(`[workflow-run-service] Saved run: ${run.id}`);
+  console.log(`[Database] Saved run: ${run.id}`);
 
   return run;
 }
@@ -222,7 +222,7 @@ export function deleteWorkflowRun(id: string): boolean {
   }
 
   fs.unlinkSync(filePath);
-  console.log(`[workflow-run-service] Deleted run: ${id}`);
+  console.log(`[Database] Deleted run: ${id}`);
   return true;
 }
 
@@ -246,11 +246,11 @@ export function deleteWorkflowRunsByWorkflowId(workflowId: string): number {
         deletedCount++;
       }
     } catch (e) {
-      console.error(`[workflow-run-service] Failed to process ${file}:`, e);
+      console.error(`[Database] Failed to process ${file}:`, e);
     }
   }
 
-  console.log(`[workflow-run-service] Deleted ${deletedCount} runs for workflow: ${workflowId}`);
+  console.log(`[Database] Deleted ${deletedCount} runs for workflow: ${workflowId}`);
   return deletedCount;
 }
 

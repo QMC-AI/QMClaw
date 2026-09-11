@@ -36,7 +36,7 @@
       "name": "T1 Relaxation",
       "description": "Measure qubit relaxation time via variable delay pulse sequence",
       "function": "sq.t1",
-      "defaultCommand": "sq.t1({qubit}, do_plot=True)",
+      "defaultCommand": "sq.t1({qubit},zpa=0)",
       "defaultPlotCommand": "plt.title('T1 Relaxation')\nplt.xlabel('Delay (ns)')\nplt.ylabel('Population')\nplt.grid(True)",
       "defaultAnalysisCommand": "dp.T1(data)",
       "metricsToExtract": [

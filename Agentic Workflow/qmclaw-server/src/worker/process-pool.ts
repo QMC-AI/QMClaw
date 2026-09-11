@@ -29,9 +29,9 @@ export class ProcessPool {
       promises.push(
         bridge.start().then(() => {
           this.workers.set(workerId, bridge);
-          console.log(`[ProcessPool] ${workerId} started`);
+          console.log(`[Worker] ${workerId} started`);
         }).catch((err) => {
-          console.error(`[ProcessPool] ${workerId} failed to start:`, err);
+          console.error(`[Worker] ${workerId} failed to start:`, err);
         })
       );
     }
@@ -109,7 +109,7 @@ export class ProcessPool {
     for (const [id, bridge] of this.workers.entries()) {
       promises.push(
         bridge.stop().then(() => {
-          console.log(`[ProcessPool] ${id} stopped`);
+          console.log(`[Worker] ${id} stopped`);
         })
       );
     }

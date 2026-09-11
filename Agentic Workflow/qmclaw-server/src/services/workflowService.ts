@@ -63,7 +63,7 @@ export function listWorkflows(): StoredWorkflow[] {
       const workflow = JSON.parse(content) as StoredWorkflow;
       workflows.push(workflow);
     } catch (e) {
-      console.error(`[workflow-service] Failed to read ${file}:`, e);
+      console.error(`[Database] Failed to read ${file}:`, e);
     }
   }
 
@@ -90,7 +90,7 @@ export function getWorkflow(id: string): StoredWorkflow | null {
     const content = fs.readFileSync(filePath, 'utf-8');
     return JSON.parse(content) as StoredWorkflow;
   } catch (e) {
-    console.error(`[workflow-service] Failed to read workflow ${id}:`, e);
+    console.error(`[Database] Failed to read workflow ${id}:`, e);
     return null;
   }
 }
@@ -129,7 +129,7 @@ export function saveWorkflow(
   const filePath = path.join(DATA_DIR, `${workflowId}.json`);
   fs.writeFileSync(filePath, JSON.stringify(workflow, null, 2), 'utf-8');
 
-  console.log(`[workflow-service] Saved workflow: ${workflowId}`);
+  console.log(`[Database] Saved workflow: ${workflowId}`);
 
   return workflow;
 }
@@ -146,7 +146,7 @@ export function deleteWorkflow(id: string): boolean {
   }
 
   fs.unlinkSync(filePath);
-  console.log(`[workflow-service] Deleted workflow: ${id}`);
+  console.log(`[Database] Deleted workflow: ${id}`);
   return true;
 }
 
@@ -168,7 +168,7 @@ export function importWorkflow(jsonStr: string): StoredWorkflow | null {
 
     // Validate structure
     if (!data.name || !Array.isArray(data.nodes) || !Array.isArray(data.edges)) {
-      console.error('[workflow-service] Invalid workflow structure');
+      console.error('[Database] Invalid workflow structure');
       return null;
     }
 
@@ -182,7 +182,7 @@ export function importWorkflow(jsonStr: string): StoredWorkflow | null {
 
     return imported;
   } catch (e) {
-    console.error('[workflow-service] Failed to import workflow:', e);
+    console.error('[Database] Failed to import workflow:', e);
     return null;
   }
 }
@@ -225,7 +225,7 @@ export function listTemplates(): NodeTemplate[] {
       const template = JSON.parse(content) as NodeTemplate;
       templates.push(template);
     } catch (e) {
-      console.error(`[workflow-service] Failed to read template ${file}:`, e);
+      console.error(`[Database] Failed to read template ${file}:`, e);
     }
   }
 
@@ -253,7 +253,7 @@ export function saveTemplate(
   const filePath = path.join(TEMPLATES_DIR, `${templateId}.json`);
   fs.writeFileSync(filePath, JSON.stringify(template, null, 2), 'utf-8');
 
-  console.log(`[workflow-service] Saved template: ${templateId}`);
+  console.log(`[Database] Saved template: ${templateId}`);
 
   return template;
 }
@@ -270,6 +270,6 @@ export function deleteTemplate(id: string): boolean {
   }
 
   fs.unlinkSync(filePath);
-  console.log(`[workflow-service] Deleted template: ${id}`);
+  console.log(`[Database] Deleted template: ${id}`);
   return true;
 }

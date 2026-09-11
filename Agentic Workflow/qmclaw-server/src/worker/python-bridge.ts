@@ -54,16 +54,16 @@ export class PythonBridge {
         });
 
         this.process.stderr?.on("data", (data: Buffer) => {
-          console.error("[Python Worker stderr]:", data.toString());
+          console.error("[Worker]:", data.toString());
         });
 
         this.process.on("error", (err) => {
-          console.error("[Python Worker error]:", err);
+          console.error("[Worker]:", err);
           reject(err);
         });
 
         this.process.on("exit", (code) => {
-          console.log(`[Python Worker exited with code ${code}]`);
+          console.log(`[Worker] Python process exited with code ${code}`);
           this.process = null;
         });
 
@@ -135,6 +135,13 @@ export class PythonBridge {
       try {
         const response: JsonRpcResponse = JSON.parse(line);
 
+        // Check for READY signal from backend (has no valid id)
+        if (response.ready === true && !response.error) {
+          console.log("[Worker] Backend ready signal received, clearing pending requests");
+          this.clearPendingRequests();
+          continue;
+        }
+
         if (response.id && this.pendingRequests.has(response.id)) {
           const { resolve, reject } = this.pendingRequests.get(response.id)!;
           this.pendingRequests.delete(response.id);
@@ -146,9 +153,21 @@ export class PythonBridge {
           }
         }
       } catch (err) {
-        console.error("[Python Bridge] Failed to parse response:", err);
+        console.error("[Worker] Failed to parse response:", err);
       }
     }
+  }
+
+  /**
+   * Clear all pending requests (call when backend restarts)
+   */
+  clearPendingRequests(): void {
+    const count = this.pendingRequests.size;
+    this.pendingRequests.forEach(({ reject }) => {
+      reject(new Error("Backend restarted, request cancelled"));
+    });
+    this.pendingRequests.clear();
+    console.log(`[Worker] Cleared ${count} pending requests`);
   }
 
   // Convenience methods for common operations

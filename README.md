@@ -38,6 +38,24 @@ A scalable general-purpose framework for quantum measurement and control, provid
 
 ---
 
+## 📋 TODO
+
+### High Priority
+- [ ] **SSE 流式处理支持** - Agent 对话支持 Server-Sent Events 流式传输，实现实时进度更新
+  - 状态：当前使用轮询模式，需要解决 Python 后台线程 stdout 通信问题
+  - 相关文件：`job_runner.py`、`index.ts`、`AgentChatPanel.tsx`
+
+### Medium Priority
+- [ ] **Agent 记忆持久化** - 将 agent 对话历史存储到数据库，支持跨会话上下文
+- [ ] **多智能体协作** - 支持多个 agent 并行执行不同任务
+- [ ] **工作流可视化** - 在前端展示 agent 执行步骤的流程图
+
+### Nice to Have
+- [ ] **语音输入/输出** - 支持语音命令和语音播报结果
+- [ ] **自动化测试套件** - 为 agent 能力编写集成测试
+
+---
+
 ## 📦 Skill Index
 
 | Skill | Version | Purpose | Trigger Keywords |
@@ -205,6 +223,14 @@ qmclaw-skills/
 │  └── Cost: $0                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 📄 Paper
+
+If QMClaw is useful for your research, please cite our paper:
+
+**[QMClaw: A Scalable General-purpose Framework for Quantum Measurement and Control](https://arxiv.org/pdf/2609.04674)**
 
 ---
 

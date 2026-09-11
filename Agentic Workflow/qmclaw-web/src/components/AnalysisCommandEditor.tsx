@@ -34,36 +34,6 @@ export default function AnalysisCommandEditor({
     error?: string;
   } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
-  const [sessionInfo, setSessionInfo] = useState<{
-    sessionPath: string[];
-    currentDataset: string | null;
-    datasetName: string | null;
-  } | null>(null);
-
-  // Load current session and dataset info
-  const loadSessionInfo = useCallback(async () => {
-    try {
-      const data = await api.listQubits() as {
-        sessionPath: string[];
-        dataset?: { num: string; name: string };
-      };
-      setSessionInfo({
-        sessionPath: data.sessionPath || [],
-        currentDataset: data.dataset?.num || null,
-        datasetName: data.dataset?.name || null,
-      });
-    } catch (e) {
-      console.error("Failed to load session info:", e);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadSessionInfo();
-    // Listen for session changes
-    const handleSessionChange = () => loadSessionInfo();
-    window.addEventListener('qmclaw:session-changed', handleSessionChange);
-    return () => window.removeEventListener('qmclaw:session-changed', handleSessionChange);
-  }, [loadSessionInfo]);
 
   // Sync command and metrics when experiment type changes (props update)
   useEffect(() => {
@@ -186,33 +156,6 @@ export default function AnalysisCommandEditor({
           </button>
         </div>
       </div>
-
-      {/* Session Context Header */}
-      {sessionInfo && (
-        <div style={{
-          padding: "0.35rem 0.75rem",
-          background: "#0a0f1a",
-          borderBottom: "1px solid #1e293b",
-          fontFamily: "monospace",
-          fontSize: "0.7rem",
-        }}>
-          <div style={{ color: "#64748b", marginBottom: "0.15rem" }}>
-            {Array(40).fill("▬").join("")}
-          </div>
-          <div style={{ color: "#94a3b8" }}>
-            <span style={{ color: "#22c55e" }}>Current Session:</span> [{sessionInfo.sessionPath.filter(p => p).map(p => `'${p}'`).join(", ")}]
-          </div>
-          <div style={{ color: "#94a3b8" }}>
-            <span style={{ color: "#22c55e" }}>Current Dataset:</span> {sessionInfo.currentDataset ? `${sessionInfo.currentDataset}` : "None"}{sessionInfo.datasetName ? ` - ${sessionInfo.datasetName}` : ""}
-          </div>
-          <div style={{ color: "#94a3b8" }}>
-            <span style={{ color: "#22c55e" }}>Fitting Function:</span> {expType}
-          </div>
-          <div style={{ color: "#64748b", marginBottom: "0.15rem" }}>
-            {Array(40).fill("▬").join("")}
-          </div>
-        </div>
-      )}
 
       {/* Content */}
       <div style={{ padding: "0.75rem" }}>

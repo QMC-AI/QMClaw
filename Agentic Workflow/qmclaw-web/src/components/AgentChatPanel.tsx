@@ -8,6 +8,10 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { api } from "../lib/api";
 import { useModelStore } from "../store/modelStore";
+import MemoryPanel from "./MemoryPanel";
+import AgentToolsPanel from "./AgentToolsPanel";
+
+type AgentView = "chat" | "memory" | "tools";
 
 interface AgentStep {
   thought?: string;
@@ -46,6 +50,7 @@ export default function AgentChatPanel() {
   const [mode, setMode] = useState("react");
   const [running, setRunning] = useState(false);
   const [selectedModel, setSelectedModel] = useState("");
+  const [activeView, setActiveView] = useState<AgentView>("chat");
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const models = useModelStore((s) => s.models);
@@ -101,109 +106,17 @@ export default function AgentChatPanel() {
     try {
       const msgIndex = messages.length + 1;
 
-      // Update to running state
+      // Use non-blocking agent_chat (runs in Python background thread)
+      const result = await api.agentChat(userMsg, mode, { model_id: selectedModel });
+
+      // Update message with result
       updateMessage(msgIndex, {
-        status: "running",
-        content: "🔄 正在执行...",
-        progress: "初始化",
-      });
-
-      // Use the streaming endpoint (which collects all events)
-      const events = await api.agentChatSSE(userMsg, mode, { model_id: selectedModel });
-
-      // Process events and update UI progressively
-      let finalResponse = "";
-      let reflectionReport = "";
-      let steps: AgentStep[] = [];
-      let results: Record<string, number> = {};
-      let charts: string[] = [];
-
-      for (const event of events) {
-        const { type, data } = event;
-
-        switch (type) {
-          case "memory":
-            if (data.hasMemory && data.context) {
-              updateMessage(msgIndex, {
-                content: `📚 召回相关记忆:\n${data.context}`,
-              });
-            }
-            break;
-
-          case "thought":
-            updateMessage(msgIndex, {
-              progress: "LLM 思考中",
-              content: "🤔 LLM 正在思考下一步操作...",
-            });
-            break;
-
-          case "step":
-            const stepNum = data.step;
-            const newStep: AgentStep = {
-              tool: data.tool,
-              input: data.input,
-              observation: data.observation,
-            };
-            steps = [...steps, newStep];
-            updateMessage(msgIndex, {
-              steps: [...steps],
-              content: `⏳ 执行中 (Step ${stepNum})...`,
-              progress: `执行 Step ${stepNum}: ${data.tool}`,
-            });
-            break;
-
-          case "final":
-            finalResponse = data.content || "执行完成";
-            updateMessage(msgIndex, {
-              content: finalResponse,
-              progress: "完成",
-            });
-            break;
-
-          case "reflection":
-            reflectionReport = data.report || "";
-            updateMessage(msgIndex, {
-              reflectionReport,
-              content: finalResponse || "执行完成，正在反思...",
-              progress: "反思中",
-            });
-            break;
-
-          case "done":
-            // Final result
-            finalResponse = data.response || finalResponse;
-            results = data.results || {};
-            charts = data.charts || [];
-            updateMessage(msgIndex, {
-              content: finalResponse || "执行完成",
-              steps: data.steps || steps,
-              results,
-              charts,
-              reflectionReport: reflectionReport || data.reflection_report,
-              memoryContext: data.memoryContext,
-              status: "done",
-            });
-            break;
-
-          case "error":
-            updateMessage(msgIndex, {
-              content: `❌ 错误: ${data.error}`,
-              error: data.error,
-              status: "error",
-            });
-            break;
-        }
-
-        // Small delay to allow UI updates between events
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-
-      // Ensure final state is set
-      updateMessage(msgIndex, {
+        content: result.response || "执行完成",
+        steps: result.steps || [],
+        results: result.results || {},
+        charts: result.charts || [],
+        reflectionReport: result.reflection_report,
         status: "done",
-        content: finalResponse || "执行完成",
-        steps: steps.length > 0 ? steps : undefined,
-        results: Object.keys(results).length > 0 ? results : undefined,
       });
 
     } catch (e: any) {
@@ -232,6 +145,29 @@ export default function AgentChatPanel() {
         flexWrap: "wrap",
       }}>
         <span style={{ fontSize: "14px", fontWeight: 700, color: "#e2e8f0" }}>🤖 量子测控智能体</span>
+
+        {/* View toggle */}
+        <div style={{ display: "flex", gap: "4px" }}>
+          {(["chat", "memory", "tools"] as AgentView[]).map((v) => (
+            <button
+              key={v}
+              onClick={() => setActiveView(v)}
+              style={{
+                padding: "4px 10px",
+                borderRadius: "6px",
+                border: "1px solid",
+                borderColor: activeView === v ? "#38bdf8" : "#334155",
+                background: activeView === v ? "#1e3a5f" : "#0f172a",
+                color: activeView === v ? "#38bdf8" : "#64748b",
+                fontSize: "11px",
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+            >
+              {v === "chat" ? "💬 Chat" : v === "memory" ? "📚 Memory" : "🛠 Tools"}
+            </button>
+          ))}
+        </div>
 
         {/* Mode selector */}
         <div style={{ display: "flex", gap: "6px" }}>
@@ -277,7 +213,8 @@ export default function AgentChatPanel() {
         </select>
       </div>
 
-      {/* Chat area */}
+      {/* Content area - switch between views */}
+      {activeView === "chat" && (
       <div style={{
         flex: 1,
         overflowY: "auto",
@@ -461,8 +398,24 @@ export default function AgentChatPanel() {
 
         <div ref={bottomRef} />
       </div>
+      )}  {/* End of chat view */}
 
-      {/* Input area */}
+      {/* Memory view */}
+      {activeView === "memory" && (
+        <div style={{ flex: 1, overflow: "auto" }}>
+          <MemoryPanel />
+        </div>
+      )}
+
+      {/* Tools view */}
+      {activeView === "tools" && (
+        <div style={{ flex: 1, overflow: "auto" }}>
+          <AgentToolsPanel />
+        </div>
+      )}
+
+      {/* Input area - only show for chat view */}
+      {activeView === "chat" && (
       <div style={{
         background: "#1e293b",
         borderRadius: "8px",
@@ -517,6 +470,7 @@ export default function AgentChatPanel() {
           {running ? "..." : "➤"}
         </button>
       </div>
+      )}  {/* End of input area conditional */}
 
       <style>{`
         @keyframes pulse {

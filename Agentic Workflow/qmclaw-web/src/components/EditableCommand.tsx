@@ -112,7 +112,7 @@ export default function EditableCommand({ qubit, expType, onRun, onSave, initial
             overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
           }}
         >
-          {buildCommand(qubit, expType)}
+          {command}
         </div>
       )}
 

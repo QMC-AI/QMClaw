@@ -12,11 +12,12 @@ import { api, Metrics, ExperimentConfig } from "../lib/api";
 import EditableCommand from "../components/EditableCommand";
 import PlotCommandEditor from "../components/PlotCommandEditor";
 import AnalysisCommandEditor from "../components/AnalysisCommandEditor";
-import JobManager from "../components/JobManager";
+import JobsPanel from "../components/JobsPanel";
 import WorkflowDesigner from "../components/WorkflowDesigner";
 import { CompactSessionManager } from "../components/SessionManager";
 import ImageClassificationPanel from "../components/ImageClassificationPanel";
 import AgentChatPanel from "../components/AgentChatPanel";
+import HermesChatPanel from "../components/HermesChatPanel";
 import QubitParamsPanel from "../components/QubitParamsPanel";
 import ModelRegistry from "../components/ModelRegistry";
 import ExperimentConfigs from "../components/ExperimentConfigs";
@@ -53,15 +54,13 @@ function StatusDot({ label, status }: { label: string; status: string }) {
 
 async function checkHealth(
   setServerOk: (v: boolean) => void,
-  setFlaskOk: (v: boolean) => void,
   setQuickStatus: (s: QuickStatus | null) => void
 ) {
   try {
     const health = await api.ping() as {
-      express: string; flask: { status: string; ready: boolean } | "unreachable";
+      express: string; backend: { status: string; ready: boolean } | "unreachable";
     };
     setServerOk(true);
-    setFlaskOk(health.flask !== "unreachable" && health.flask?.ready === true);
     // Also fetch quick hardware status
     try {
       const qs = await api.getQuickStatus() as QuickStatus;
@@ -71,7 +70,6 @@ async function checkHealth(
     }
   } catch {
     setServerOk(false);
-    setFlaskOk(false);
     setQuickStatus(null);
   }
 }
@@ -109,8 +107,8 @@ function saveArray(key: string, value: string[]) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ }
 }
 
-// Tab: experiments, workflow, agent, images (jobs/services/agent-tools/memory 作为从属)
-type Tab = "experiments" | "workflow" | "agent" | "images";
+// Tab: experiments, workflow, agent, images, hermes
+type Tab = "experiments" | "workflow" | "agent" | "images" | "hermes";
 type ExpType = "spectroscopy" | "s21" | "iqraw" | "t1" | "xeb" | "ramsey" | "piamp" | "s21_dis" | "allxy" | "single_shot" | "pulsed_spec" | "swap" | "drag_calibrate";
 
 // ── Default values (used for SSR and fallback) ────────────────────────────────
@@ -139,7 +137,6 @@ function ActionBtn({ label, on, color, disabled }: { label: string; on: () => vo
 
 export default function Dashboard() {
   const [serverOk, setServerOk] = useState(false);
-  const [flaskOk, setFlaskOk] = useState(false);
   const [quickStatus, setQuickStatus] = useState<QuickStatus | null>(null);
   const [running, setRunning] = useState(false);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -248,12 +245,12 @@ export default function Dashboard() {
     }
   }, [addLog]);
 
-  // Load qubits on mount and when Flask becomes available
+  // Load qubits on mount and when backend becomes available
   useEffect(() => {
-    if (flaskOk) {
+    if (serverOk) {
       loadQubits();
     }
-  }, [flaskOk, loadQubits]);
+  }, [serverOk, loadQubits]);
 
   // Listen for session changes from SessionManager
   useEffect(() => {
@@ -271,10 +268,53 @@ export default function Dashboard() {
   }, [logs]);
 
   useEffect(() => {
-    checkHealth(setServerOk, setFlaskOk, setQuickStatus);
-    const interval = setInterval(() => checkHealth(setServerOk, setFlaskOk, setQuickStatus), 30_000);
+    checkHealth(setServerOk, setQuickStatus);
+    const interval = setInterval(() => checkHealth(setServerOk, setQuickStatus), 30_000);
     return () => clearInterval(interval);
   }, []);
+
+  // ── Plot historical dataset from DataVault ──────────────────────────────
+  const handlePlotHistoricalDataset = async (name: string, path: string) => {
+    if (running) {
+      addLog("⚠️ Cannot plot while experiment is running", true);
+      return;
+    }
+    setRunning(true);
+    setPlotUrl(null);
+    setAnalysisResult(null);
+    setAnalysisError(null);
+    setPlotAnalysisOutput(null);
+    setLlmSummary(null);
+    addLog(`📊 Plotting historical dataset: ${name}...`);
+
+    try {
+      const result = await api.plotHistoricalDataset(name, path, currentPlotCommand);
+
+      if (result.success && result.plot_filename) {
+        setPlotUrl(`/plots/${result.plot_filename}?t=${Date.now()}`);
+        if (result.analysis_output) {
+          setPlotAnalysisOutput(result.analysis_output);
+        }
+        addLog(`✅ Plot saved: ${result.dataset_name}`);
+      } else {
+        addLog(`❌ Plot failed: ${result.error || "Unknown error"}`, true);
+      }
+    } catch (e: any) {
+      addLog(`❌ ${e.message}`, true);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  // Listen for "plot in experiments" event from DatasetBrowser
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { name: string; path: string };
+      handlePlotHistoricalDataset(detail.name, detail.path);
+    };
+    window.addEventListener("dataset:plot-in-experiments", handler);
+    return () => window.removeEventListener("dataset:plot-in-experiments", handler);
+  }, [currentPlotCommand, running]);
 
   // ── Persistence wrappers ────────────────────────────────────────────────
   const setSelectedQubit = (q: string) => {
@@ -359,9 +399,7 @@ export default function Dashboard() {
       setJobId(id);
       addLog("Job: " + id);
 
-      const result = await api.waitForJob(id, (r) => {
-        if (r.status === "running") addLog("  running...");
-      });
+      const result = await api.waitForJob(id);
 
       if (result.status === "completed") {
         addLog("✅ Done (stdout " + (result.stdout?.length || 0) + " chars)");
@@ -416,9 +454,7 @@ export default function Dashboard() {
       setJobId(id);
       addLog("Job: " + id);
 
-      const result = await api.waitForJob(id, (r) => {
-        if (r.status === "running") addLog("  running...");
-      });
+      const result = await api.waitForJob(id);
 
       if (result.status === "completed") {
         addLog("✅ Done (stdout " + (result.stdout?.length || 0) + " chars)");
@@ -577,26 +613,6 @@ export default function Dashboard() {
     }
   };
 
-  // ── Measure all metrics ───────────────────────────────────────────────
-  const measureAllMetrics = async () => {
-    if (running) return;
-    setRunning(true);
-    setPlotUrl(null);
-    addLog("⏱ Measuring metrics...");
-    try {
-      const m = await api.measureMetrics(selectedQubit) as Metrics;
-      addLog(
-        "📊 fid=" + (m.readout_fidelity ?? 0).toFixed(4) + " | " +
-        "t1=" + (m.t1 ?? 0).toFixed(1) + "ns | " +
-        "gate=" + ((m.gate_fidelity ?? 0) * 100).toFixed(2) + "%"
-      );
-    } catch (e: any) {
-      addLog("❌ Metrics failed: " + e.message, true);
-    } finally {
-      setRunning(false);
-    }
-  };
-
   const expButtons: ExpType[] = ["spectroscopy", "s21", "iqraw", "t1", "ramsey", "piamp", "xeb", "s21_dis", "allxy", "single_shot", "pulsed_spec", "swap", "drag_calibrate"];
 
   // ── Render ─────────────────────────────────────────────────────────────
@@ -611,9 +627,6 @@ export default function Dashboard() {
           <CompactSessionManager />
           <span title="Express server" style={{ color: serverOk ? "#22c55e" : "#ef4444", fontSize: "0.75rem" }}>
             Express {serverOk ? "✅" : "❌"}
-          </span>
-          <span title="Flask backend" style={{ color: flaskOk ? "#22c55e" : "#ef4444", fontSize: "0.75rem" }}>
-            Flask {flaskOk ? "✅" : "❌"}
           </span>
           {/* Hardware status indicators */}
           {quickStatus && (
@@ -667,9 +680,11 @@ export default function Dashboard() {
           {/* Tab-specific content (top area) */}
           {activeTab === "experiments" && (
             <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", padding: "0.5rem" }}>
-              <JobManager
-                currentJobId={jobId}
-                onJobSelect={(id) => { setJobId(id); setActiveTab("experiments"); }}
+              <JobsPanel
+                selectedQubit={selectedQubit}
+                onSelectQubit={setSelectedQubit}
+                qubits={qubits}
+                onLoadQubits={loadQubits}
               />
             </div>
           )}
@@ -699,7 +714,7 @@ export default function Dashboard() {
           )}
 
           {/* Compact Qubit selector (bottom, fixed height) - not for images tab */}
-          {activeTab !== "images" && (
+          {activeTab !== "images" && activeTab !== "experiments" && (
           <div style={{
             borderTop: "1px solid #1e293b",
             padding: "0.5rem",
@@ -845,7 +860,7 @@ export default function Dashboard() {
 
           {/* Tab bar */}
           <div style={{ display: "flex", gap: "0.5rem", flexShrink: 0 }}>
-            {(["experiments", "workflow", "agent", "images"] as Tab[]).map((t) => (
+            {(["experiments", "workflow", "agent", "images", "hermes"] as Tab[]).map((t) => (
               <button key={t} onClick={() => setActiveTab(t)} style={{
                 padding: "0.4rem 1rem", borderRadius: "0.375rem", border: "none",
                 background: activeTab === t ? "#38bdf8" : "#1e293b",
@@ -957,7 +972,6 @@ export default function Dashboard() {
                 }}>
                   {running ? "⏳ Running..." : "▶ Run " + selectedExp.replace(/_/g, " ")}
                 </button>
-                <ActionBtn label="Measure Metrics" on={measureAllMetrics} color="#0ea5e9" disabled={running} />
                 {expButtons.map((e) => (
                   <ActionBtn key={e} label={e.replace(/_/g, " ")} on={() => runExperiment(e)} disabled={running} />
                 ))}
@@ -1180,6 +1194,11 @@ export default function Dashboard() {
           {/* AGENT TAB */}
           {activeTab === "agent" && (
             <AgentChatPanel />
+          )}
+
+          {/* HERMES TAB */}
+          {activeTab === "hermes" && (
+            <HermesChatPanel />
           )}
 
         </main>

@@ -37,7 +37,7 @@ export class RealtimeServer {
 
   private setupHandlers(): void {
     this.io.on("connection", (socket: Socket) => {
-      console.log(`[WebSocket] Client connected: ${socket.id}`);
+      console.log(`[System] Client connected: ${socket.id}`);
 
       // Handle subscription requests
       socket.on("message", (data: string) => {
@@ -45,12 +45,12 @@ export class RealtimeServer {
           const msg: ClientMessage = JSON.parse(data);
           this.handleMessage(socket, msg);
         } catch (err) {
-          console.error("[WebSocket] Failed to parse message:", err);
+          console.error("[System] Failed to parse message:", err);
         }
       });
 
       socket.on("disconnect", () => {
-        console.log(`[WebSocket] Client disconnected: ${socket.id}`);
+        console.log(`[System] Client disconnected: ${socket.id}`);
         this.removeSocketFromAllSubscriptions(socket.id);
       });
     });
@@ -76,7 +76,7 @@ export class RealtimeServer {
     this.subscriptions.get(subscriptionKey)!.add(socket.id);
 
     socket.join(subscriptionKey);
-    console.log(`[WebSocket] ${socket.id} subscribed to ${subscriptionKey}`);
+    console.log(`[System] ${socket.id} subscribed to ${subscriptionKey}`);
   }
 
   private unsubscribe(socket: Socket, channel: string, jobId?: string): void {
@@ -91,7 +91,7 @@ export class RealtimeServer {
     }
 
     socket.leave(subscriptionKey);
-    console.log(`[WebSocket] ${socket.id} unsubscribed from ${subscriptionKey}`);
+    console.log(`[System] ${socket.id} unsubscribed from ${subscriptionKey}`);
   }
 
   private removeSocketFromAllSubscriptions(socketId: string): void {
