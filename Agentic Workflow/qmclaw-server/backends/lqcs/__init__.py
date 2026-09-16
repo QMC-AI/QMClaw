@@ -163,9 +163,12 @@ class LQCSBackend:
 
             # Connect to LabRAD
             print("[LQCS Backend] About to call labrad.connect()...", file=sys.stderr, flush=True)
+            print("[LQCS Backend] NOTE: If this hangs, LabRAD server may not be running!", file=sys.stderr, flush=True)
+            sys.stderr.flush()
+            print("[LQCS Backend] Calling labrad.connect() now...", file=sys.stderr, flush=True)
             sys.stderr.flush()
             self._cxn = labrad.connect()
-            print("[LQCS Backend] LabRAD connected!", file=sys.stderr, flush=True)
+            print("[LQCS Backend] LabRAD connected! Connection ID:", self._cxn.ID if hasattr(self._cxn, 'ID') else 'unknown', file=sys.stderr, flush=True)
             print("[LQCS Backend] Calling util.setWiringInfo()...", file=sys.stderr, flush=True)
             util.setWiringInfo(self._cxn)
             print("[LQCS Backend] setWiringInfo done", file=sys.stderr, flush=True)

@@ -18,77 +18,50 @@ export default function DatasetBrowser() {
   const [switchUser, setSwitchUser] = useState("");
   const [switchPath, setSwitchPath] = useState("");
 
-  // Load session config on mount
+  // Load session config on mount from quantum service
   useEffect(() => {
-    loadSessionConfig();
+    const loadConfig = async () => {
+      try {
+        const res = await api.listQubits() as { sessionPath?: string[]; error?: string };
+        if (res.sessionPath && res.sessionPath.length > 0) {
+          const sp = res.sessionPath;
+          const user = sp.length > 1 ? sp[1] : 'LQHL';
+          const path = sp.slice(2);
+          setSessionConfig({ user, path });
+          setPath("/" + user + "/" + path.join("/"));
+          setSwitchUser(user);
+          setSwitchPath(path.join("/"));
+        }
+      } catch (e) {
+        console.error("[DatasetBrowser] Failed to load session config:", e);
+      }
+    };
+    loadConfig();
   }, []);
 
-  // Check LabRAD availability before loading datasets
+  // Check LabRAD availability via quantum service
   const checkLabradAvailable = async (): Promise<boolean> => {
-    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
     try {
-      const res = await fetch(`${API_BASE}/hardware/quick`);
-      if (res.ok) {
-        const data = await res.json();
-        return data.labrad === "ok";
-      }
+      const res = await api.listQubits() as { error?: string };
+      return !res.error;
     } catch { /* ignore */ }
     return false;
-  };
-
-  const loadSessionConfig = async () => {
-    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
-    try {
-      const res = await fetch(`${API_BASE}/sessions/config`);
-      if (res.ok) {
-        const data = await res.json();
-        setSessionConfig({ user: data.user, path: data.path });
-        setPath("/" + data.user + "/" + data.path.join("/"));
-        setSwitchUser(data.user);
-        setSwitchPath(data.path.join("/"));
-      }
-    } catch (e) {
-      console.error("Failed to load session config:", e);
-    }
   };
 
   const handleSwitchSession = async () => {
     if (!switchUser || !switchPath) return;
     const pathSegments = switchPath.split("/").filter(Boolean);
-    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
     try {
-      // First save to config file
-      const saveRes = await fetch(`${API_BASE}/sessions/config`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user: switchUser, path: pathSegments }),
-      });
-
-      if (!saveRes.ok) {
-        throw new Error("Failed to save config");
-      }
-
-      // Then switch session in job_runner.py (this updates the _data object)
-      const switchRes = await fetch(`${API_BASE}/sessions/switch`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user: switchUser, path: pathSegments }),
-      });
-
-      if (switchRes.ok) {
-        await loadSessionConfig();
-        setShowSessionSwitcher(false);
-        // Reload datasets with new path
-        loadDatasets("/" + switchUser + "/" + switchPath);
-      } else {
-        const errorData = await switchRes.json().catch(() => ({}));
-        if (errorData.error?.includes("data_vault") || errorData.error?.includes("NoneType")) {
-          setLabradAvailable(false);
-          setError("LabRAD 服务器未连接，请先启动测控服务");
-        } else {
-          throw new Error(errorData.error || "Failed to switch session");
-        }
-      }
+      // Switch session via quantum service API
+      const sessionPath = ['', switchUser, ...pathSegments];
+      await api.switchSession(sessionPath);
+      setSessionConfig({ user: switchUser, path: pathSegments });
+      setPath("/" + switchUser + "/" + pathSegments.join("/"));
+      setShowSessionSwitcher(false);
+      // Reload datasets with new path
+      loadDatasets("/" + switchUser + "/" + switchPath);
+      // Notify other components
+      window.dispatchEvent(new CustomEvent('qmclaw:session-changed', { detail: { path: sessionPath } }));
     } catch (e: any) {
       console.error("Failed to switch session:", e);
       setError(e.message);

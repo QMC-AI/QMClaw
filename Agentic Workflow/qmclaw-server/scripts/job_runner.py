@@ -18,7 +18,8 @@ Usage:
 import os
 import sys
 import json
-from typing import Dict, Any
+import subprocess
+from typing import Dict, Any, Optional, List
 import base64
 import time
 import signal
@@ -26,10 +27,366 @@ import traceback
 import tempfile
 import urllib.parse
 import threading
+import atexit
 
 # PLOTS_DIR shared with Express server
 PLOTS_DIR = os.environ.get("PLOTS_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "..", "qmclaw-web", "public", "plots"))
 from io import StringIO
+
+# ── Service Manager (Auto-start microservices) ─────────────────────────────────
+
+class ServiceManager:
+    """自动管理微服务的启动和停止"""
+
+    SERVICES = {
+        "llm": {
+            "port": 3006,
+            "script": "services/llm_service/server.py",
+            "description": "LLM Service",
+        },
+        "quantum": {
+            "port": 3003,
+            "script": "services/quantum_service/server.py",
+            "description": "Quantum Service",
+        },
+        "analysis": {
+            "port": 3004,
+            "script": "services/analysis_service/server.py",
+            "description": "Analysis Service",
+        },
+        "agent": {
+            "port": 3005,
+            "script": "services/agent_service/server.py",
+            "description": "Agent Service",
+        },
+        "image": {
+            "port": 3007,
+            "script": "services/image_service/server.py",
+            "description": "Image Service",
+        },
+        "workflow": {
+            "port": 3008,
+            "script": "services/workflow_service/server.py",
+            "description": "Workflow Service",
+        },
+        "task_queue": {
+            "port": 3009,
+            "script": "services/task_queue/server.py",
+            "description": "Task Queue Service",
+        },
+    }
+
+    def __init__(self):
+        self.processes: Dict[str, Any] = {}
+        self.server_dir = os.path.dirname(os.path.dirname(__file__))
+        self._started = False
+
+    def _check_port_available(self, port: int) -> bool:
+        """检查端口是否可用"""
+        import socket
+        try:
+            with socket.create_connection(("localhost", port), timeout=1):
+                return False  # 端口被占用
+        except (OSError, socket.timeout):
+            return True  # 端口可用
+
+    def _wait_for_service(self, name: str, port: int, timeout: int = 30) -> bool:
+        """等待服务就绪"""
+        import urllib.request
+        import urllib.error
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self._check_port_available(port):
+                time.sleep(0.5)
+                continue
+            try:
+                url = f"http://localhost:{port}/health"
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=2) as response:
+                    if response.status == 200:
+                        print(f"SERVICE_MGR: {name} is ready (port {port})", file=sys.stderr, flush=True)
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        print(f"SERVICE_MGR: {name} failed to start within {timeout}s", file=sys.stderr, flush=True)
+        return False
+
+    def start_all(self, services: Optional[List[str]] = None, timeout: int = 30) -> bool:
+        """启动所有或指定的服务"""
+        if self._started:
+            print("SERVICE_MGR: Already started", file=sys.stderr, flush=True)
+            return True
+
+        if services is None:
+            services = list(self.SERVICES.keys())
+
+        print(f"SERVICE_MGR: Starting services: {', '.join(services)}", file=sys.stderr, flush=True)
+
+        started = []
+        for name in services:
+            if name not in self.SERVICES:
+                print(f"SERVICE_MGR: Unknown service: {name}", file=sys.stderr, flush=True)
+                continue
+
+            svc = self.SERVICES[name]
+            port = svc["port"]
+
+            # 检查端口是否已被占用
+            if not self._check_port_available(port):
+                print(f"SERVICE_MGR: {name} port {port} already in use, skipping", file=sys.stderr, flush=True)
+                continue
+
+            script_path = os.path.join(self.server_dir, svc["script"])
+            if not os.path.exists(script_path):
+                print(f"SERVICE_MGR: {name} script not found: {script_path}", file=sys.stderr, flush=True)
+                continue
+
+            print(f"SERVICE_MGR: Starting {name} ({svc['description']})...", file=sys.stderr, flush=True)
+
+            try:
+                env = os.environ.copy()
+                # 确保 Python 使用 UTF-8 编码
+                env["PYTHONIOENCODING"] = "utf-8"
+
+                proc = subprocess.Popen(
+                    [sys.executable, script_path],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=self.server_dir,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if sys.platform == 'win32' else 0,
+                )
+                self.processes[name] = proc
+                started.append(name)
+                print(f"SERVICE_MGR: {name} started (PID: {proc.pid})", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"SERVICE_MGR: Failed to start {name}: {e}", file=sys.stderr, flush=True)
+
+        if not started:
+            print("SERVICE_MGR: No services started", file=sys.stderr, flush=True)
+            self._started = True
+            return True
+
+        # 等待所有服务就绪
+        print(f"SERVICE_MGR: Waiting for {len(started)} services to be ready...", file=sys.stderr, flush=True)
+        all_ready = True
+        for name in started:
+            svc = self.SERVICES[name]
+            if not self._wait_for_service(name, svc["port"], timeout):
+                all_ready = False
+
+        if all_ready:
+            print(f"SERVICE_MGR: All {len(started)} services ready!", file=sys.stderr, flush=True)
+        else:
+            print("SERVICE_MGR: Some services failed to start", file=sys.stderr, flush=True)
+
+        self._started = True
+        return all_ready
+
+    def stop_all(self):
+        """停止所有服务"""
+        if not self.processes:
+            return
+
+        print("SERVICE_MGR: Stopping all services...", file=sys.stderr, flush=True)
+        for name, proc in self.processes.items():
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    print(f"SERVICE_MGR: {name} terminated", file=sys.stderr, flush=True)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    print(f"SERVICE_MGR: {name} killed", file=sys.stderr, flush=True)
+
+        self.processes.clear()
+        print("SERVICE_MGR: All services stopped", file=sys.stderr, flush=True)
+
+
+# 全局服务管理器
+_service_manager: Optional[ServiceManager] = None
+
+def _get_service_manager() -> ServiceManager:
+    global _service_manager
+    if _service_manager is None:
+        _service_manager = ServiceManager()
+    return _service_manager
+
+
+# ── Service Proxy (Progressive Migration) ──────────────────────────────────────
+# 尝试导入服务代理模块用于渐进式迁移
+_service_proxy = None
+_use_services = os.environ.get("QMCLAW_USE_SERVICES", "false").lower() == "true"
+
+if _use_services:
+    try:
+        # 添加 server 目录到路径
+        _server_dir = os.path.dirname(os.path.dirname(__file__))
+        if _server_dir not in sys.path:
+            sys.path.insert(0, _server_dir)
+        from services import client_proxy
+        _service_proxy = client_proxy
+        print(f"SERVICE_PROXY: Using microservices mode", file=sys.stderr, flush=True)
+
+        # 自动启动所有微服务
+        mgr = _get_service_manager()
+        mgr.start_all()
+
+        # 注册退出时停止所有服务
+        atexit.register(_stop_all_services)
+    except ImportError as e:
+        print(f"SERVICE_PROXY: Failed to import client_proxy: {e}", file=sys.stderr, flush=True)
+        _service_proxy = None
+else:
+    print(f"SERVICE_PROXY: Using legacy mode (set QMCLAW_USE_SERVICES=true to enable)", file=sys.stderr, flush=True)
+
+def _stop_all_services():
+    """退出时停止所有微服务"""
+    global _service_manager
+    if _service_manager:
+        _service_manager.stop_all()
+        _service_manager = None
+
+# 注册信号处理器 - 当收到终止信号时停止服务
+def _signal_handler(signum, frame):
+    print(f"SERVICE_MGR: Received signal {signum}, stopping services...", file=sys.stderr, flush=True)
+    _stop_all_services()
+    # 重新抛出信号让默认处理器继续
+    signal.signal(signum, signal.SIG_DFL)
+    raise KeyboardInterrupt
+
+# 只在启用服务模式时注册信号处理器
+if _use_services:
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+else:
+    print(f"SERVICE_PROXY: Using legacy mode (set QMCLAW_USE_SERVICES=true to enable)", file=sys.stderr, flush=True)
+
+
+# ── Migration Helper Functions ──────────────────────────────────────────────────
+# 渐进式迁移: 优先使用服务代理，失败时回退到本地实现
+
+def _try_service_call(service_method, fallback_result=None, fallback_error_msg=None):
+    """尝试调用服务方法，失败时返回回退值"""
+    if not _service_proxy:
+        return fallback_result
+    try:
+        result = service_method()
+        if "error" in result and result["error"]:
+            print(f"SERVICE_PROXY: Service call failed: {result['error']}, falling back to legacy", file=sys.stderr)
+            return fallback_result
+        return result
+    except Exception as e:
+        print(f"SERVICE_PROXY: Service call exception: {e}, falling back to legacy", file=sys.stderr)
+        return fallback_result
+
+
+# ── Backend action handlers (progressive migration to services) ─────────────────
+
+def _handle_backend_action(action: str, data: dict, cid: str = "") -> dict:
+    """Handle backend-style requests - progressive migration to microservices.
+
+    When QMCLAW_USE_SERVICES=true, this function will delegate to microservices.
+    Otherwise, it uses the legacy direct LabRAD calls.
+    """
+    # 如果启用服务模式，尝试使用服务代理
+    if _use_services and _service_proxy:
+        return _handle_backend_action_via_services(action, data, cid)
+    else:
+        # 保持原有实现直到迁移完成
+        return _handle_backend_request_legacy(action, data, cid)
+
+
+def _handle_backend_action_via_services(action: str, data: dict, cid: str = "") -> dict:
+    """Handle backend actions via microservices."""
+    try:
+        # ── health ──────────────────────────────────────────────────────────────
+        if action == "health":
+            result = _service_proxy.quantum.status()
+            return {"cid": cid, "action": action, "data": {
+                "status": "running",
+                "ready": True,
+                "busy": False,
+                "session": result if result.get("connected") else {
+                    "conn_id": "",
+                    "name": "",
+                    "host": "",
+                    "port": 0,
+                    "connected": False,
+                }
+            }}
+
+        # ── experiments ────────────────────────────────────────────────────────
+        elif action == "experiments":
+            result = _service_proxy.quantum.experiments()
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── sessions ────────────────────────────────────────────────────────────
+        elif action == "sessions":
+            result = _service_proxy.quantum.sessions()
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── session_tree ────────────────────────────────────────────────────────
+        elif action == "session_tree":
+            max_depth = data.get("max_depth", 5)
+            result = _service_proxy.quantum.session_tree(max_depth)
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── switch_session ──────────────────────────────────────────────────────
+        elif action == "switch_session":
+            # switch_session 需要特殊处理(保存配置、重新加载qubits)，保持本地
+            return _handle_backend_request_original(action, data, cid)
+
+        # ── list_qubits ────────────────────────────────────────────────────────
+        elif action == "list_qubits":
+            result = _service_proxy.quantum.qubits()
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── get_qubit_params ───────────────────────────────────────────────────
+        elif action == "get_qubit_params":
+            qname = data.get("name")
+            if not qname:
+                return {"cid": cid, "action": action, "error": "Qubit name required"}
+            result = _service_proxy.quantum.qubit_params(qname)
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── set_qubit_params ────────────────────────────────────────────────────
+        elif action == "set_qubit_params":
+            qname = data.get("name")
+            params = data.get("params", {})
+            if not qname:
+                return {"cid": cid, "action": action, "error": "Qubit name required"}
+            result = _service_proxy.quantum.set_qubit_params(qname, params)
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── datasets ────────────────────────────────────────────────────────────
+        elif action == "datasets":
+            path = data.get("path")
+            result = _service_proxy.quantum.datasets(path)
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── debug_env, debug_data, test_load_dataset, plot_dataset, plot ────────
+        # 这些操作需要访问本地状态，保持本地实现
+        else:
+            return _handle_backend_request_original(action, data, cid)
+
+    except Exception as e:
+        print(f"SERVICE_PROXY: Error handling {action}: {e}", file=sys.stderr)
+        # 服务出错时回退到本地实现
+        return _handle_backend_request_original(action, data, cid)
+
+
+def _legacy_handle_backend_request(action: str, data: dict, cid: str = "") -> dict:
+    """Legacy implementation of backend request handling.
+
+    This is the original handle_backend_request function preserved for
+    backward compatibility and for actions that haven't been migrated yet.
+    """
+    # The original implementation is below, after the Image Classification section
+    return _handle_backend_request_original(action, data, cid)
 
 
 def _sanitize_string(s):
@@ -267,6 +624,7 @@ def reload_qubits(session_path):
         from lqms.pyle.workflow import switchSession
         from lqms.utils.save_path import get_info_path
         from lqms.data_process import dataAnalysisCore as dc
+        import threading
 
         # Switch session
         if session_path:
@@ -277,8 +635,27 @@ def reload_qubits(session_path):
 
         print(f"RELOAD_QUBITS: Switching to session path={session_path}, user={user}", file=sys.stderr, flush=True)
 
-        # Create new session switcher
-        _s = switchSession(_cxn, user=user)
+        # Create new session switcher with timeout protection
+        switch_result = {"session": None, "error": None}
+        def _switch():
+            try:
+                switch_result["session"] = switchSession(_cxn, user=user)
+            except Exception as e:
+                switch_result["error"] = e
+
+        switch_thread = threading.Thread(target=_switch)
+        switch_thread.daemon = True
+        switch_thread.start()
+        switch_thread.join(timeout=30)  # 30 second timeout
+
+        if switch_thread.is_alive():
+            print("RELOAD_QUBITS: switchSession TIMEOUT after 30 seconds!", file=sys.stderr, flush=True)
+            return False
+        elif switch_result["error"]:
+            raise switch_result["error"]
+        else:
+            _s = switch_result["session"]
+
         print(f"RELOAD_QUBITS: Created new session switcher, _s keys count={len(list(_s.keys()))}", file=sys.stderr, flush=True)
 
         # Reload info and data lab
@@ -2779,7 +3156,20 @@ def run_workflow(workflow_json: str, workflow_id: str):
 # ── backend-style endpoints (integrated, no separate backend server) ──────────────────
 
 def handle_backend_request(action, data):
-    """Handle backend-style requests using the pre-initialized LabRAD connection."""
+    """Handle backend-style requests - progressive migration to microservices.
+
+    When QMCLAW_USE_SERVICES=true and services are available, this delegates to microservices.
+    Otherwise, it falls back to the legacy implementation.
+    """
+    cid = data.get("cid", "")
+    return _handle_backend_action(action, data, cid)
+
+
+def _handle_backend_request_original(action, data, cid=""):
+    """Original implementation of handle_backend_request.
+
+    This contains all the original backend request handling logic.
+    """
     cid = data.get("cid", "")
 
     try:
@@ -4849,8 +5239,13 @@ sys.stderr.flush()
 sys.stdout.flush()
 
 # Process backend requests in the main thread to avoid threading issues with stdin
+print("[EVENT_LOOP] About to enter stdin loop, sys.stdin type:", type(sys.stdin), file=sys.stderr, flush=True)
+print("[EVENT_LOOP] sys.stdin.isatty():", sys.stdin.isatty(), file=sys.stderr, flush=True)
+print("[EVENT_LOOP] sys.stdin.fileno():", sys.stdin.fileno() if hasattr(sys.stdin, 'fileno') else 'N/A', file=sys.stderr, flush=True)
+sys.stdout.flush()
 print("[EVENT_LOOP] Starting event loop...", file=sys.stderr, flush=True)
 for line in sys.stdin:
+    print(f"[EVENT_LOOP] Received line: {line[:200]}", file=sys.stderr, flush=True)
     line = line.strip()
     if not line:
         continue

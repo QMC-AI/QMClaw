@@ -2,14 +2,41 @@
  * qmclaw-server - Main Entry Point
  *
  * Architecture:
- *   Browser → Express (:3002) → Python subprocess (LabRAD + lqms)
- *                 ↓
- *              Single persistent subprocess (avoids 20s re-init per job)
+ *   Browser → Express (:3002) → Microservices (LLM, Quantum, Analysis, Agent, Image, Workflow, TaskQueue)
+ *
+ * Modes:
+ *   - Microservices mode (default): /api/* routes proxy to microservices
+ *   - Legacy mode (QMCLAW_USE_SERVICES=false): uses job_runner.py subprocess
  */
+
+import { createServiceProxy } from "./services/serviceProxy";
+
+// ── Mode Configuration ────────────────────────────────────────────────────────
+// 微服务模式：Express 只做网关，/api/* 路由代理到微服务
+// Legacy 模式：Express 启动 job_runner.py 子进程，处理 /job/* 等路由
+// 配置位置: config/services.json -> mode.use_microservices
+
+import * as fs from "fs";
+import path from "path";
+
+// Load service configuration for mode setting
+const servicesConfigPath = path.join(__dirname, "..", "config", "services.json");
+let servicesConfig: { mode?: { use_microservices?: boolean } } = {};
+try {
+  servicesConfig = JSON.parse(fs.readFileSync(servicesConfigPath, "utf-8"));
+} catch (e) {
+  console.warn("[Config] Failed to load services.json:", e);
+}
+
+// Default to true, can be overridden by env var for quick testing
+const USE_MICROSERVICES = process.env.QMCLAW_USE_SERVICES === "false"
+  ? false
+  : (servicesConfig.mode?.use_microservices ?? true);
+console.log("[Server] Mode:", USE_MICROSERVICES ? "Microservices" : "Legacy (job_runner.py)");
+console.log("[Server] Mode config source:", process.env.QMCLAW_USE_SERVICES ? "ENV" : "services.json");
 
 // Load environment variables from .env file (override existing to ensure .env takes precedence)
 import dotenv from "dotenv";
-import path from "path";
 const envPath = path.join(__dirname, "..", ".env");
 console.log("[Debug] Loading .env from:", envPath);
 dotenv.config({
@@ -25,10 +52,19 @@ console.log("[Debug] __dirname:", __dirname);
 import express from "express";
 import { createServer } from "http";
 import cors from "cors";
-import { spawn } from "child_process";
 import { generateJobId } from "./queue/job-types";
-import * as fs from "fs";
 import { loadExperimentConfigs, saveExperimentConfigs, getExperimentConfig, updateExperimentConfig, ExperimentConfig } from "./services/experimentConfigService";
+
+// ── Legacy Mode Only Imports ───────────────────────────────────────────────────
+let spawn: typeof import("child_process").spawn | null = null;
+let pyProc: ReturnType<ReturnType<typeof import("child_process").spawn>> | null = null;
+let pyProcReady = false;
+let sseBuffer = "";
+let bufferedSseCid = "";
+
+if (!USE_MICROSERVICES) {
+  spawn = require("child_process").spawn;
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Logging Filter Configuration
@@ -41,13 +77,19 @@ import { loadExperimentConfigs, saveExperimentConfigs, getExperimentConfig, upda
 // Python 端使用 INIT: / WORKFLOW_NODE: / QMCLAW_PLOT: 等格式
 
 /**
- * 日志过滤器 - 通过注释/取消注释控制日志显示
+ * 日志过滤器 - 调试模式：打印所有日志
  *
- * 使用方法：
- *   line.includes("[Tag]") ||  // ✅ Tag - 说明（取消注释即显示）
- *   // line.includes("[Tag]") ||  // ❌ Tag - 说明（注释掉即隐藏）
+ * 设置 ENABLE_LOG_FILTER = true 启用过滤（生产模式）
+ * 设置 ENABLE_LOG_FILTER = false 打印所有日志（调试模式）
  */
+const ENABLE_LOG_FILTER = false;  // 调试模式：false = 打印所有日志
+
 function shouldPrintLog(line: string): boolean {
+  // 调试模式：打印所有日志
+  if (!ENABLE_LOG_FILTER) {
+    return true;
+  }
+
   // ══════════════════════════════════════════════════════════════════════════════
   // TypeScript 端
   // ══════════════════════════════════════════════════════════════════════════════
@@ -71,6 +113,7 @@ function shouldPrintLog(line: string): boolean {
     // line.includes("[MiniMax Debug]") ||  // ❌ MiniMax Debug - MiniMax调试
     // line.includes("[LQCS Backend]") ||  // ❌ LQCS Backend - LQCS后端初始化
     // line.includes("[backends init_backend]") ||  // ❌ backends init_backend - backends初始化
+    // line.includes("INIT:") ||  // ❌ INIT: - 初始化日志
     false) {
     return true;
   }
@@ -96,6 +139,14 @@ function shouldPrintLog(line: string): boolean {
     line.includes("LLM_ERR:") ||  // ✅ LLM_ERR: - LLM错误
     line.includes("RELOAD_QUBITS:") ||  // ✅ RELOAD_QUBITS: - 量子比特重载
     line.includes("QmClaw Server Controller") ||  // ✅ QmClaw Server Controller - 服务控制
+    line.includes("[EVENT]") ||  // ✅ [EVENT] - backend请求事件
+    line.includes("[EVENT_LOOP]") ||  // ✅ [EVENT_LOOP] - 事件循环调试
+    line.includes("[backends") ||  // ✅ [backends - backends模块日志
+    line.includes("[LQCS Backend]") ||  // ✅ [LQCS Backend] - LQCS后端日志
+    line.includes("TIMEOUT") ||  // ✅ TIMEOUT - 超时信息
+    line.includes("SINGLE_NODE:") ||  // ✅ SINGLE_NODE: - 单节点执行
+    line.includes(">>> FORCE LOG") ||  // ✅ FORCE LOG - 强制日志
+    line.includes("INIT: Starting backend initialization") ||  // ✅ INIT: backend init开始
 
     // ── 以下默认隐藏 ──────────────────────────────────────────────────────────
     // line.includes("INIT:") ||  // ❌ INIT: - 初始化日志
@@ -121,7 +172,7 @@ function shouldPrintLog(line: string): boolean {
   return false;
 }
 
-const PORT = process.env.PORT || 3002;
+const PORT = process.env.PORT || 8080;
 const PLOTS_DIR = process.env.PLOTS_DIR || path.join(__dirname, "..", "..", "qmclaw-web", "public", "plots");
 const PYTHON_BIN = process.env.PYTHON_BIN || "python";
 const SESSION_CONFIG_FILE = path.join(__dirname, "..", "config", "session.json");
@@ -166,6 +217,11 @@ function getDefaultSessionPath(): string {
 // ── JSONL Line Processor ────────────────────────────────────────────────────────
 
 function processJsonlLine(line: string): void {
+  // Skip non-JSON lines (e.g., LabRAD/lqms output like "TORCH_DEVCIE=cpu", "Registry Root is ...")
+  if (!line.trim().startsWith('{')) {
+    return;
+  }
+
   try {
     const obj = JSON.parse(line);
 
@@ -252,8 +308,96 @@ type backendPendingEntry = {
 };
 const backendPendingRequests = new Map<string, backendPendingEntry>();
 
+// ── Microservice Proxy Function ─────────────────────────────────────────────────
+
+type ServiceName = 'quantum' | 'analysis' | 'agent' | 'hermes' | 'llm' | 'image' | 'workflow';
+
+const SERVICE_PORTS: Record<ServiceName, number> = {
+  quantum: 3003,
+  analysis: 3004,
+  agent: 3005,
+  hermes: 3005,   // Hermes uses agent service port
+  llm: 3006,
+  image: 3007,
+  workflow: 3008,
+};
+
+interface ProxyResult {
+  ok: boolean;
+  data?: unknown;
+  error?: string;
+}
+
+/**
+ * Proxy an HTTP request to a microservice.
+ * @param service - The target microservice name
+ * @param path - The API path (e.g., '/qubits', '/execute')
+ * @param method - HTTP method
+ * @param body - Request body (for POST/PUT requests)
+ * @param isFormData - Whether body is FormData
+ */
+async function proxyToService(
+  service: ServiceName,
+  path: string,
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE',
+  body?: unknown,
+  isFormData = false,
+): Promise<ProxyResult> {
+  const port = SERVICE_PORTS[service] || 3003;
+  const url = `http://localhost:${port}${path}`;
+
+  console.log(`[Proxy] ${method} ${service} -> ${url}`);
+
+  try {
+    const headers: Record<string, string> = {};
+    if (!isFormData) {
+      headers['Content-Type'] = 'application/json';
+    }
+
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: isFormData ? (body as FormData) : (body ? JSON.stringify(body) : undefined),
+      signal: AbortSignal.timeout(120_000), // 2 minute timeout for long operations
+    });
+
+    const contentType = response.headers.get('content-type') || '';
+
+    // Handle streaming responses (SSE)
+    if (contentType.includes('text/event-stream')) {
+      const text = await response.text();
+      return { ok: true, data: text };
+    }
+
+    // Parse JSON response
+    if (contentType.includes('application/json')) {
+      const data = await response.json();
+      return { ok: response.ok, data };
+    }
+
+    // Handle other responses
+    const text = await response.text();
+    return {
+      ok: response.ok,
+      data: text,
+      error: response.ok ? undefined : `HTTP ${response.status}: ${text.slice(0, 200)}`
+    };
+  } catch (err: any) {
+    console.error(`[Proxy] Error calling ${service}:`, err.message);
+    return {
+      ok: false,
+      error: `Failed to connect to ${service} service: ${err.message}`,
+    };
+  }
+}
+
 /** Send a backend-style message to the subprocess and resolve via correlation ID */
 async function sendbackendRequest(action: string, data: Record<string, unknown>, timeoutMs = 30_000): Promise<unknown> {
+  // 微服务模式下不支持 legacy backend 调用
+  if (USE_MICROSERVICES) {
+    throw new Error("Legacy backend not available in microservices mode");
+  }
+
   await ensureSubprocess();
   if (!pyProc || !pyProc.stdin) throw new Error("Worker not running");
 
@@ -335,21 +479,59 @@ async function sendbackendRequestStreaming(
 // ── Express setup ────────────────────────────────────────────────────────────
 
 const app = express();
-app.use(cors());
+// CORS配置：允许所有开发服务器来源
+app.use(cors({
+  origin: true,  // 允许所有来源（包括 localhost:3001, 127.0.0.1:8081 等）
+  credentials: true,
+}));
 app.use(express.json());
 
-// ── Persistent subprocess ────────────────────────────────────────────────────
+// ── Service Proxy ───────────────────────────────────────────────────────────
+// 代理请求到各微服务 (挂载到 /api 前缀)
+app.use('/api', createServiceProxy());
+
+// ── Legacy Mode Guard ───────────────────────────────────────────────────────
+// 在微服务模式下，某些路由不可用
+function requireLegacyMode(res: import("express").Response): boolean {
+  if (USE_MICROSERVICES) {
+    res.status(503).json({
+      error: "Unavailable in microservices mode",
+      message: "This endpoint requires legacy mode. Set QMCLAW_USE_SERVICES=false to enable.",
+      mode: "microservices",
+    });
+    return false;
+  }
+  return true;
+}
+
+function requireSubprocess(res: import("express").Response): boolean {
+  if (USE_MICROSERVICES) {
+    return requireLegacyMode(res);
+  }
+  if (!pyProc || !pyProcReady) {
+    res.status(503).json({
+      error: "Subprocess not ready",
+      message: "Python worker is initializing. Please try again later.",
+      subprocess: pyProc ? "initializing" : "not_started",
+    });
+    return false;
+  }
+  return true;
+}
+
+// ── Persistent subprocess (Legacy Mode Only) ───────────────────────────────
 
 // One long-running Python subprocess; all jobs run through it.
 // Avoids re-initializing LabRAD connection (20+ seconds) per job.
-
-let pyProc: ReturnType<typeof spawn> | null = null;
-let pyProcReady = false;
-let sseBuffer = "";  // accumulates subprocess stdout
-let bufferedSseCid = "";  // stores CID when buffering SSE events
+// Note: pyProc, pyProcReady, sseBuffer, bufferedSseCid are declared at the top of the file
 
 /** Spawn the persistent Python subprocess and set up I/O handlers */
 function ensureSubprocess(): Promise<void> {
+  // 微服务模式下不启动 subprocess
+  if (USE_MICROSERVICES) {
+    return Promise.reject(new Error("Subprocess not available in microservices mode"));
+  }
+
   if (pyProc) return Promise.resolve();
 
   return new Promise((resolve, reject) => {
@@ -388,9 +570,16 @@ function ensureSubprocess(): Promise<void> {
         // 过滤Python后端的日志输出
         if (shouldPrintLog(line)) {
           console.log(line);
+        } else {
+          // Debug: log when a line is filtered
+          if (line.includes("[backends") || line.includes(">>> FORCE")) {
+            console.log("[Debug-Filter] FILTERED:", line.substring(0, 80));
+          }
         }
       }
     });
+
+    console.log(`[Debug] Log filter initialized: ENABLE_LOG_FILTER=${ENABLE_LOG_FILTER}`);
 
     pyProc.stdout?.on("data", (data: Buffer) => {
       sseBuffer += data.toString();
@@ -703,6 +892,8 @@ function parseJobInfo(code: string): { qubit: string; experiment: string } {
 }
 
 app.post("/job", async (req, res) => {
+  if (!requireSubprocess(res)) return;
+
   const { code, plotCommand, analysisPrompt, autoAnalyze, model, _modelProvider, _modelBaseUrl, temperature } = req.body as JobSubmission;
   if (!code) { res.status(400).json({ error: "No code provided" }); return; }
 
@@ -774,6 +965,26 @@ app.get("/result/:jobId", (req, res) => {
 
 /** GET /health */
 app.get("/health", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    // 微服务模式：检查各微服务健康状态
+    res.json({
+      express: "ok",
+      mode: "microservices",
+      port: PORT,
+      microservices: {
+        llm: "http://localhost:3006",
+        quantum: "http://localhost:3003",
+        analysis: "http://localhost:3004",
+        agent: "http://localhost:3005",
+        image: "http://localhost:3007",
+        workflow: "http://localhost:3008",
+        task_queue: "http://localhost:3009",
+      },
+    });
+    return;
+  }
+
+  // Legacy 模式：调用 job_runner.py
   try {
     const data = await sendbackendRequest("health", {}, 5000) as {
       status: string; ready: boolean; busy: boolean;
@@ -781,11 +992,12 @@ app.get("/health", async (_req, res) => {
     };
     res.json({
       express: "ok",
+      mode: "legacy",
       subprocess: pyProcReady ? "ready" : (pyProc ? "initializing" : "stopped"),
       backend: data,
     });
   } catch {
-    res.json({ express: "ok", subprocess: pyProcReady ? "ready" : "stopped", backend: "unreachable" });
+    res.json({ express: "ok", mode: "legacy", subprocess: pyProcReady ? "ready" : "stopped", backend: "unreachable" });
   }
 });
 
@@ -961,6 +1173,8 @@ const workflowHistory: string[] = [];
 
 /** POST /workflow — submit a workflow for execution */
 app.post("/workflow", async (req, res) => {
+  if (!requireSubprocess(res)) return;
+
   const body = req.body as { name?: string; nodes?: WorkflowNode[]; context?: Record<string, string> };
   if (!body.nodes || !Array.isArray(body.nodes)) {
     res.status(400).json({ error: "Invalid workflow: nodes array required" });
@@ -1010,6 +1224,8 @@ app.get("/workflow/:workflowId", (req, res) => {
 
 /** DELETE /workflow/:id — cancel workflow */
 app.delete("/workflow/:workflowId", (req, res) => {
+  if (!requireSubprocess(res)) return;
+
   const wf = workflowResults.get(req.params.workflowId);
   if (!wf) { res.status(404).json({ error: "Workflow not found" }); return; }
   if (wf.status === "pending" || wf.status === "running") {
@@ -1127,57 +1343,59 @@ app.post("/api/workflows/import", (req, res) => {
   }
 });
 
-// ── Workflow Runs API ──────────────────────────────────────────────────────
+// ── Workflow Runs API (微服务模式代理) ──────────────────────────────────────
+// 注意：在微服务模式下，这些路由已通过 serviceProxy.ts 代理到 workflow_service
+// 以下代码暂时保留作为参考，将来可以完全移除
 
-/** GET /api/workflow-runs — list all workflow runs, optionally filtered by workflowId or workflowName */
-app.get("/api/workflow-runs", (req, res) => {
-  try {
-    const workflowId = req.query.workflowId as string | undefined;
-    const workflowName = req.query.workflowName as string | undefined;
-    const runs = listWorkflowRuns(workflowId, workflowName);
-    res.json(runs);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// /** GET /api/workflow-runs — list all workflow runs, optionally filtered by workflowId or workflowName */
+// app.get("/api/workflow-runs", (req, res) => {
+//   try {
+//     const workflowId = req.query.workflowId as string | undefined;
+//     const workflowName = req.query.workflowName as string | undefined;
+//     const runs = listWorkflowRuns(workflowId, workflowName);
+//     res.json(runs);
+//   } catch (err: any) {
+//     res.status(500).json({ error: err.message });
+//   }
+// });
 
-/** GET /api/workflow-runs/stats/:workflowId — get run statistics for a workflow */
-app.get("/api/workflow-runs/stats/:workflowId", (req, res) => {
-  try {
-    const stats = getWorkflowStats(req.params.workflowId);
-    res.json(stats);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// /** GET /api/workflow-runs/stats/:workflowId — get run statistics for a workflow */
+// app.get("/api/workflow-runs/stats/:workflowId", (req, res) => {
+//   try {
+//     const stats = getWorkflowStats(req.params.workflowId);
+//     res.json(stats);
+//   } catch (err: any) {
+//     res.status(500).json({ error: err.message });
+//   }
+// });
 
-/** GET /api/workflow-runs/:runId — get a specific workflow run */
-app.get("/api/workflow-runs/:runId", (req, res) => {
-  try {
-    const run = getWorkflowRun(req.params.runId);
-    if (!run) {
-      res.status(404).json({ error: "Workflow run not found" });
-      return;
-    }
-    res.json(run);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// /** GET /api/workflow-runs/:runId — get a specific workflow run */
+// app.get("/api/workflow-runs/:runId", (req, res) => {
+//   try {
+//     const run = getWorkflowRun(req.params.runId);
+//     if (!run) {
+//       res.status(404).json({ error: "Workflow run not found" });
+//       return;
+//     }
+//     res.json(run);
+//   } catch (err: any) {
+//     res.status(500).json({ error: err.message });
+//   }
+// });
 
-/** DELETE /api/workflow-runs/:runId — delete a workflow run */
-app.delete("/api/workflow-runs/:runId", (req, res) => {
-  try {
-    const deleted = deleteWorkflowRun(req.params.runId);
-    if (!deleted) {
-      res.status(404).json({ error: "Workflow run not found" });
-      return;
-    }
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// /** DELETE /api/workflow-runs/:runId — delete a workflow run */
+// app.delete("/api/workflow-runs/:runId", (req, res) => {
+//   try {
+//     const deleted = deleteWorkflowRun(req.params.runId);
+//     if (!deleted) {
+//       res.status(404).json({ error: "Workflow run not found" });
+//       return;
+//     }
+//     res.json({ success: true });
+//   } catch (err: any) {
+//     res.status(500).json({ error: err.message });
+//   }
+// });
 
 // ── Single Node Execution ──────────────────────────────────────────────
 
@@ -1443,13 +1661,13 @@ app.post("/api/chat/test", async (req, res) => {
       return;
     }
 
-    // Call LLM via Python subprocess
+    // Call LLM via microservice
     const messages = [
       ...(systemPrompt ? [{ role: 'system' as const, content: systemPrompt }] : []),
       { role: 'user' as const, content: message },
     ];
 
-    const result = await sendbackendRequest('llm_chat', {
+    const result = await proxyToService('llm', '/chat', 'POST', {
       provider: model.provider,
       modelId: model.modelId,
       baseUrl: model.baseUrl,
@@ -1458,22 +1676,28 @@ app.post("/api/chat/test", async (req, res) => {
       maxTokens: maxTokens ?? model.config.maxTokens ?? 500,
     }) as { content?: string; error?: string; usage?: Record<string, number> };
 
-    if (result.error) {
+    if (!result.ok) {
       res.status(500).json({ error: result.error });
+      return;
+    }
+
+    const resultData = result.data as { content?: string; error?: string; usage?: Record<string, number> };
+    if (resultData.error) {
+      res.status(500).json({ error: resultData.error });
       return;
     }
 
     // Save to session if sessionId provided
     if (sessionId) {
       addMessage(sessionId, { role: 'user', content: message });
-      addMessage(sessionId, { role: 'assistant', content: result.content || '' });
+      addMessage(sessionId, { role: 'assistant', content: resultData.content || '' });
     }
 
     res.json({
-      content: result.content,
+      content: resultData.content,
       model: modelName,
       modelId: model.modelId,
-      usage: result.usage,
+      usage: resultData.usage,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1665,34 +1889,46 @@ app.post("/api/chat/analyze-plot", async (req, res) => {
   }
 });
 
-/** POST /api/experiments/run-analysis — run analysis command on latest dataset */
+/** POST /api/experiments/run-analysis — run analysis command on latest dataset (microservice) */
 app.post("/api/experiments/run-analysis", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const { command, expType } = req.body as { command?: string; expType?: string };
-
     if (!command) {
       res.status(400).json({ error: "command is required" });
       return;
     }
-
-    // Execute analysis command via job_runner
-    const result = await sendbackendRequest("run_analysis", {
+    const result = await proxyToService('analysis', '/execute', 'POST', {
       command,
       expType: expType || ""
-    }) as { success: boolean; stdout?: string; stderr?: string; metrics?: Record<string, number>; error?: string };
-
-    if (result.error) {
-      res.status(500).json({ success: false, error: result.error });
-      return;
-    }
-
-    res.json({
-      success: true,
-      stdout: result.stdout || "",
-      metrics: result.metrics || {},
     });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { command, expType } = req.body as { command?: string; expType?: string };
+
+      if (!command) {
+        res.status(400).json({ error: "command is required" });
+        return;
+      }
+
+      const result = await sendbackendRequest("run_analysis", {
+        command,
+        expType: expType || ""
+      }) as { success: boolean; stdout?: string; stderr?: string; metrics?: Record<string, number>; error?: string };
+
+      if (result.error) {
+        res.status(500).json({ success: false, error: result.error });
+        return;
+      }
+
+      res.json({
+        success: true,
+        stdout: result.stdout || "",
+        metrics: result.metrics || {},
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
   }
 });
 
@@ -1809,329 +2045,184 @@ app.put("/api/rules", (req, res) => {
   }
 });
 
-// ── Image Classification ───────────────────────────────────────────────────────
+// ── Image Classification (microservice) ─────────────────────────────────────────
 
-/** POST /api/classify/images — batch classify images in a folder */
+/** POST /api/classify/images — batch classify images in a folder (microservice) */
 app.post("/api/classify/images", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const { folderPath, backend, reviewThreshold, marginThreshold } = req.body as {
-      folderPath?: string;
-      backend?: string;
-      reviewThreshold?: number;
-      marginThreshold?: number;
+      folderPath?: string; backend?: string; reviewThreshold?: number; marginThreshold?: number;
     };
-    const data = await sendbackendRequest("classify_images", {
+    const result = await proxyToService('image', '/classify/batch', 'POST', {
       folderPath: folderPath || "",
       backend: backend || "pytorch",
       reviewThreshold: reviewThreshold ?? 0.75,
       marginThreshold: marginThreshold ?? 0.15,
-    }) as { results?: unknown[]; error?: string };
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+    });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { folderPath, backend, reviewThreshold, marginThreshold } = req.body as {
+        folderPath?: string; backend?: string; reviewThreshold?: number; marginThreshold?: number;
+      };
+      const data = await sendbackendRequest("classify_images", {
+        folderPath: folderPath || "",
+        backend: backend || "pytorch",
+        reviewThreshold: reviewThreshold ?? 0.75,
+        marginThreshold: marginThreshold ?? 0.15,
+      }) as { results?: unknown[]; error?: string };
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** POST /api/classify/single — single image inference */
+/** POST /api/classify/single — single image inference (microservice) */
 app.post("/api/classify/single", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const { imagePath, backend } = req.body as { imagePath?: string; backend?: string };
-    const data = await sendbackendRequest("classify_single", {
+    const result = await proxyToService('image', '/classify/single', 'POST', {
       imagePath: imagePath || "",
       backend: backend || "pytorch",
-    }) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+    });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { imagePath, backend } = req.body as { imagePath?: string; backend?: string };
+      const data = await sendbackendRequest("classify_single", {
+        imagePath: imagePath || "",
+        backend: backend || "pytorch",
+      }) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** POST /api/classify/latest-experiment — classify latest experiment image from DataVault */
+/** POST /api/classify/latest-experiment — classify latest experiment image (microservice) */
 app.post("/api/classify/latest-experiment", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const { qubit, experimentType, backend, reviewThreshold, marginThreshold } = req.body as {
-      qubit?: string;
-      experimentType?: string;
-      backend?: string;
-      reviewThreshold?: number;
-      marginThreshold?: number;
+      qubit?: string; experimentType?: string; backend?: string; reviewThreshold?: number; marginThreshold?: number;
     };
-    const data = await sendbackendRequest("classify_latest_experiment", {
+    const result = await proxyToService('image', '/classify/latest', 'POST', {
       qubit: qubit || "",
       experimentType: experimentType || "spectroscopy",
       backend: backend || "pytorch",
       reviewThreshold: reviewThreshold ?? 0.75,
       marginThreshold: marginThreshold ?? 0.15,
-    }) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+    });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { qubit, experimentType, backend, reviewThreshold, marginThreshold } = req.body as {
+        qubit?: string; experimentType?: string; backend?: string; reviewThreshold?: number; marginThreshold?: number;
+      };
+      const data = await sendbackendRequest("classify_latest_experiment", {
+        qubit: qubit || "",
+        experimentType: experimentType || "spectroscopy",
+        backend: backend || "pytorch",
+        reviewThreshold: reviewThreshold ?? 0.75,
+        marginThreshold: marginThreshold ?? 0.15,
+      }) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** GET /api/classify/stats — get classification statistics */
+/** GET /api/classify/stats — get classification statistics (microservice) */
 app.get("/api/classify/stats", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const sinceHours = parseInt(req.query.sinceHours as string) || 24;
-    const data = await sendbackendRequest("get_classification_stats", { sinceHours }) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+    const result = await proxyToService('image', `/stats?sinceHours=${sinceHours}`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const sinceHours = parseInt(req.query.sinceHours as string) || 24;
+      const data = await sendbackendRequest("get_classification_stats", { sinceHours }) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** GET /api/classify/model-info — get model file info */
+/** GET /api/classify/model-info — get model file info (microservice) */
 app.get("/api/classify/model-info", async (_req, res) => {
-  try {
-    const data = await sendbackendRequest("get_model_info", {}) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('image', '/model-info', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("get_model_info", {}) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** POST /api/classify/train — trigger model training */
+/** POST /api/classify/train — trigger model training (microservice) */
 app.post("/api/classify/train", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const { epochs, batchSize, imbalanceMode } = req.body as {
-      epochs?: number;
-      batchSize?: number;
-      imbalanceMode?: string;
+      epochs?: number; batchSize?: number; imbalanceMode?: string;
     };
-    const data = await sendbackendRequest("train_model", {
+    const result = await proxyToService('image', '/train', 'POST', {
       epochs: epochs ?? 20,
       batchSize: batchSize ?? 32,
       imbalanceMode: imbalanceMode || "weighted",
-    }) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+    });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { epochs, batchSize, imbalanceMode } = req.body as {
+        epochs?: number; batchSize?: number; imbalanceMode?: string;
+      };
+      const data = await sendbackendRequest("train_model", {
+        epochs: epochs ?? 20,
+        batchSize: batchSize ?? 32,
+        imbalanceMode: imbalanceMode || "weighted",
+      }) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-// ── Quantum Agent ───────────────────────────────────────────────────────────────
+// ── Quantum Agent (microservice) ─────────────────────────────────────────────────
 
 /** POST /api/agent/chat — send a message to the quantum agent */
 app.post("/api/agent/chat", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const { message, mode, context } = req.body as {
-      message?: string;
-      mode?: string;
-      context?: Record<string, unknown>;
+      message?: string; mode?: string; context?: Record<string, unknown>;
     };
     if (!message) { res.status(400).json({ error: "message is required" }); return; }
-    // Use 10-minute timeout for agent tasks (long-running LLM operations)
-    const data = await sendbackendRequest("agent_chat", {
-      message,
-      mode: mode || "react",
-      context: context || {},
-    }, 600_000) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+    const result = await proxyToService('agent', '/chat', 'POST', {
+      message, mode: mode || "react", context: context || {},
+    });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { message, mode, context } = req.body as {
+        message?: string; mode?: string; context?: Record<string, unknown>;
+      };
+      if (!message) { res.status(400).json({ error: "message is required" }); return; }
+      const data = await sendbackendRequest("agent_chat", {
+        message, mode: mode || "react", context: context || {},
+      }, 600_000) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
 /** POST /api/agent/chat/stream — streaming agent chat (SSE) */
 app.post("/api/agent/chat/stream", async (req, res) => {
-  console.log('[SSE] /api/agent/chat/stream called');
-  try {
+  if (USE_MICROSERVICES) {
+    // Proxy to agent microservice streaming endpoint
     const { message, mode, context } = req.body as {
-      message?: string;
-      mode?: string;
-      context?: Record<string, unknown>;
-    };
-    if (!message) { res.status(400).json({ error: "message is required" }); return; }
-
-    // Set SSE headers
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering
-
-    // Flush headers immediately so client knows connection is open
-    res.flushHeaders();
-
-    // Send backend request for streaming
-    const cid = "stream_" + Date.now() + Math.random().toString(36).slice(2, 8);
-    const msg = JSON.stringify({ type: "backend", cid, action: "agent_chat_stream", data: { message, mode: mode || "react", context: context || {} } }) + "\n";
-
-    // Register callback for this specific cid
-    activeStreams.set(cid, (sseData: string) => {
-      res.write(sseData);
-    });
-
-    // Track this request to handle completion
-    backendPendingRequests.set(cid, {
-      resolve: () => {
-        console.log(`[SSE] Streaming completed for cid:`, cid);
-        activeStreams.delete(cid);
-        backendPendingRequests.delete(cid);
-        res.end();
-      },
-      reject: (err: Error) => {
-        console.log(`[SSE] Streaming error for cid:`, cid, err.message);
-        activeStreams.delete(cid);
-        backendPendingRequests.delete(cid);
-        res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
-        res.end();
-      }
-    });
-
-    // Send to Python backend
-    if (pyProc?.stdin) {
-      pyProc.stdin.write(msg);
-    }
-
-    // Set timeout
-    setTimeout(() => {
-      if (activeStreams.has(cid)) {
-        console.log(`[SSE] Timeout for cid:`, cid);
-        activeStreams.delete(cid);
-        backendPendingRequests.delete(cid);
-        res.write(`event: error\ndata: ${JSON.stringify({ error: "Timeout" })}\n\n`);
-        res.end();
-      }
-    }, 600_000);
-
-  } catch (err: any) {
-    console.log(`[SSE] Error:`, err.message);
-    res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
-    res.end();
-  }
-});
-
-/** GET /api/agent/modes — get available agent reasoning modes */
-app.get("/api/agent/modes", (_req, res) => {
-  res.json({ modes: ["react", "plan_and_execute", "reflexion"] });
-});
-
-/** POST /api/agent/reset — reset agent session (no-op, session is stateless) */
-app.post("/api/agent/reset", (_req, res) => {
-  res.json({ success: true });
-});
-
-/** GET /api/agent/debug-env — check environment variables in Python process */
-app.get("/api/agent/debug-env", async (_req, res) => {
-  // First check Express's env vars
-  const expressEnv = {
-    minimax: process.env.MINIMAX_API_KEY ? `SET (len=${process.env.MINIMAX_API_KEY.length})` : "NOT SET",
-    openai: process.env.OPENAI_API_KEY ? "SET" : "NOT SET",
-  };
-  try {
-    const data = await sendbackendRequest("debug_env", {}) as Record<string, unknown>;
-    res.json({ express: expressEnv, python: data });
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
-});
-
-// ── Memory & Reflection API ─────────────────────────────────────────────────
-
-/** POST /api/agent/memory/episodes — list episodes */
-app.post("/api/agent/memory/episodes", async (req, res) => {
-  try {
-    const { limit, qubit, status } = req.body;
-    const data = await sendbackendRequest("memory_list_episodes", { limit, qubit, status }) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
-});
-
-/** GET /api/agent/memory/episodes/:id — get episode details */
-app.get("/api/agent/memory/episodes/:id", async (req, res) => {
-  try {
-    const data = await sendbackendRequest("memory_get_episode", { episode_id: req.params.id }) as Record<string, unknown>;
-    if (data.error) { res.status(404).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
-});
-
-/** DELETE /api/agent/memory/episodes/:id — archive episode */
-app.delete("/api/agent/memory/episodes/:id", async (req, res) => {
-  try {
-    const data = await sendbackendRequest("memory_archive_episode", { episode_id: req.params.id }) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
-});
-
-/** GET /api/agent/memory/skills — list all skills */
-app.get("/api/agent/memory/skills", async (_req, res) => {
-  try {
-    const data = await sendbackendRequest("memory_list_skills", {}) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
-});
-
-/** DELETE /api/agent/memory/skills/:id — delete skill */
-app.delete("/api/agent/memory/skills/:id", async (req, res) => {
-  try {
-    const data = await sendbackendRequest("memory_delete_skill", { skill_id: req.params.id }) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
-});
-
-/** GET /api/agent/memory/stats — get memory stats */
-app.get("/api/agent/memory/stats", async (_req, res) => {
-  try {
-    const data = await sendbackendRequest("memory_stats", {}) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
-});
-
-/** POST /api/agent/memory/recall — recall relevant memories */
-app.post("/api/agent/memory/recall", async (req, res) => {
-  try {
-    const { task, qubit } = req.body;
-    const data = await sendbackendRequest("memory_recall", { task, qubit }) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
-});
-
-/** POST /api/agent/memory/reflect — trigger reflection */
-app.post("/api/agent/memory/reflect", async (req, res) => {
-  try {
-    const { episode_id, task, result_data } = req.body;
-    const data = await sendbackendRequest("memory_reflect", {
-      episode_id,
-      task,
-      result_data
-    }) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
-});
-
-// ── Hermes Agent API ──────────────────────────────────────────────────────────
-
-/** POST /api/hermes/chat — Hermes agent chat */
-app.post("/api/hermes/chat", async (req, res) => {
-  try {
-    const { message, model, base_url, enabled_toolsets, session_id } = req.body as {
-      message?: string;
-      model?: string;
-      base_url?: string;
-      enabled_toolsets?: string[];
-      session_id?: string;
-    };
-    if (!message) { res.status(400).json({ error: "message is required" }); return; }
-    const data = await sendbackendRequest("hermes_chat", {
-      message,
-      model,
-      base_url,
-      enabled_toolsets,
-      session_id,
-    }, 600_000) as Record<string, unknown>;
-    if (data.error) { res.status(502).json({ error: data.error }); return; }
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
-});
-
-/** POST /api/hermes/chat/stream — Streaming Hermes agent chat (SSE) */
-app.post("/api/hermes/chat/stream", async (req, res) => {
-  console.log('[Hermes SSE] /api/hermes/chat/stream called');
-  try {
-    const { message, model, base_url, session_id } = req.body as {
-      message?: string;
-      model?: string;
-      base_url?: string;
-      session_id?: string;
+      message?: string; mode?: string; context?: Record<string, unknown>;
     };
     if (!message) { res.status(400).json({ error: "message is required" }); return; }
 
@@ -2140,61 +2231,338 @@ app.post("/api/hermes/chat/stream", async (req, res) => {
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
-
     res.flushHeaders();
 
-    const cid = "hermes_stream_" + Date.now() + Math.random().toString(36).slice(2, 8);
-    const msg = JSON.stringify({
-      type: "backend",
-      cid,
-      action: "hermes_chat_stream",
-      data: { message, model, base_url, session_id }
-    }) + "\n";
+    // Proxy to agent service streaming endpoint
+    const result = await proxyToService('agent', '/chat/stream', 'POST', {
+      message, mode: mode || "react", context: context || {},
+    }, false);
 
-    activeStreams.set(cid, (sseData: string) => {
-      res.write(sseData);
-    });
-
-    backendPendingRequests.set(cid, {
-      resolve: () => {
-        console.log(`[Hermes] Streaming completed for cid:`, cid);
-        activeStreams.delete(cid);
-        backendPendingRequests.delete(cid);
-        res.end();
-      },
-      reject: (err: Error) => {
-        console.log(`[Hermes] Streaming error for cid:`, cid, err.message);
-        activeStreams.delete(cid);
-        backendPendingRequests.delete(cid);
-        res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
-        res.end();
-      }
-    });
-
-    if (pyProc?.stdin) {
-      pyProc.stdin.write(msg);
+    if (!result.ok) {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: result.error })}\n\n`);
+      res.end();
+      return;
     }
 
-    setTimeout(() => {
-      if (activeStreams.has(cid)) {
-        console.log(`[Hermes] Timeout for cid:`, cid);
-        activeStreams.delete(cid);
-        backendPendingRequests.delete(cid);
-        res.write(`event: error\ndata: ${JSON.stringify({ error: "Timeout" })}\n\n`);
-        res.end();
-      }
-    }, 600_000);
-
-  } catch (err: any) {
-    console.log(`[Hermes] Error:`, err.message);
-    res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
+    // Forward the streaming response
+    res.write(result.data);
     res.end();
+  } else {
+    console.log('[SSE] /api/agent/chat/stream called');
+    try {
+      const { message, mode, context } = req.body as {
+        message?: string; mode?: string; context?: Record<string, unknown>;
+      };
+      if (!message) { res.status(400).json({ error: "message is required" }); return; }
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders();
+
+      const cid = "stream_" + Date.now() + Math.random().toString(36).slice(2, 8);
+      const msg = JSON.stringify({ type: "backend", cid, action: "agent_chat_stream", data: { message, mode: mode || "react", context: context || {} } }) + "\n";
+
+      activeStreams.set(cid, (sseData: string) => { res.write(sseData); });
+
+      backendPendingRequests.set(cid, {
+        resolve: () => {
+          console.log(`[SSE] Streaming completed for cid:`, cid);
+          activeStreams.delete(cid);
+          backendPendingRequests.delete(cid);
+          res.end();
+        },
+        reject: (err: Error) => {
+          console.log(`[SSE] Streaming error for cid:`, cid, err.message);
+          activeStreams.delete(cid);
+          backendPendingRequests.delete(cid);
+          res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
+          res.end();
+        }
+      });
+
+      if (pyProc?.stdin) { pyProc.stdin.write(msg); }
+
+      setTimeout(() => {
+        if (activeStreams.has(cid)) {
+          console.log(`[SSE] Timeout for cid:`, cid);
+          activeStreams.delete(cid);
+          backendPendingRequests.delete(cid);
+          res.write(`event: error\ndata: ${JSON.stringify({ error: "Timeout" })}\n\n`);
+          res.end();
+        }
+      }, 600_000);
+    } catch (err: any) {
+      console.log(`[SSE] Error:`, err.message);
+      res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+/** GET /api/agent/modes — get available agent reasoning modes */
+app.get("/api/agent/modes", (_req, res) => {
+  if (USE_MICROSERVICES) {
+    res.json({ modes: ["react", "plan_and_execute", "reflexion"] });
+  } else {
+    res.json({ modes: ["react", "plan_and_execute", "reflexion"] });
+  }
+});
+
+/** POST /api/agent/reset — reset agent session (microservice) */
+app.post("/api/agent/reset", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('agent', '/reset', 'POST');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.json({ success: true });
+  }
+});
+
+/** GET /api/agent/debug-env — check environment variables (microservice) */
+app.get("/api/agent/debug-env", async (_req, res) => {
+  const expressEnv = {
+    minimax: process.env.MINIMAX_API_KEY ? `SET (len=${process.env.MINIMAX_API_KEY.length})` : "NOT SET",
+    openai: process.env.OPENAI_API_KEY ? "SET" : "NOT SET",
+  };
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('agent', '/debug-env', 'GET');
+    res.status(result.ok ? 200 : 502).json({ express: expressEnv, python: result.data ?? { error: result.error } });
+  } else {
+    try {
+      const data = await sendbackendRequest("debug_env", {}) as Record<string, unknown>;
+      res.json({ express: expressEnv, python: data });
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+// ── Memory & Reflection API (microservice) ─────────────────────────────────────────────────
+
+/** POST /api/agent/memory/episodes — list episodes */
+app.post("/api/agent/memory/episodes", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const { limit, qubit, status } = req.body;
+    const result = await proxyToService('agent', '/memory/episodes', 'POST', { limit, qubit, status });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { limit, qubit, status } = req.body;
+      const data = await sendbackendRequest("memory_list_episodes", { limit, qubit, status }) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** GET /api/agent/memory/episodes/:id — get episode details */
+app.get("/api/agent/memory/episodes/:id", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('agent', `/memory/episodes/${req.params.id}`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("memory_get_episode", { episode_id: req.params.id }) as Record<string, unknown>;
+      if (data.error) { res.status(404).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** DELETE /api/agent/memory/episodes/:id — archive episode */
+app.delete("/api/agent/memory/episodes/:id", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('agent', `/memory/episodes/${req.params.id}`, 'DELETE');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("memory_archive_episode", { episode_id: req.params.id }) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** GET /api/agent/memory/skills — list all skills */
+app.get("/api/agent/memory/skills", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('agent', '/memory/skills', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("memory_list_skills", {}) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** DELETE /api/agent/memory/skills/:id — delete skill */
+app.delete("/api/agent/memory/skills/:id", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('agent', `/memory/skills/${req.params.id}`, 'DELETE');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("memory_delete_skill", { skill_id: req.params.id }) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** GET /api/agent/memory/stats — get memory stats */
+app.get("/api/agent/memory/stats", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('agent', '/memory/stats', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("memory_stats", {}) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** POST /api/agent/memory/recall — recall relevant memories */
+app.post("/api/agent/memory/recall", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const { task, qubit } = req.body;
+    const result = await proxyToService('agent', '/memory/recall', 'POST', { task, qubit });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { task, qubit } = req.body;
+      const data = await sendbackendRequest("memory_recall", { task, qubit }) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** POST /api/agent/memory/reflect — trigger reflection */
+app.post("/api/agent/memory/reflect", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const { episode_id, task, result_data } = req.body;
+    const result = await proxyToService('agent', '/memory/reflect', 'POST', { episode_id, task, result_data });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { episode_id, task, result_data } = req.body;
+      const data = await sendbackendRequest("memory_reflect", { episode_id, task, result_data }) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+// ── Hermes Agent API (microservice) ──────────────────────────────────────────────────────────
+
+/** POST /api/hermes/chat — Hermes agent chat */
+app.post("/api/hermes/chat", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const { message, model, base_url, enabled_toolsets, session_id } = req.body as {
+      message?: string; model?: string; base_url?: string; enabled_toolsets?: string[]; session_id?: string;
+    };
+    if (!message) { res.status(400).json({ error: "message is required" }); return; }
+    const result = await proxyToService('hermes', '/chat', 'POST', {
+      message, model, base_url, enabled_toolsets, session_id,
+    });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { message, model, base_url, enabled_toolsets, session_id } = req.body as {
+        message?: string; model?: string; base_url?: string; enabled_toolsets?: string[]; session_id?: string;
+      };
+      if (!message) { res.status(400).json({ error: "message is required" }); return; }
+      const data = await sendbackendRequest("hermes_chat", {
+        message, model, base_url, enabled_toolsets, session_id,
+      }, 600_000) as Record<string, unknown>;
+      if (data.error) { res.status(502).json({ error: data.error }); return; }
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** POST /api/hermes/chat/stream — Streaming Hermes agent chat (SSE) */
+app.post("/api/hermes/chat/stream", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const { message, model, base_url, session_id } = req.body as {
+      message?: string; model?: string; base_url?: string; session_id?: string;
+    };
+    if (!message) { res.status(400).json({ error: "message is required" }); return; }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    const result = await proxyToService('hermes', '/chat/stream', 'POST', { message, model, base_url, session_id }, false);
+    if (!result.ok) {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: result.error })}\n\n`);
+      res.end();
+      return;
+    }
+    res.write(result.data);
+    res.end();
+  } else {
+    console.log('[Hermes SSE] /api/hermes/chat/stream called');
+    try {
+      const { message, model, base_url, session_id } = req.body as {
+        message?: string; model?: string; base_url?: string; session_id?: string;
+      };
+      if (!message) { res.status(400).json({ error: "message is required" }); return; }
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders();
+
+      const cid = "hermes_stream_" + Date.now() + Math.random().toString(36).slice(2, 8);
+      const msg = JSON.stringify({ type: "backend", cid, action: "hermes_chat_stream", data: { message, model, base_url, session_id } }) + "\n";
+
+      activeStreams.set(cid, (sseData: string) => { res.write(sseData); });
+
+      backendPendingRequests.set(cid, {
+        resolve: () => {
+          console.log(`[Hermes] Streaming completed for cid:`, cid);
+          activeStreams.delete(cid);
+          backendPendingRequests.delete(cid);
+          res.end();
+        },
+        reject: (err: Error) => {
+          console.log(`[Hermes] Streaming error for cid:`, cid, err.message);
+          activeStreams.delete(cid);
+          backendPendingRequests.delete(cid);
+          res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
+          res.end();
+        }
+      });
+
+      if (pyProc?.stdin) { pyProc.stdin.write(msg); }
+
+      setTimeout(() => {
+        if (activeStreams.has(cid)) {
+          console.log(`[Hermes] Timeout for cid:`, cid);
+          activeStreams.delete(cid);
+          backendPendingRequests.delete(cid);
+          res.write(`event: error\ndata: ${JSON.stringify({ error: "Timeout" })}\n\n`);
+          res.end();
+        }
+      }, 600_000);
+    } catch (err: any) {
+      console.log(`[Hermes] Error:`, err.message);
+      res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
+      res.end();
+    }
   }
 });
 
 /** GET /api/hermes/models — Get available models for Hermes */
 app.get("/api/hermes/models", (_req, res) => {
-  // Load from model_configs.json
   const configPath = path.join(__dirname, "..", "config", "model_configs.json");
   let models: Array<{ id: string; name: string; provider: string; base_url?: string }> = [];
 
@@ -2210,7 +2578,6 @@ app.get("/api/hermes/models", (_req, res) => {
       }));
   } catch (e) {
     console.error("Failed to load model configs:", e);
-    // Fallback
     models = [
       { id: "MiniMax-M2.7", name: "MiniMax M2.7", provider: "minimax", base_url: "https://api.minimaxi.com/" },
     ];
@@ -2368,61 +2735,87 @@ app.get("/api/skills/export", (_req, res) => {
   res.json(data);
 });
 
-/** GET /sessions/config — get current session config */
-app.get("/sessions/config", (_req, res) => {
-  const config = loadSessionConfig();
-  const fullPath = ['', config.user, ...config.path];
-  res.json({ user: config.user, path: config.path, fullPath });
-});
-
-/** GET /sessions/status — debug: check session status in job_runner */
-app.get("/sessions/status", async (_req, res) => {
-  try {
-    const result = await sendbackendRequest("debug_data", {}) as Record<string, unknown>;
-    res.json({
-      debugData: result,
-      configSession: loadSessionConfig(),
-    });
-  } catch (err: any) {
-    res.status(502).json({ error: err.message });
-  }
-});
-
-/** GET /sessions/test-load — test loading the latest dataset */
-app.get("/sessions/test-load", async (_req, res) => {
-  try {
-    const result = await sendbackendRequest("test_load_dataset", {}) as Record<string, unknown>;
-    res.json(result);
-  } catch (err: any) {
-    res.status(502).json({ error: err.message });
-  }
-});
-
-/** GET /sessions/diagnostic — full diagnostic info */
-app.get("/sessions/diagnostic", async (_req, res) => {
-  try {
-    const debugData = await sendbackendRequest("debug_data", {}) as Record<string, unknown>;
-    const testLoad = await sendbackendRequest("test_load_dataset", {}) as Record<string, unknown>;
+/** GET /sessions/config — get current session config (microservice) */
+app.get("/sessions/config", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('quantum', '/session/config', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
     const config = loadSessionConfig();
-    res.json({
-      config,
-      jobRunnerSession: debugData?.current_session_path,
-      datasetCount: debugData?.dataset_count,
-      testLoad,
-    });
-  } catch (err: any) {
-    res.status(502).json({ error: err.message });
+    const fullPath = ['', config.user, ...config.path];
+    res.json({ user: config.user, path: config.path, fullPath });
   }
 });
 
-/** POST /sessions/plot — plot the latest dataset with custom command */
+/** GET /sessions/status — debug: check session status in job_runner (microservice) */
+app.get("/sessions/status", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('quantum', '/session/status', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const result = await sendbackendRequest("debug_data", {}) as Record<string, unknown>;
+      res.json({
+        debugData: result,
+        configSession: loadSessionConfig(),
+      });
+    } catch (err: any) {
+      res.status(502).json({ error: err.message });
+    }
+  }
+});
+
+/** GET /sessions/test-load — test loading the latest dataset (microservice) */
+app.get("/sessions/test-load", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('quantum', '/session/test-load', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const result = await sendbackendRequest("test_load_dataset", {}) as Record<string, unknown>;
+      res.json(result);
+    } catch (err: any) {
+      res.status(502).json({ error: err.message });
+    }
+  }
+});
+
+/** GET /sessions/diagnostic — full diagnostic info (microservice) */
+app.get("/sessions/diagnostic", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('quantum', '/session/diagnostic', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const debugData = await sendbackendRequest("debug_data", {}) as Record<string, unknown>;
+      const testLoad = await sendbackendRequest("test_load_dataset", {}) as Record<string, unknown>;
+      const config = loadSessionConfig();
+      res.json({
+        config,
+        jobRunnerSession: debugData?.current_session_path,
+        datasetCount: debugData?.dataset_count,
+        testLoad,
+      });
+    } catch (err: any) {
+      res.status(502).json({ error: err.message });
+    }
+  }
+});
+
+/** POST /sessions/plot — plot the latest dataset with custom command (microservice) */
 app.post("/sessions/plot", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const { command } = req.body as { command?: string };
-    const result = await sendbackendRequest("plot_dataset", { command: command || "" }) as Record<string, unknown>;
-    res.json(result);
-  } catch (err: any) {
-    res.status(502).json({ error: err.message });
+    const result = await proxyToService('analysis', '/plot', 'POST', { command: command || "" });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { command } = req.body as { command?: string };
+      const result = await sendbackendRequest("plot_dataset", { command: command || "" }) as Record<string, unknown>;
+      res.json(result);
+    } catch (err: any) {
+      res.status(502).json({ error: err.message });
+    }
   }
 });
 
@@ -2437,155 +2830,332 @@ app.post("/sessions/config", (req, res) => {
   res.json({ success: true, user, path });
 });
 
-/** GET /sessions — list DataVault sessions */
+/** GET /sessions — list DataVault sessions (microservice) */
 app.get("/sessions", async (_req, res) => {
-  try {
-    const data = await sendbackendRequest("sessions", {}) as { current: unknown; sessions: unknown };
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+  if (USE_MICROSERVICES) {
+    // Proxy to quantum service
+    const result = await proxyToService('quantum', '/sessions', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("sessions", {}) as { current: unknown; sessions: unknown };
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** POST /sessions/switch — switch DataVault session */
+/** POST /sessions/switch — switch DataVault session (microservice) */
 app.post("/sessions/switch", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const body = req.body as { user?: string; path?: string[] };
-    let user: string | undefined;
-    let pathSegments: string[] | undefined;
+    let sessionPath: string[] = [];
 
-    // Support both formats:
-    // 1. { user: "LQHL", path: ["test", "20260324"] }
-    // 2. { path: ["", "LQHL", "test", "20260324"] }
+    // Support both formats
     if (body.user && body.path) {
-      user = body.user;
-      pathSegments = body.path;
+      sessionPath = ['', body.user, ...body.path];
     } else if (body.path && body.path.length >= 2) {
-      // Extract from full path: ["", "LQHL", "test", "20260324"]
-      user = body.path[1];
-      pathSegments = body.path.slice(2);
+      sessionPath = body.path;
     }
 
-    // Save to config file
-    if (user && pathSegments) {
-      saveSessionConfig(user, pathSegments);
-    }
+    const result = await proxyToService('quantum', '/switch_session', 'POST', { session_path: sessionPath });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const body = req.body as { user?: string; path?: string[] };
+      let user: string | undefined;
+      let pathSegments: string[] | undefined;
 
-    // Call job_runner.py to update _data object
-    const sessionPath = user && pathSegments ? ['', user, ...pathSegments] : [];
-    const switchResult = await sendbackendRequest("switch_session", { path: sessionPath }) as { success: boolean; path: string[]; qubits?: Array<{ name: string; f10?: number; fread?: number }> };
+      if (body.user && body.path) {
+        user = body.user;
+        pathSegments = body.path;
+      } else if (body.path && body.path.length >= 2) {
+        user = body.path[1];
+        pathSegments = body.path.slice(2);
+      }
 
-    res.json(switchResult);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+      if (user && pathSegments) {
+        saveSessionConfig(user, pathSegments);
+      }
+
+      const sessionPath = user && pathSegments ? ['', user, ...pathSegments] : [];
+      const switchResult = await sendbackendRequest("switch_session", { path: sessionPath }) as { success: boolean; path: string[]; qubits?: Array<{ name: string; f10?: number; fread?: number }> };
+
+      res.json(switchResult);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** GET /qubits — list qubits in current session */
+/** GET /qubits — list qubits in current session (microservice) */
 app.get("/qubits", async (_req, res) => {
-  try {
-    const data = await sendbackendRequest("list_qubits", {}) as { qubits: Array<{ name: string; f10?: number; fread?: number; bias_z?: number; error?: string }>; sessionPath: string[] };
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('quantum', '/qubits', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("list_qubits", {}) as { qubits: Array<{ name: string; f10?: number; fread?: number; bias_z?: number; error?: string }>; sessionPath: string[] };
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** GET /sessions/tree — get full DataVault directory tree */
-app.get("/sessions/tree", async (_req, res) => {
-  try {
-    const data = await sendbackendRequest("session_tree", {}) as { tree: Array<{ name: string; path: string[]; hasChildren: boolean }> };
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+/** GET /sessions/tree — get full DataVault directory tree (microservice) */
+app.get("/sessions/tree", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const maxDepth = parseInt((req.query.max_depth as string) ?? '5', 10);
+    const result = await proxyToService('quantum', '/session_tree', 'POST', { max_depth: maxDepth });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("session_tree", {}) as { tree: Array<{ name: string; path: string[]; hasChildren: boolean }> };
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** POST /sessions/plot-historical — plot historical dataset with custom command */
+/** POST /sessions/plot-historical — plot historical dataset with custom command (microservice) */
 app.post("/sessions/plot-historical", async (req, res) => {
-  try {
-    const { name, path, command } = req.body;
-    if (!name) { res.status(400).json({ error: "name required" }); return; }
-    const result = await sendbackendRequest("plot_historical_dataset", { name, path, command }) as {
-      success: boolean;
-      plot_filename?: string;
-      dataset_name?: string;
-      analysis_output?: string;
-      error?: string;
-    };
-    res.json(result);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('analysis', '/plot/historical', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const { name, path, command } = req.body;
+      if (!name) { res.status(400).json({ error: "name required" }); return; }
+      const result = await sendbackendRequest("plot_historical_dataset", { name, path, command }) as {
+        success: boolean;
+        plot_filename?: string;
+        dataset_name?: string;
+        analysis_output?: string;
+        error?: string;
+      };
+      res.json(result);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** GET /qubits/:name/params — get qubit parameters */
+/** POST /api/analysis/plot/experiments — plot dataset by experiment type (returns Base64) */
+app.post("/api/analysis/plot/experiments", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('analysis', '/plot/experiments', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    // Legacy mode not supported for new endpoint
+    res.status(501).json({ error: "Not implemented in legacy mode" });
+  }
+});
+
+/** GET /qubits/:name/params — get qubit parameters (microservice) */
 app.get("/qubits/:name/params", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const name = req.params.name;
-    const data = await sendbackendRequest("get_qubit_params", { name }) as {
-      name: string;
-      params: Record<string, number | null>;
-      error?: string;
-    };
-    if (data.error) {
-      res.status(404).json({ error: data.error });
-    } else {
-      res.json(data);
-    }
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+    const result = await proxyToService('quantum', '/qubit/params', 'POST', { name });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const name = req.params.name;
+      const data = await sendbackendRequest("get_qubit_params", { name }) as {
+        name: string;
+        params: Record<string, number | null>;
+        error?: string;
+      };
+      if (data.error) {
+        res.status(404).json({ error: data.error });
+      } else {
+        res.json(data);
+      }
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** PUT /qubits/:name/params — update qubit parameters */
+/** PUT /qubits/:name/params — update qubit parameters (microservice) */
 app.put("/qubits/:name/params", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const name = req.params.name;
-    const params = req.body as Record<string, number | null>;
-    const data = await sendbackendRequest("set_qubit_params", { name, params }) as {
-      success: boolean;
-      name: string;
-      updated: string[];
-      errors: string[] | null;
-      error?: string;
-    };
-    if (data.error) {
-      res.status(404).json({ error: data.error });
-    } else {
-      res.json(data);
-    }
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+    const result = await proxyToService('quantum', '/qubit/set_params', 'POST', { name, params: req.body });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const name = req.params.name;
+      const params = req.body as Record<string, number | null>;
+      const data = await sendbackendRequest("set_qubit_params", { name, params }) as {
+        success: boolean;
+        name: string;
+        updated: string[];
+        errors: string[] | null;
+        error?: string;
+      };
+      if (data.error) {
+        res.status(404).json({ error: data.error });
+      } else {
+        res.json(data);
+      }
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** GET /datasets — list DataVault datasets in a path */
+/** GET /datasets — list DataVault datasets in a path (microservice) */
 app.get("/datasets", async (req, res) => {
-  try {
+  if (USE_MICROSERVICES) {
     const path = req.query.path as string | undefined;
-    const data = await sendbackendRequest("datasets", { path: path || getDefaultSessionPath() }) as { path: string; groups: string[]; datasets: unknown[] };
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+    const result = await proxyToService('quantum', '/datasets', 'POST', { path: path ?? null });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const path = req.query.path as string | undefined;
+      const data = await sendbackendRequest("datasets", { path: path || getDefaultSessionPath() }) as { path: string; groups: string[]; datasets: unknown[] };
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** GET /datasets/plot?name=...&path=... — generate historical dataset plot PNG */
+/** GET /datasets/plot?name=...&path=... — generate historical dataset plot PNG (microservice) */
 app.get("/datasets/plot", async (req, res) => {
-  const name = req.query.name as string;
-  const datasetPath = req.query.path as string || getDefaultSessionPath();
-  if (!name) { res.status(400).json({ error: "name query param required" }); return; }
-  try {
-    const result = await sendbackendRequest("plot", { name, path: datasetPath }) as { plotPath?: string; name?: string; error?: string };
-    if (result.error || !result.plotPath) {
-      res.status(500).json({ error: result.error || "Plot generation failed" });
+  if (USE_MICROSERVICES) {
+    const name = req.query.name as string;
+    const path = req.query.path as string;
+    if (!name) { res.status(400).json({ error: "name query param required" }); return; }
+    const result = await proxyToService('analysis', '/plot', 'POST', { name, path });
+    if (!result.ok || !result.data) {
+      res.status(502).json({ error: result.error });
       return;
     }
-    if (!fs.existsSync(result.plotPath)) { res.status(404).json({ error: "Plot file not found" }); return; }
+    const plotPath = (result.data as { plotPath?: string }).plotPath;
+    if (!plotPath || !fs.existsSync(plotPath)) { res.status(404).json({ error: "Plot file not found" }); return; }
     res.setHeader("Content-Type", "image/png");
-    res.sendFile(result.plotPath);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+    res.sendFile(plotPath);
+  } else {
+    const name = req.query.name as string;
+    const datasetPath = req.query.path as string || getDefaultSessionPath();
+    if (!name) { res.status(400).json({ error: "name query param required" }); return; }
+    try {
+      const result = await sendbackendRequest("plot", { name, path: datasetPath }) as { plotPath?: string; name?: string; error?: string };
+      if (result.error || !result.plotPath) {
+        res.status(500).json({ error: result.error || "Plot generation failed" });
+        return;
+      }
+      if (!fs.existsSync(result.plotPath)) { res.status(404).json({ error: "Plot file not found" }); return; }
+      res.setHeader("Content-Type", "image/png");
+      res.sendFile(result.plotPath);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
-/** GET /hardware/status — get detailed hardware connection status */
+/** GET /api/quantum/session_tree — get session directory tree (microservice) */
+app.get("/api/quantum/session_tree", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const maxDepth = parseInt(req.query.max_depth as string) || 5;
+    const result = await proxyToService('quantum', '/session_tree', 'POST', { max_depth: maxDepth });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("session_tree", {}) as { tree: Array<{ name: string; path: string[]; hasChildren: boolean }> };
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** GET /api/quantum/datasets — list DataVault datasets in a path (microservice) */
+app.get("/api/quantum/datasets", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const path = req.query.path as string | undefined;
+    const result = await proxyToService('quantum', '/datasets', 'POST', { path: path ?? null });
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const path = req.query.path as string | undefined;
+      const data = await sendbackendRequest("datasets", { path: path || getDefaultSessionPath() }) as { path: string; groups: string[]; datasets: unknown[] };
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** GET /api/quantum/qubits — get qubits (microservice) */
+app.get("/api/quantum/qubits", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('quantum', '/qubits', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("qubits", {}) as { qubits: unknown[]; count: number };
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** GET /api/quantum/sessions — get sessions (microservice) */
+app.get("/api/quantum/sessions", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('quantum', '/sessions', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    try {
+      const data = await sendbackendRequest("sessions", {}) as { sessions: unknown[]; current: unknown };
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
+});
+
+/** GET /datasets — get detailed hardware connection status (microservice) */
 app.get("/hardware/status", async (_req, res) => {
-  try {
-    const data = await sendbackendRequest("hardware_status", {}) as {
-      overall: string; timestamp: string;
-      services: Record<string, unknown>; devices: Record<string, unknown>;
-      issues: string[];
-    };
-    res.json(data);
-  } catch (err: any) { res.status(502).json({ error: err.message }); }
+  if (USE_MICROSERVICES) {
+    try {
+      const quantumHealth = await fetch("http://localhost:3003/health", { signal: AbortSignal.timeout(3000) });
+      const quantumData = quantumHealth.ok ? await quantumHealth.json() : {};
+
+      res.json({
+        overall: quantumData.labrad_connected ? "ok" : "degraded",
+        timestamp: new Date().toISOString(),
+        services: {
+          labrad: quantumData.labrad_connected ? "connected" : "disconnected",
+          datavault: quantumData.datalab_connected ? "connected" : "disconnected",
+          quantum_service: "via_microservice",
+        },
+        devices: {},
+        issues: quantumData.labrad_connected ? [] : ["LabRAD not connected"],
+      });
+    } catch (err: any) {
+      res.status(502).json({ error: err.message });
+    }
+  } else {
+    if (!requireSubprocess(res)) return;
+    try {
+      const data = await sendbackendRequest("hardware_status", {}) as {
+        overall: string; timestamp: string;
+        services: Record<string, unknown>; devices: Record<string, unknown>;
+        issues: string[];
+      };
+      res.json(data);
+    } catch (err: any) { res.status(502).json({ error: err.message }); }
+  }
 });
 
 /** GET /hardware/quick — get quick status summary for header */
 app.get("/hardware/quick", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    // 微服务模式：从各微服务汇总状态
+    try {
+      const quantumHealth = await fetch("http://localhost:3003/health", { signal: AbortSignal.timeout(3000) });
+      const llmHealth = await fetch("http://localhost:3006/health", { signal: AbortSignal.timeout(3000) });
+      const quantumData = quantumHealth.ok ? await quantumHealth.json() : {};
+      const llmData = llmHealth.ok ? await llmHealth.json() : {};
+      res.json({
+        labrad: quantumData.labrad_connected ? "connected" : "disconnected",
+        llm: llmData.status === "healthy" ? "ready" : "unavailable",
+        ray: "via_quantum",
+        datavault: quantumData.datalab_connected ? "connected" : "disconnected",
+        message: `Microservices mode - Quantum: ${quantumData.labrad_connected ? 'connected' : 'disconnected'}`,
+      });
+    } catch (err: any) {
+      res.json({
+        labrad: "checking",
+        llm: "unavailable",
+        ray: "unknown",
+        datavault: "unknown",
+        message: "Microservices health check failed: " + err.message,
+      });
+    }
+    return;
+  }
   try {
     const data = await sendbackendRequest("quick_status", {}) as {
       labrad: string; ray: string; datavault: string; message: string;

@@ -9,9 +9,8 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import { api, Metrics, ExperimentConfig } from "../lib/api";
-import EditableCommand from "../components/EditableCommand";
-import PlotCommandEditor from "../components/PlotCommandEditor";
-import AnalysisCommandEditor from "../components/AnalysisCommandEditor";
+import CollapsibleCommand from "../components/CollapsibleCommand";
+import UnifiedResults from "../components/UnifiedResults";
 import JobsPanel from "../components/JobsPanel";
 import WorkflowDesigner from "../components/WorkflowDesigner";
 import { CompactSessionManager } from "../components/SessionManager";
@@ -139,7 +138,7 @@ export default function Dashboard() {
   const [serverOk, setServerOk] = useState(false);
   const [quickStatus, setQuickStatus] = useState<QuickStatus | null>(null);
   const [running, setRunning] = useState(false);
-  const [jobId, setJobId] = useState<string | null>(null);
+  const [taskId, setTaskId] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
 
   // Qubit list — persisted (SSR uses defaults, client hydrates from localStorage)
@@ -176,6 +175,13 @@ export default function Dashboard() {
         const configs = data.configs as unknown as Record<string, Record<string, ExperimentConfig>>;
         if (configs.experiments) {
           setExperimentConfigs(configs.experiments);
+          // Initialize commands from configs
+          const exp = selectedExp as string;
+          if (configs.experiments[exp]) {
+            setCurrentRunCommand(configs.experiments[exp].defaultCommand || "");
+            setCurrentPlotCommand(configs.experiments[exp].defaultPlotCommand || "");
+            setCurrentAnalyzeCommand(configs.experiments[exp].defaultAnalysisCommand || "");
+          }
         }
       }
     }).catch(console.error);
@@ -198,10 +204,32 @@ export default function Dashboard() {
   const [selectedExp, setSelectedExpState] = useState<ExpType>(defaultSelectedExp);
   const [logs, setLogs] = useState<string[]>([]);
   const [plotUrl, setPlotUrl] = useState<string | null>(null);
-  const [analysisResult, setAnalysisResult] = useState<string | null>(null);
+  const [plotLoading, setPlotLoading] = useState(false);
+  const [analysisResult, setAnalysisResult] = useState<{
+    success: boolean;
+    stdout?: string;
+    stderr?: string;
+    metrics?: Record<string, number | string>;
+    error?: string;
+  } | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [plotModified, setPlotModified] = useState(false);
+
+  // Command states for collapsible commands
+  const [currentRunCommand, setCurrentRunCommand] = useState<string>("");
   const [currentPlotCommand, setCurrentPlotCommand] = useState<string>("");
+  const [currentAnalyzeCommand, setCurrentAnalyzeCommand] = useState<string>("");
+
+  // Command running states
+  const [isRunningCommand, setIsRunningCommand] = useState(false);
+  const [isRunningPlot, setIsRunningPlot] = useState(false);
+  const [isRunningAnalyze, setIsRunningAnalyze] = useState(false);
+
+  // Command saving states
+  const [isSavingCommand, setIsSavingCommand] = useState(false);
+  const [isSavingPlot, setIsSavingPlot] = useState(false);
+  const [isSavingAnalyze, setIsSavingAnalyze] = useState(false);
+
   const [autoAnalyze, setAutoAnalyze] = useState<boolean>(true);
   // Plot analysis state
   const [plotAnalysisOutput, setPlotAnalysisOutput] = useState<string | null>(null);
@@ -234,7 +262,7 @@ export default function Dashboard() {
         setQubits(qubitNames);
         // Auto-select first qubit if current selection is not in list
         setSelectedQubitState(prev => qubitNames.includes(prev) ? prev : qubitNames[0]);
-        addLog(`Loaded ${qubitNames.length} qubits from session: ${result.sessionPath.join('/')}`);
+        addLog(`Loaded ${qubitNames.length} qubits${result.sessionPath ? ' from session: ' + result.sessionPath.join('/') : ''}`);
       } else {
         setQubits([]);
         setSelectedQubitState("");
@@ -280,7 +308,9 @@ export default function Dashboard() {
       return;
     }
     setRunning(true);
+    setIsRunningPlot(true);
     setPlotUrl(null);
+    setPlotLoading(true);
     setAnalysisResult(null);
     setAnalysisError(null);
     setPlotAnalysisOutput(null);
@@ -288,14 +318,13 @@ export default function Dashboard() {
     addLog(`📊 Plotting historical dataset: ${name}...`);
 
     try {
-      const result = await api.plotHistoricalDataset(name, path, currentPlotCommand);
+      // 使用新版 API - 自动根据实验类型选择绘图配置
+      const result = await api.plotExperimentDataset(name, path);
 
-      if (result.success && result.plot_filename) {
-        setPlotUrl(`/plots/${result.plot_filename}?t=${Date.now()}`);
-        if (result.analysis_output) {
-          setPlotAnalysisOutput(result.analysis_output);
-        }
-        addLog(`✅ Plot saved: ${result.dataset_name}`);
+      if (result.success && result.image) {
+        // 直接使用 Base64 URL 显示图像
+        setPlotUrl(result.image);
+        addLog(`✅ Plotted ${result.exp_type} for qubit ${result.qubit} (exp #${result.exp_num})`);
       } else {
         addLog(`❌ Plot failed: ${result.error || "Unknown error"}`, true);
       }
@@ -303,6 +332,8 @@ export default function Dashboard() {
       addLog(`❌ ${e.message}`, true);
     } finally {
       setRunning(false);
+      setIsRunningPlot(false);
+      setPlotLoading(false);
     }
   };
 
@@ -325,6 +356,12 @@ export default function Dashboard() {
   const setSelectedExp = (e: ExpType) => {
     setSelectedExpState(e);
     saveStr(STORAGE_KEYS.selectedExp, e);
+    // Update commands from configs
+    if (experimentConfigs[e]) {
+      setCurrentRunCommand(experimentConfigs[e].defaultCommand || "");
+      setCurrentPlotCommand(experimentConfigs[e].defaultPlotCommand || "");
+      setCurrentAnalyzeCommand(experimentConfigs[e].defaultAnalysisCommand || "");
+    }
   };
 
   // ── Add qubit ──────────────────────────────────────────────────────────
@@ -382,48 +419,56 @@ export default function Dashboard() {
   const runExperiment = async (exp: ExpType, plotCmd?: string) => {
     if (running) return;
     setRunning(true);
+    setIsRunningCommand(true);
     addLog("▶ " + exp + " on " + selectedQubit + "...");
-    setJobId(null);
     setPlotUrl(null);
+    setPlotLoading(true);
     setAnalysisResult(null);
     setAnalysisError(null);
+    setLlmSummary(null);
 
     const sqFn = sqMap[exp] || exp;
     const code = sqFn + "(" + selectedQubit + ", do_plot=True)";
 
     try {
-      const { jobId: id } = await api.runAsync(code, {
-        plotCommand: plotCmd || currentPlotCommand,
-        autoAnalyze,
-      });
-      setJobId(id);
-      addLog("Job: " + id);
+      // Use synchronous microservice endpoint
+      const result = await api.runExperiment(code, { timeout: 300 });
+      setTaskId(result.task_id);
+      addLog("Task: " + result.task_id.slice(0, 12) + "...");
 
-      const result = await api.waitForJob(id);
-
-      if (result.status === "completed") {
+      if (result.status === "success") {
         addLog("✅ Done (stdout " + (result.stdout?.length || 0) + " chars)");
         const snippet = (result.stdout || "").slice(-200).replace(/\n/g, " | ");
         addLog("  → " + snippet);
-        if (result.plotPath) setPlotUrl(api.plotUrl(id));
+        if (result.result && typeof result.result === 'object' && 'plotPath' in result.result) {
+          setPlotUrl(result.result.plotPath as string);
+        }
 
         // Parse analysis result from stdout
         const analysisMatch = (result.stdout || "").match(/QMCLAW_ANALYSIS:(.+)/);
         if (analysisMatch) {
           try {
             const analysis = JSON.parse(analysisMatch[1]);
-            setAnalysisResult(analysis);
+            setAnalysisResult({ success: true, stdout: analysis });
             addLog("📊 Analysis: " + analysis.slice(0, 100) + "...");
           } catch {
-            setAnalysisResult(analysisMatch[1]);
+            setAnalysisResult({ success: true, stdout: analysisMatch[1] });
             addLog("📊 Analysis: " + analysisMatch[1].slice(0, 100) + "...");
           }
         }
         const analysisErrorMatch = (result.stdout || "").match(/QMCLAW_ANALYSIS_ERROR:(.+)/);
         if (analysisErrorMatch) {
-          setAnalysisError(analysisErrorMatch[1]);
+          setAnalysisResult({ success: false, error: analysisErrorMatch[1] });
           addLog("⚠️ Analysis error: " + analysisErrorMatch[1], true);
         }
+
+        // Auto LLM summary if enabled
+        if (autoAnalyze && plotAnalysisOutput && !llmSummary) {
+          addLog("🤖 Auto-generating AI summary...");
+          handleAiSummary();
+        }
+      } else if (result.status === "busy") {
+        addLog("⏳ Service busy, another task is running", true);
       } else {
         addLog("❌ Failed: " + (result.error || result.status), true);
         if (result.stderr) addLog("  stderr: " + result.stderr.slice(0, 200), true);
@@ -432,7 +477,8 @@ export default function Dashboard() {
       addLog("❌ " + e.message, true);
     } finally {
       setRunning(false);
-      setJobId(null);
+      setIsRunningCommand(false);
+      setPlotLoading(false);
     }
   };
 
@@ -440,45 +486,53 @@ export default function Dashboard() {
   const runCustom = async (command: string, plotCmd?: string) => {
     if (running) return;
     setRunning(true);
+    setIsRunningCommand(true);
     setPlotUrl(null);
+    setPlotLoading(true);
     setAnalysisResult(null);
     setAnalysisError(null);
+    setLlmSummary(null);
     addLog("▶ Custom: " + command.slice(0, 60) + "...");
-    setJobId(null);
 
     try {
-      const { jobId: id } = await api.runAsync(command, {
-        plotCommand: plotCmd || currentPlotCommand,
-        autoAnalyze,
-      });
-      setJobId(id);
-      addLog("Job: " + id);
+      // Use synchronous microservice endpoint
+      const result = await api.runExperiment(command, { timeout: 300 });
+      setTaskId(result.task_id);
+      addLog("Task: " + result.task_id.slice(0, 12) + "...");
 
-      const result = await api.waitForJob(id);
-
-      if (result.status === "completed") {
+      if (result.status === "success") {
         addLog("✅ Done (stdout " + (result.stdout?.length || 0) + " chars)");
         const snippet = (result.stdout || "").slice(-200).replace(/\n/g, " | ");
         addLog("  → " + snippet);
-        if (result.plotPath) setPlotUrl(api.plotUrl(id));
+        if (result.result && typeof result.result === 'object' && 'plotPath' in result.result) {
+          setPlotUrl(result.result.plotPath as string);
+        }
 
         // Parse analysis result from stdout
         const analysisMatch = (result.stdout || "").match(/QMCLAW_ANALYSIS:(.+)/);
         if (analysisMatch) {
           try {
             const analysis = JSON.parse(analysisMatch[1]);
-            setAnalysisResult(analysis);
+            setAnalysisResult({ success: true, stdout: analysis });
             addLog("📊 Analysis: " + analysis.slice(0, 100) + "...");
           } catch {
-            setAnalysisResult(analysisMatch[1]);
+            setAnalysisResult({ success: true, stdout: analysisMatch[1] });
             addLog("📊 Analysis: " + analysisMatch[1].slice(0, 100) + "...");
           }
         }
         const analysisErrorMatch = (result.stdout || "").match(/QMCLAW_ANALYSIS_ERROR:(.+)/);
         if (analysisErrorMatch) {
-          setAnalysisError(analysisErrorMatch[1]);
+          setAnalysisResult({ success: false, error: analysisErrorMatch[1] });
           addLog("⚠️ Analysis error: " + analysisErrorMatch[1], true);
         }
+
+        // Auto LLM summary if enabled
+        if (autoAnalyze && plotAnalysisOutput && !llmSummary) {
+          addLog("🤖 Auto-generating AI summary...");
+          handleAiSummary();
+        }
+      } else if (result.status === "busy") {
+        addLog("⏳ Service busy, another task is running", true);
       } else {
         addLog("❌ Failed: " + (result.error || result.status), true);
         if (result.stderr) addLog("  stderr: " + result.stderr.slice(0, 200), true);
@@ -487,7 +541,8 @@ export default function Dashboard() {
       addLog("❌ " + e.message, true);
     } finally {
       setRunning(false);
-      setJobId(null);
+      setIsRunningCommand(false);
+      setPlotLoading(false);
     }
   };
 
@@ -495,7 +550,9 @@ export default function Dashboard() {
   const handlePlot = async (plotCommand: string) => {
     if (running) return;
     setRunning(true);
+    setIsRunningPlot(true);
     setPlotUrl(null);
+    setPlotLoading(true);
     setAnalysisResult(null);
     setAnalysisError(null);
     setPlotAnalysisOutput(null);
@@ -514,7 +571,7 @@ export default function Dashboard() {
       const result = await res.json();
 
       if (result.success) {
-        setPlotUrl(`/plots/${result.plot_filename}?t=${Date.now()}`);
+        setPlotUrl(`${result.plotUrl}?t=${Date.now()}`);
         // Capture analysis output from the plot command
         if (result.analysis_output) {
           setPlotAnalysisOutput(result.analysis_output);
@@ -527,6 +584,8 @@ export default function Dashboard() {
       addLog("❌ " + e.message, true);
     } finally {
       setRunning(false);
+      setIsRunningPlot(false);
+      setPlotLoading(false);
     }
   };
 
@@ -553,6 +612,7 @@ export default function Dashboard() {
 
   // ── Save plot command to config ─────────────────────────────────────────
   const handleSavePlotCommand = async (expType: string, plotCommand: string) => {
+    setIsSavingPlot(true);
     try {
       await api.updateExperimentConfig(expType, { defaultPlotCommand: plotCommand });
       // Reload configs to reflect the change
@@ -567,11 +627,14 @@ export default function Dashboard() {
     } catch (e: any) {
       addLog(`❌ Failed to save: ${e.message}`, true);
       throw e;
+    } finally {
+      setIsSavingPlot(false);
     }
   };
 
   // ── Save run command to config ─────────────────────────────────────────────
   const handleSaveRunCommand = async (expType: string, command: string) => {
+    setIsSavingCommand(true);
     try {
       await api.updateExperimentConfig(expType, {
         defaultCommand: command,
@@ -588,11 +651,14 @@ export default function Dashboard() {
     } catch (e: any) {
       addLog(`❌ Failed to save: ${e.message}`, true);
       throw e;
+    } finally {
+      setIsSavingCommand(false);
     }
   };
 
   // ── Save analysis command to config ─────────────────────────────────────
   const handleSaveAnalysisCommand = async (expType: string, analysisCommand: string, metrics: string[]) => {
+    setIsSavingAnalyze(true);
     try {
       await api.updateExperimentConfig(expType, {
         defaultAnalysisCommand: analysisCommand,
@@ -610,6 +676,46 @@ export default function Dashboard() {
     } catch (e: any) {
       addLog(`❌ Failed to save: ${e.message}`, true);
       throw e;
+    } finally {
+      setIsSavingAnalyze(false);
+    }
+  };
+
+  // ── Execute All: Run command → Plot → Analyze ───────────────────────────
+  const handleExecuteAll = async () => {
+    if (running) {
+      addLog("⚠️ A task is already running", true);
+      return;
+    }
+
+    // First run the experiment command
+    addLog("▶ Execute All: Running experiment...");
+    await runExperiment(selectedExp);
+
+    // After experiment completes, run plot command
+    if (!running && plotUrl) {
+      addLog("▶ Execute All: Running plot...");
+      await handlePlot(currentPlotCommand);
+
+      // After plot completes, run analysis command
+      if (!running && currentAnalyzeCommand) {
+        addLog("▶ Execute All: Running analysis...");
+        const result = await api.runAnalysis(currentAnalyzeCommand, selectedExp);
+        if (result.success) {
+          setAnalysisResult({
+            success: true,
+            stdout: result.stdout,
+            metrics: result.metrics,
+          });
+          addLog("✅ Execute All: Complete!");
+        } else {
+          setAnalysisResult({
+            success: false,
+            error: result.error || "Unknown error",
+          });
+          addLog("❌ Execute All: Analysis failed", true);
+        }
+      }
     }
   };
 
@@ -912,269 +1018,233 @@ export default function Dashboard() {
                 {expDescriptions[selectedExp]}
               </div>
 
-              <EditableCommand
-                qubit={selectedQubit}
-                expType={selectedExp}
-                initialCommand={experimentConfigs[selectedExp]?.defaultPlotCommand || ""}
-                onRun={(cmd) => runCustom(cmd)}
-                onSave={(cmd) => handleSaveRunCommand(selectedExp, cmd)}
-                disabled={running}
-              />
-
-              <PlotCommandEditor
-                expType={selectedExp}
-                initialPlotCommand={experimentConfigs[selectedExp]?.defaultPlotCommand || ""}
-                onPlotCommandChange={(cmd) => setCurrentPlotCommand(cmd)}
-                onPlot={(cmd) => handlePlot(cmd)}
-                onSaveToConfig={handleSavePlotCommand}
-                plotDisabled={running}
-              />
-
-              {/* Analysis Command Editor */}
-              <AnalysisCommandEditor
-                expType={selectedExp}
-                initialCommand={experimentConfigs[selectedExp]?.defaultAnalysisCommand || ""}
-                metricsToExtract={experimentConfigs[selectedExp]?.metricsToExtract || []}
-                onSaveToConfig={(cmd, metrics) => handleSaveAnalysisCommand(selectedExp, cmd, metrics)}
-                disabled={running}
-                onLog={addLog}
-              />
-
-              {/* Auto-analyze toggle */}
-              <div style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "0.5rem",
-                padding: "0.35rem 0.75rem",
-                background: "#0f172a",
-                border: "1px solid #1e293b",
-                borderRadius: "0.375rem",
-                fontSize: "0.75rem",
-              }}>
-                <input
-                  type="checkbox"
-                  id="auto-analyze"
-                  checked={autoAnalyze}
-                  onChange={(e) => setAutoAnalyze(e.target.checked)}
-                  style={{ cursor: "pointer" }}
+              {/* Collapsible Commands */}
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                {/* Run Command */}
+                <CollapsibleCommand
+                  type="command"
+                  command={currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)"}
+                  onCommandChange={setCurrentRunCommand}
+                  onRun={() => runCustom(currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)")}
+                  onSave={() => handleSaveRunCommand(selectedExp, currentRunCommand)}
+                  disabled={running}
+                  isRunning={isRunningCommand}
+                  isSaving={isSavingCommand}
+                  showRunButton={true}
+                  showSaveButton={true}
                 />
-                <label htmlFor="auto-analyze" style={{ color: "#94a3b8", cursor: "pointer" }}>
-                  🤖 Auto-analyze plot with LLM
+
+                {/* Plot Command */}
+                <CollapsibleCommand
+                  type="plot"
+                  command={currentPlotCommand || "qter.fitData({exp_num})"}
+                  onCommandChange={setCurrentPlotCommand}
+                  onRun={() => {
+                    const cmd = currentPlotCommand || `qter.fitData({exp_num})`;
+                    handlePlot(cmd);
+                  }}
+                  onSave={() => {
+                    const cmd = currentPlotCommand || `qter.fitData({exp_num})`;
+                    handleSavePlotCommand(selectedExp, cmd);
+                  }}
+                  disabled={running}
+                  isRunning={isRunningPlot}
+                  isSaving={isSavingPlot}
+                  showRunButton={true}
+                  showSaveButton={true}
+                />
+
+                {/* Analyze Command */}
+                <CollapsibleCommand
+                  type="analyze"
+                  command={currentAnalyzeCommand || "qter.fitData({exp_num}, collect=True, do_plot=False)"}
+                  onCommandChange={setCurrentAnalyzeCommand}
+                  onRun={() => {
+                    setIsRunningAnalyze(true);
+                    const cmd = currentAnalyzeCommand || `qter.fitData({exp_num}, collect=True, do_plot=False)`;
+                    api.runAnalysis(cmd, selectedExp).then((result) => {
+                      if (result.success) {
+                        setAnalysisResult({
+                          success: true,
+                          stdout: result.stdout,
+                          metrics: result.metrics,
+                        });
+                        addLog("✅ Analysis completed");
+                      } else {
+                        setAnalysisResult({
+                          success: false,
+                          error: result.error || "Unknown error",
+                        });
+                        addLog("❌ Analysis failed: " + result.error, true);
+                      }
+                    }).finally(() => {
+                      setIsRunningAnalyze(false);
+                    });
+                  }}
+                  onSave={() => {
+                    const cmd = currentAnalyzeCommand || `qter.fitData({exp_num}, collect=True, do_plot=False)`;
+                    handleSaveAnalysisCommand(selectedExp, cmd, []);
+                  }}
+                  disabled={running}
+                  isRunning={isRunningAnalyze}
+                  isSaving={isSavingAnalyze}
+                  showRunButton={true}
+                  showSaveButton={true}
+                />
+              </div>
+
+              {/* Action Buttons */}
+              <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
+                {/* Execute All Button */}
+                <button
+                  onClick={handleExecuteAll}
+                  disabled={running}
+                  style={{
+                    padding: "0.6rem 1.5rem",
+                    borderRadius: "0.5rem",
+                    border: "none",
+                    background: running ? "#334155" : "#8b5cf6",
+                    color: running ? "#64748b" : "#fff",
+                    fontWeight: 700,
+                    cursor: running ? "not-allowed" : "pointer",
+                    fontSize: "0.85rem",
+                  }}
+                >
+                  ⚡ Execute All
+                </button>
+
+                {/* Run Selected Experiment */}
+                <button
+                  onClick={() => runExperiment(selectedExp)}
+                  disabled={running}
+                  style={{
+                    padding: "0.6rem 1.5rem",
+                    borderRadius: "0.5rem",
+                    border: "none",
+                    background: running ? "#334155" : "#22c55e",
+                    color: running ? "#64748b" : "#fff",
+                    fontWeight: 600,
+                    cursor: running ? "not-allowed" : "pointer",
+                    fontSize: "0.85rem",
+                  }}
+                >
+                  {running ? "⏳ Running..." : "▶ Run " + selectedExp.replace(/_/g, " ")}
+                </button>
+
+                {/* Plot Button */}
+                <button
+                  onClick={() => {
+                    if (running) return;
+                    setIsRunningPlot(true);
+                    const cmd = currentPlotCommand || `qter.fitData({exp_num})`;
+                    api.runPlot(cmd, selectedExp).then((result) => {
+                      if (result.success) {
+                        setPlotUrl(result.image || null);
+                        addLog("✅ Plot completed");
+                      } else {
+                        addLog("❌ Plot failed: " + result.error, true);
+                      }
+                    }).finally(() => {
+                      setIsRunningPlot(false);
+                    });
+                  }}
+                  disabled={running || isRunningPlot}
+                  style={{
+                    padding: "0.6rem 1rem",
+                    borderRadius: "0.5rem",
+                    border: "1px solid #3b82f6",
+                    background: "transparent",
+                    color: running || isRunningPlot ? "#64748b" : "#3b82f6",
+                    fontWeight: 600,
+                    cursor: running || isRunningPlot ? "not-allowed" : "pointer",
+                    fontSize: "0.85rem",
+                  }}
+                >
+                  {isRunningPlot ? "⏳ Plotting..." : "📊 Plot"}
+                </button>
+
+                {/* Analyze Button */}
+                <button
+                  onClick={() => {
+                    if (running) return;
+                    setIsRunningAnalyze(true);
+                    api.runAnalysis(currentAnalyzeCommand, selectedExp).then((result) => {
+                      if (result.success) {
+                        setAnalysisResult({
+                          success: true,
+                          stdout: result.stdout,
+                          metrics: result.metrics,
+                        });
+                        addLog("✅ Analysis completed");
+                      } else {
+                        setAnalysisResult({
+                          success: false,
+                          error: result.error || "Unknown error",
+                        });
+                        addLog("❌ Analysis failed: " + result.error, true);
+                      }
+                    }).finally(() => {
+                      setIsRunningAnalyze(false);
+                    });
+                  }}
+                  disabled={running || isRunningAnalyze}
+                  style={{
+                    padding: "0.6rem 1rem",
+                    borderRadius: "0.5rem",
+                    border: "1px solid #f59e0b",
+                    background: "transparent",
+                    color: running || isRunningAnalyze ? "#64748b" : "#f59e0b",
+                    fontWeight: 600,
+                    cursor: running || isRunningAnalyze ? "not-allowed" : "pointer",
+                    fontSize: "0.85rem",
+                  }}
+                >
+                  {isRunningAnalyze ? "⏳ Analyzing..." : "📈 Analyze"}
+                </button>
+
+                {/* Auto LLM Summary Checkbox */}
+                <label
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.35rem",
+                    cursor: "pointer",
+                    fontSize: "0.75rem",
+                    color: "#94a3b8",
+                    padding: "0.4rem 0.75rem",
+                    background: autoAnalyze ? "#1e1b4b" : "#1e293b",
+                    borderRadius: "0.375rem",
+                    border: "1px solid",
+                    borderColor: autoAnalyze ? "#6366f1" : "#334155",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={autoAnalyze}
+                    onChange={(e) => setAutoAnalyze(e.target.checked)}
+                    style={{ cursor: "pointer" }}
+                  />
+                  🤖 LLM
                 </label>
               </div>
 
-              <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                <button onClick={() => runExperiment(selectedExp)} disabled={running} style={{
-                  padding: "0.6rem 2rem", borderRadius: "0.5rem", border: "none",
-                  background: running ? "#334155" : "#22c55e",
-                  color: running ? "#64748b" : "#fff",
-                  fontWeight: 600, cursor: running ? "not-allowed" : "pointer", fontSize: "0.9rem",
-                }}>
-                  {running ? "⏳ Running..." : "▶ Run " + selectedExp.replace(/_/g, " ")}
-                </button>
-                {expButtons.map((e) => (
-                  <ActionBtn key={e} label={e.replace(/_/g, " ")} on={() => runExperiment(e)} disabled={running} />
-                ))}
-              </div>
-
-              {plotUrl ? (
-                <div style={{
-                  marginTop: "0.5rem",
-                  border: "1px solid #1e293b",
-                  borderRadius: "0.5rem",
-                  overflow: "hidden",
-                  background: "#0a0f1a",
-                }}>
-                  <div style={{
-                    padding: "0.5rem 0.75rem",
-                    fontSize: "0.7rem", fontWeight: 600,
-                    color: "#475569", letterSpacing: "0.1em",
-                    borderBottom: "1px solid #1e293b",
-                    background: "#0f172a",
-                  }}>
-                    📈 PLOT {jobId ? "(job: " + jobId.slice(0, 8) + "...)" : ""}
-                  </div>
-                  {/* Left-Right Layout: Image + Analysis */}
-                  <div style={{
-                    display: "grid",
-                    gridTemplateColumns: plotAnalysisOutput ? "1fr 400px" : "1fr",
-                    minHeight: "300px",
-                  }}>
-                    {/* Left: Plot Image */}
-                    <div style={{ borderRight: plotAnalysisOutput ? "1px solid #1e293b" : "none" }}>
-                      <img
-                        src={plotUrl}
-                        alt="Experiment plot"
-                        style={{ display: "block", width: "100%", maxHeight: "70vh", objectFit: "contain" }}
-                      />
-                    </div>
-                    {/* Right: Analysis Output + AI Summary */}
-                    {plotAnalysisOutput && (
-                      <div style={{ padding: "0.75rem", overflow: "auto", maxHeight: "70vh" }}>
-                        {/* Analysis Output Header */}
-                        <div style={{
-                          fontSize: "0.7rem", fontWeight: 600,
-                          color: "#475569", letterSpacing: "0.1em",
-                          marginBottom: "0.5rem",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                        }}>
-                          📊 ANALYSIS OUTPUT
-                        </div>
-                        {/* Analysis Output Content */}
-                        <pre style={{
-                          fontSize: "0.75rem",
-                          color: "#22d3ee",
-                          lineHeight: 1.5,
-                          whiteSpace: "pre-wrap",
-                          wordBreak: "break-word",
-                          background: "#0f172a",
-                          padding: "0.75rem",
-                          borderRadius: "0.25rem",
-                          border: "1px solid #1e293b",
-                          margin: 0,
-                          maxHeight: "35vh",
-                          overflow: "auto",
-                        }}>
-                          {plotAnalysisOutput}
-                        </pre>
-                        {/* AI Summary Button */}
-                        <button
-                          onClick={handleAiSummary}
-                          disabled={isSummarizing}
-                          style={{
-                            marginTop: "0.75rem",
-                            padding: "0.4rem 0.75rem",
-                            borderRadius: "0.25rem",
-                            border: "none",
-                            background: isSummarizing ? "#334155" : "#6366f1",
-                            color: isSummarizing ? "#64748b" : "#fff",
-                            fontSize: "0.75rem",
-                            fontWeight: 600,
-                            cursor: isSummarizing ? "not-allowed" : "pointer",
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "0.5rem",
-                            width: "100%",
-                          }}
-                        >
-                          {isSummarizing ? (
-                            <>⏳ Generating summary...</>
-                          ) : (
-                            <>🤖 AI Summary</>
-                          )}
-                        </button>
-                        {/* LLM Summary Display */}
-                        {llmSummary && (
-                          <div style={{
-                            marginTop: "0.75rem",
-                            padding: "0.75rem",
-                            background: "#1e1b4b",
-                            borderRadius: "0.25rem",
-                            border: "1px solid #6366f1",
-                          }}>
-                            <div style={{
-                              fontSize: "0.7rem", fontWeight: 600,
-                              color: "#a5b4fc", marginBottom: "0.5rem",
-                            }}>
-                              💡 AI Summary
-                            </div>
-                            <div style={{
-                              fontSize: "0.8rem",
-                              color: "#e2e8f0",
-                              lineHeight: 1.6,
-                              whiteSpace: "pre-wrap",
-                            }}>
-                              {llmSummary}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ) : (
-                <div style={{
-                  marginTop: "0.5rem",
-                  border: "1px dashed #1e293b",
-                  borderRadius: "0.5rem",
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  minHeight: "8rem", color: "#334569",
-                  fontSize: "0.8rem",
-                  flexDirection: "column", gap: "0.5rem",
-                }}>
-                  <span style={{ fontSize: "1.5rem" }}>📊</span>
-                  <span>Run an experiment to see the plot here</span>
-                </div>
-              )}
-
-              {/* Analysis result display */}
-              {analysisResult && (
-                <div style={{
-                  marginTop: "0.5rem",
-                  border: "1px solid #6366f1",
-                  borderRadius: "0.5rem",
-                  overflow: "hidden",
-                  background: "#0a0f1a",
-                }}>
-                  <div style={{
-                    padding: "0.5rem 0.75rem",
-                    fontSize: "0.7rem", fontWeight: 600,
-                    color: "#6366f1", letterSpacing: "0.1em",
-                    borderBottom: "1px solid #1e293b",
-                    background: "#1e1b4b",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "0.5rem",
-                  }}>
-                    🤖 LLM ANALYSIS
-                    <span style={{ fontSize: "0.65rem", color: "#a5b4fc", fontWeight: 400 }}>
-                      {selectedExp}
-                    </span>
-                  </div>
-                  <div style={{
-                    padding: "0.75rem",
-                    fontSize: "0.8rem",
-                    color: "#e2e8f0",
-                    lineHeight: 1.6,
-                    whiteSpace: "pre-wrap",
-                    maxHeight: "300px",
-                    overflow: "auto",
-                  }}>
-                    {analysisResult}
-                  </div>
-                </div>
-              )}
-
-              {/* Analysis error display */}
-              {analysisError && (
-                <div style={{
-                  marginTop: "0.5rem",
-                  border: "1px solid #f59e0b",
-                  borderRadius: "0.5rem",
-                  overflow: "hidden",
-                  background: "#0a0f1a",
-                }}>
-                  <div style={{
-                    padding: "0.5rem 0.75rem",
-                    fontSize: "0.7rem", fontWeight: 600,
-                    color: "#f59e0b", letterSpacing: "0.1em",
-                    borderBottom: "1px solid #1e293b",
-                    background: "#451a03",
-                  }}>
-                    ⚠️ ANALYSIS ERROR
-                  </div>
-                  <div style={{
-                    padding: "0.75rem",
-                    fontSize: "0.8rem",
-                    color: "#fca5a5",
-                    lineHeight: 1.6,
-                  }}>
-                    {analysisError}
-                  </div>
-                </div>
-              )}
+              {/* Unified Results Display */}
+              <UnifiedResults
+                plotUrl={plotUrl}
+                plotLoading={plotLoading}
+                analysisResult={analysisResult}
+                llmSummary={llmSummary}
+                isSummarizing={isSummarizing}
+                onDownloadPlot={() => {
+                  if (plotUrl && plotUrl.startsWith('data:')) {
+                    const link = document.createElement('a');
+                    link.href = plotUrl;
+                    link.download = `plot_${Date.now()}.png`;
+                    link.click();
+                  }
+                }}
+                onAiSummary={handleAiSummary}
+              />
             </div>
           )}
 
@@ -1217,7 +1287,7 @@ export default function Dashboard() {
             borderBottom: "1px solid #1e293b",
             flexShrink: 0,
           }}>
-            OUTPUT {jobId ? "(job: " + jobId.slice(0, 8) + "...)" : ""}
+            OUTPUT {taskId ? "(task: " + taskId.slice(0, 8) + "...)" : ""}
           </div>
           <div style={{
             flex: 1, overflow: "auto",

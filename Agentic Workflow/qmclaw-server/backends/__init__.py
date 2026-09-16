@@ -81,8 +81,8 @@ def init_backend(
     """Initialize the configured backend.
 
     This is the main entry point for initializing the backend system.
-    It loads the configuration from system.json and creates the
-    appropriate backend instance.
+    It tries to use the legacy backend.py first, then falls back to the
+    new LQCSBackend adapter.
 
     Args:
         config_path: Path to system.json configuration file
@@ -93,13 +93,66 @@ def init_backend(
         Initialized backend instance
     """
     import sys
-    import threading
+    import time as _time
     print("[backends init_backend] STARTING", file=sys.stderr, flush=True)
-    print(f"[backends init_backend] backends in sys.modules: {'backends' in sys.modules}", file=sys.stderr, flush=True)
-    print(f"[backends init_backend] backends module id: {id(sys.modules.get('backends', None))}", file=sys.stderr, flush=True)
+
+    # ── Method 1: Try to import legacy backend.py ───────────────────────────
+    # This is the original method that worked before the backends adapter was added.
+    # It directly imports from measure_scripts/backend.py which handles all initialization.
+    print("[backends init_backend] Trying legacy backend.py import...", file=sys.stderr, flush=True)
+
+    # Fix sys.path: Ray may have modified it, restore the correct paths
+    # The correct paths should include measure_scripts/measure_scripts and sq_workflow
+    # We need to find the QMClaw root (parent of "Agentic Workflow" folder or "measure_scripts")
+    _backends_init_py_path = Path(__file__).parent  # .../qmclaw-server/backends
+    _server_dir = _backends_init_py_path.parent  # .../qmclaw-server
+
+    # Find QMClaw root by going up until we find measure_scripts
+    _qmclaw_root = _server_dir
+    for _i in range(10):
+        _parent = _qmclaw_root.parent
+        if not _parent or str(_parent) == str(_qmclaw_root):
+            break
+        _qmclaw_root = _parent
+        if (_qmclaw_root / "measure_scripts").exists():
+            break
+
+    print(f"[backends init_backend] _qmclaw_root = {_qmclaw_root}", file=sys.stderr, flush=True)
+    print(f"[backends init_backend] measure_scripts exists = {(_qmclaw_root / 'measure_scripts').exists()}", file=sys.stderr, flush=True)
+
+    _sq_workflow_path = _qmclaw_root / "measure_scripts" / "measure_scripts" / "sq_workflow"
+    _measure_scripts_path = _qmclaw_root / "measure_scripts" / "measure_scripts"
+
+    print(f"[backends init_backend] _sq_workflow_path = {_sq_workflow_path}", file=sys.stderr, flush=True)
+    print(f"[backends init_backend] _sq_workflow_path exists = {_sq_workflow_path.exists()}", file=sys.stderr, flush=True)
+    print(f"[backends init_backend] backend.py exists = {(_sq_workflow_path / 'backend.py').exists()}", file=sys.stderr, flush=True)
+
+    # Remove ray/thirdparty_files from sys.path and add our paths at the beginning
+    # Create a new sys.path with correct paths at front
+    _correct_paths = [str(_sq_workflow_path), str(_measure_scripts_path)]
+    _new_sys_path = _correct_paths.copy()
+    for _p in sys.path:
+        if _p not in _correct_paths and 'ray/thirdparty_files' not in _p:
+            _new_sys_path.append(_p)
+
+    # Also keep ray path at end if it was there
+    for _p in sys.path:
+        if 'ray/thirdparty_files' in _p and _p not in _new_sys_path:
+            _new_sys_path.append(_p)
+
+    sys.path[:] = _new_sys_path
+    print(f"[backends init_backend] sys.path[:5] after fix = {sys.path[:5]}", file=sys.stderr, flush=True)
+
+    # Skip 'import backend' path - it hangs when Ray is already initialized
+    # Instead, use LQCSBackend adapter directly which handles all initialization
+    print("[backends init_backend] Skipping legacy 'import backend' (causes Ray conflict)", file=sys.stderr, flush=True)
+    print("[backends init_backend] Using LQCSBackend adapter directly...", file=sys.stderr, flush=True)
+    sys.stderr.flush()
+
+    # ── Method 2: Use LQCSBackend adapter ────────────────────────────────
+    import threading
 
     # Load configuration
-    print("[backends init_backend] calling load_system_config()...", file=sys.stderr, flush=True)
     config = load_system_config(config_path)
     print(f"[backends init_backend] config loaded: {config}", file=sys.stderr, flush=True)
 
@@ -119,30 +172,42 @@ def init_backend(
 
     # Create backend
     print(f"[backends init_backend] Creating backend '{system_name}'...", file=sys.stderr, flush=True)
-    print("[backends init_backend] calling _create_backend()...", file=sys.stderr, flush=True)
     backend = _create_backend(system_name, config)
     print(f"[backends init_backend] Backend created: {type(backend)}", file=sys.stderr, flush=True)
 
     # Initialize with session path - with overall timeout protection
     print(f"[backends init_backend] Initializing with session_path={session_path}...", file=sys.stderr, flush=True)
-    print("[backends init_backend] calling backend.initialize()...", file=sys.stderr, flush=True)
+    sys.stderr.flush()
 
     # Wrap initialization in a thread with timeout
     result = {"init_result": None, "init_error": None}
 
     def _init_with_timeout():
         try:
+            print("[backends init_backend] Thread: calling backend.initialize()...", file=sys.stderr, flush=True)
+            sys.stderr.flush()
             result["init_result"] = backend.initialize(session_path)
+            print("[backends init_backend] Thread: backend.initialize() returned!", file=sys.stderr, flush=True)
         except Exception as e:
+            import traceback
             result["init_error"] = e
+            print(f"[backends init_backend] Thread: backend.initialize() raised: {e}", file=sys.stderr, flush=True)
+            print(f"[backends init_backend] Thread traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+        sys.stderr.flush()
 
     init_thread = threading.Thread(target=_init_with_timeout)
     init_thread.daemon = True
     init_thread.start()
+    print(f"[backends init_backend] Thread started, waiting up to {timeout}s...", file=sys.stderr, flush=True)
+    sys.stderr.flush()
     init_thread.join(timeout=timeout)
+
+    print(f"[backends init_backend] Thread join completed, is_alive={init_thread.is_alive()}", file=sys.stderr, flush=True)
+    sys.stderr.flush()
 
     if init_thread.is_alive():
         print(f"[backends init_backend] TIMEOUT after {timeout} seconds!", file=sys.stderr, flush=True)
+        sys.stderr.flush()
         raise TimeoutError(f"Backend initialization timed out after {timeout} seconds")
     elif result["init_error"]:
         print(f"[backends init_backend] initialization error: {result['init_error']}", file=sys.stderr, flush=True)

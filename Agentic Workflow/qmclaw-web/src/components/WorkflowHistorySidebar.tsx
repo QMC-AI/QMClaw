@@ -14,8 +14,10 @@ export default function WorkflowHistorySidebar({ currentWorkflowId, onSelectWork
 
   const loadRuns = useCallback(async () => {
     try {
-      const data = await api.listWorkflowRuns() as WorkflowRun[];
-      setRuns(data || []);
+      const result = await api.listWorkflowRuns() as { runs?: WorkflowRun[]; error?: string };
+      // 后端返回 {runs: [...], count: X}，兼容直接返回数组的情况
+      const data = (result?.runs || result as unknown as WorkflowRun[] || []);
+      setRuns(Array.isArray(data) ? data : []);
     } catch (e) {
       console.error("Failed to load workflow runs:", e);
       setRuns([]);

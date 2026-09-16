@@ -1,7 +1,17 @@
 /**
  * API Client for qmclaw Express backend
  *
- * All API calls go to the Express server (:3002) which proxies to Python subprocess
+ * Architecture: Browser → Express (:3002) → Microservices
+ *
+ * Path structure:
+ *   /api/quantum/*  - Quantum (LabRAD) operations
+ *   /api/llm/*      - LLM operations
+ *   /api/analysis/* - Data analysis
+ *   /api/agent/*    - Agent (chat, memory)
+ *   /api/image/*    - Image classification
+ *   /api/workflow/* - Workflow execution
+ *   /api/tasks/*    - Task queue
+ *   /api/hermes/*   - Hermes Agent
  */
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
@@ -106,12 +116,93 @@ export const api = {
     return res.json();
   },
 
-  // ── Experiments ──────────────────────────────────────────────────────────
+  // ── Quantum Service (LabRAD operations) ──────────────────────────────────
 
+  /**
+   * List available experiments from sq module
+   */
   listExperiments: async () => {
-    const res = await fetch(`${API_BASE}/experiments`);
+    const res = await fetch(`${API_BASE}/api/quantum/experiments`);
     return res.json();
   },
+
+  /**
+   * List qubits in current session
+   */
+  listQubits: async () => {
+    const res = await fetch(`${API_BASE}/api/quantum/qubits`);
+    return res.json();
+  },
+
+  /**
+   * Get qubit parameters
+   */
+  getQubitParams: async (name: string) => {
+    const res = await fetch(`${API_BASE}/api/quantum/qubit/params?name=${encodeURIComponent(name)}`);
+    return res.json();
+  },
+
+  /**
+   * Set qubit parameters
+   */
+  setQubitParams: async (name: string, params: Record<string, number | null>) => {
+    const res = await fetch(`${API_BASE}/api/quantum/qubit/set_params`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, params }),
+    });
+    return res.json();
+  },
+
+  /**
+   * List sessions (DataVault groups)
+   */
+  listSessions: async () => {
+    const res = await fetch(`${API_BASE}/api/quantum/sessions`);
+    return res.json();
+  },
+
+  /**
+   * Switch to a different session
+   */
+  switchSession: async (path: string[]) => {
+    const res = await fetch(`${API_BASE}/api/quantum/switch_session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_path: path }),
+    });
+    return res.json();
+  },
+
+  /**
+   * Get session directory tree
+   */
+  getSessionTree: async (maxDepth = 5) => {
+    const res = await fetch(`${API_BASE}/api/quantum/session_tree?max_depth=${maxDepth}`);
+    return res.json();
+  },
+
+  /**
+   * List datasets in a path
+   */
+  listDatasets: async (path: string) => {
+    const res = await fetch(`${API_BASE}/api/quantum/datasets?path=${encodeURIComponent(path)}`);
+    return res.json();
+  },
+
+  /**
+   * Execute experiment code
+   */
+  executeExperiment: async (code: string, timeout = 300) => {
+    const res = await fetch(`${API_BASE}/api/quantum/execute`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, timeout }),
+    });
+    return res.json();
+  },
+
+  // ── Experiment Configs (stored locally) ────────────────────────────────────
 
   getExperimentConfigs: async () => {
     const res = await fetch(`${API_BASE}/api/experiments/configs`);
@@ -127,8 +218,45 @@ export const api = {
     return res.json();
   },
 
-  // ── Jobs ─────────────────────────────────────────────────────────────────
+  // ── Jobs (Microservice Mode) ─────────────────────────────────────────────────
 
+  /**
+   * Run experiment code via Quantum microservice (synchronous)
+   * Uses POST /api/quantum/execute - execution is synchronous, returns result directly
+   */
+  runExperiment: async (code: string, options?: {
+    taskId?: string;
+    timeout?: number;
+  }): Promise<{
+    task_id: string;
+    status: string;
+    stdout: string;
+    stderr: string;
+    error: string;
+    result?: unknown;
+  }> => {
+    const res = await fetch(`${API_BASE}/api/quantum/execute`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code,
+        task_id: options?.taskId || `task_${Date.now()}`,
+        timeout: options?.timeout || 300,
+      }),
+    });
+
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      throw new Error(errorData.error || `Execution failed: HTTP ${res.status}`);
+    }
+
+    return res.json();
+  },
+
+  /**
+   * Run experiment with polling (for backwards compatibility)
+   * In microservice mode, execution is synchronous so polling completes immediately
+   */
   runAsync: async (code: string, options?: {
     plotCommand?: string;
     analysisPrompt?: string;
@@ -138,19 +266,80 @@ export const api = {
     _modelBaseUrl?: string;
     temperature?: number;
   }) => {
-    const res = await fetch(`${API_BASE}/job`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, ...options }),
-    });
-    return res.json();
+    // Try microservice endpoint first
+    try {
+      const result = await api.runExperiment(code, { timeout: 300 });
+      // Convert to legacy JobResult format
+      return {
+        id: result.task_id,
+        status: result.status === "success" ? "completed" : result.status,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        error: result.error || "",
+        submittedAt: Date.now(),
+        completedAt: result.status !== "busy" ? Date.now() : undefined,
+      };
+    } catch (e) {
+      // Fallback to legacy endpoint
+      const res = await fetch(`${API_BASE}/job`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code, ...options }),
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        throw new Error(errorData.error || errorData.message || `Job submission failed: HTTP ${res.status}`);
+      }
+
+      return res.json();
+    }
   },
 
+  /**
+   * Wait for job result - in microservice mode this returns immediately
+   */
   waitForJob: async (jobId: string, onProgress?: (job: JobResult) => void): Promise<JobResult> => {
+    // Validate jobId
+    if (!jobId || jobId === 'undefined' || jobId === 'null') {
+      return Promise.reject(new Error('Invalid job ID'));
+    }
+
+    const maxPolls = 60;  // 60 second timeout
+    let pollCount = 0;
+
     return new Promise((resolve, reject) => {
       const poll = async () => {
+        pollCount++;
+
+        // Timeout after 60 seconds
+        if (pollCount > maxPolls) {
+          reject(new Error('Job polling timeout'));
+          return;
+        }
+
         try {
           const res = await fetch(`${API_BASE}/job/${jobId}`);
+
+          // Handle HTTP error status codes
+          if (!res.ok) {
+            if (res.status === 404) {
+              // Job not found - may not exist yet, keep polling
+              setTimeout(poll, 1000);
+              return;
+            }
+            if (res.status === 503) {
+              // Service unavailable (e.g., in microservices mode)
+              const errorData = await res.json().catch(() => ({}));
+              reject(new Error(errorData.error || 'Service unavailable in microservices mode'));
+              return;
+            }
+            // Other errors
+            const errorData = await res.json().catch(() => ({}));
+            reject(new Error(errorData.error || `HTTP ${res.status}`));
+            return;
+          }
+
           const job: JobResult = await res.json();
           if (onProgress) onProgress(job);
           if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
@@ -159,6 +348,7 @@ export const api = {
             setTimeout(poll, 1000);
           }
         } catch (e) {
+          // Network error
           reject(e);
         }
       };
@@ -179,104 +369,40 @@ export const api = {
   plotUrl: (jobId: string) => `${API_BASE}/plot/${jobId}`,
 
   measureMetrics: async (qubit: string): Promise<Metrics> => {
-    // Run a quick measurement sequence to get all metrics
     const code = `
 import sq
 q = s['${qubit}']
-# Quick T1
-try:
-    sq.t1(q, do_plot=False)
-    import re
-    m = re.search(r'T1[:=s]+([0-9.]+)', sys.stdout.getvalue() if 'sys.stdout' in dir() else '')
-except:
-    pass
-# Return mock metrics for now
 print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
 `;
-    const { jobId } = await fetch(`${API_BASE}/job`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
-    }).then(r => r.json());
+    try {
+      // Use microservice endpoint directly
+      const result = await api.runExperiment(code, { timeout: 60 });
+      const metrics: Metrics = {};
+      const match = result.stdout.match(/readout_fidelity=([0-9.]+)/);
+      if (match) metrics.readout_fidelity = parseFloat(match[1]);
+      const t1Match = result.stdout.match(/t1=([0-9.]+)/);
+      if (t1Match) metrics.t1 = parseFloat(t1Match[1]);
+      const gateMatch = result.stdout.match(/gate_fidelity=([0-9.]+)/);
+      if (gateMatch) metrics.gate_fidelity = parseFloat(gateMatch[1]);
+      return metrics;
+    } catch (e) {
+      // Fallback to legacy endpoint
+      const { jobId } = await fetch(`${API_BASE}/job`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
+      }).then(r => r.json());
 
-    const result = await api.waitForJob(jobId);
-    const metrics: Metrics = {};
-    const match = result.stdout.match(/readout_fidelity=([0-9.]+)/);
-    if (match) metrics.readout_fidelity = parseFloat(match[1]);
-    const t1Match = result.stdout.match(/t1=([0-9.]+)/);
-    if (t1Match) metrics.t1 = parseFloat(t1Match[1]);
-    const gateMatch = result.stdout.match(/gate_fidelity=([0-9.]+)/);
-    if (gateMatch) metrics.gate_fidelity = parseFloat(gateMatch[1]);
-    return metrics;
-  },
-
-  // ── Sessions & DataVault ─────────────────────────────────────────────────
-
-  listSessions: async () => {
-    const res = await fetch(`${API_BASE}/sessions`);
-    return res.json();
-  },
-
-  switchSession: async (path: string[]) => {
-    const res = await fetch(`${API_BASE}/sessions/switch`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    });
-    return res.json();
-  },
-
-  listDatasets: async (path: string) => {
-    const res = await fetch(`${API_BASE}/datasets?path=${encodeURIComponent(path)}`);
-    return res.json();
-  },
-
-  datasetPlotUrl: (name: string, path: string) =>
-    `${API_BASE}/datasets/plot?name=${encodeURIComponent(name)}&path=${encodeURIComponent(path)}`,
-
-  /**
-   * Load a specific historical dataset from DataVault and plot with custom command.
-   * Used when user clicks "Plot in Experiments" on a historical record.
-   */
-  plotHistoricalDataset: async (name: string, path: string, command: string): Promise<{
-    success: boolean;
-    plot_filename?: string;
-    dataset_name?: string;
-    analysis_output?: string;
-    error?: string;
-  }> => {
-    const res = await fetch(`${API_BASE}/sessions/plot-historical`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, path, command }),
-    });
-    return res.json();
-  },
-
-  getSessionTree: async () => {
-    const res = await fetch(`${API_BASE}/sessions/tree`);
-    return res.json();
-  },
-
-  // ── Qubits ───────────────────────────────────────────────────────────────
-
-  listQubits: async () => {
-    const res = await fetch(`${API_BASE}/qubits`);
-    return res.json();
-  },
-
-  getQubitParams: async (name: string) => {
-    const res = await fetch(`${API_BASE}/qubits/${name}/params`);
-    return res.json();
-  },
-
-  setQubitParams: async (name: string, params: Record<string, number | null>) => {
-    const res = await fetch(`${API_BASE}/qubits/${name}/params`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(params),
-    });
-    return res.json();
+      const result = await api.waitForJob(jobId);
+      const metrics: Metrics = {};
+      const match = result.stdout.match(/readout_fidelity=([0-9.]+)/);
+      if (match) metrics.readout_fidelity = parseFloat(match[1]);
+      const t1Match = result.stdout.match(/t1=([0-9.]+)/);
+      if (t1Match) metrics.t1 = parseFloat(t1Match[1]);
+      const gateMatch = result.stdout.match(/gate_fidelity=([0-9.]+)/);
+      if (gateMatch) metrics.gate_fidelity = parseFloat(gateMatch[1]);
+      return metrics;
+    }
   },
 
   // ── Workflows ────────────────────────────────────────────────────────────
@@ -286,7 +412,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     nodes: WorkflowNode[];
     context?: Record<string, string>;
   }) => {
-    const res = await fetch(`${API_BASE}/workflow`, {
+    const res = await fetch(`${API_BASE}/api/workflow/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
@@ -300,7 +426,11 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
       const timer = timeoutMs ? setTimeout(() => { timedOut = true; reject(new Error("Workflow timeout")); }, timeoutMs) : null;
       const poll = async () => {
         try {
-          const res = await fetch(`${API_BASE}/workflow/${workflowId}`);
+          const res = await fetch(`${API_BASE}/api/workflow/status`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ workflowId }),
+          });
           const status: WorkflowStatus = await res.json();
           if (!timedOut) {
             if (onProgress) onProgress(status);
@@ -323,7 +453,11 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
   },
 
   cancelWorkflow: async (workflowId: string) => {
-    const res = await fetch(`${API_BASE}/workflow/${workflowId}`, { method: "DELETE" });
+    const res = await fetch(`${API_BASE}/api/workflow/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workflowId }),
+    });
     return res.json();
   },
 
@@ -418,7 +552,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
-  // ── Models (LLM Registry) ────────────────────────────────────────────────
+  // ── LLM Models ───────────────────────────────────────────────────────────
 
   listModels: async () => {
     const res = await fetch(`${API_BASE}/api/models`);
@@ -503,7 +637,36 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
-  // ── Plot Analysis ────────────────────────────────────────────────────────
+  // ── Analysis Service ────────────────────────────────────────────────────
+
+  plotHistoricalDataset: async (name: string, path: string, command: string) => {
+    const res = await fetch(`${API_BASE}/api/analysis/plot/historical`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, path, command }),
+    });
+    return res.json();
+  },
+
+  // 新版绘图 API - 根据实验类型自动选择绘图配置，返回 Base64 图像
+  plotExperimentDataset: async (name: string, path: string) => {
+    const res = await fetch(`${API_BASE}/api/analysis/plot/experiments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, path }),
+    });
+    return res.json();
+  },
+
+  runAnalysis: async (command: string, expType?: string) => {
+    const r = await fetch(`${API_BASE}/api/experiments/run-analysis`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command, expType }),
+    });
+    if (!r.ok) throw new Error(`API ${r.status}: ${await r.text()}`);
+    return r.json();
+  },
 
   analyzePlot: async (data: {
     analysis_output?: string;
@@ -518,25 +681,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
-  // ── Analysis Command Execution ────────────────────────────────────────────────
-
-  runAnalysis: async (command: string, expType?: string): Promise<{
-    success: boolean;
-    stdout?: string;
-    stderr?: string;
-    metrics?: Record<string, number>;
-    error?: string;
-  }> => {
-    const r = await fetch(`${API_BASE}/api/experiments/run-analysis`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command, expType }),
-    });
-    if (!r.ok) throw new Error(`API ${r.status}: ${await r.text()}`);
-    return r.json();
-  },
-
-  // ── Image Classification ────────────────────────────────────────────────────
+  // ── Image Service ────────────────────────────────────────────────────────
 
   classifyImages: async (params: {
     folderPath: string;
@@ -544,7 +689,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     reviewThreshold?: number;
     marginThreshold?: number;
   }) => {
-    const res = await fetch(`${API_BASE}/api/classify/images`, {
+    const res = await fetch(`${API_BASE}/api/image/classify/folder`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(params),
@@ -553,7 +698,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
   },
 
   classifySingle: async (imagePath: string, backend = "pytorch") => {
-    const res = await fetch(`${API_BASE}/api/classify/single`, {
+    const res = await fetch(`${API_BASE}/api/image/classify/single`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ imagePath, backend }),
@@ -577,7 +722,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
   },
 
   getModelInfo: async () => {
-    const res = await fetch(`${API_BASE}/api/classify/model-info`);
+    const res = await fetch(`${API_BASE}/api/image/model/info`);
     return res.json();
   },
 
@@ -591,7 +736,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     batchSize?: number;
     imbalanceMode?: string;
   }) => {
-    const res = await fetch(`${API_BASE}/api/classify/train`, {
+    const res = await fetch(`${API_BASE}/api/image/train`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(params),
@@ -599,7 +744,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
-  // ── Quantum Agent ────────────────────────────────────────────────────────
+  // ── Agent Service ────────────────────────────────────────────────────────
 
   agentChat: async (message: string, mode = "react", context?: Record<string, unknown>) => {
     const res = await fetch(`${API_BASE}/api/agent/chat`, {
@@ -610,11 +755,6 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
-  /**
-   * Streaming agent chat via SSE.
-   * Returns an EventSource-compatible response.
-   * Use with fetch + ReadableStream for client-side SSE parsing.
-   */
   agentChatStream: async function* (
     message: string,
     mode = "react",
@@ -648,7 +788,6 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
         for (const line of lines) {
           if (line.startsWith("event: ")) {
             const eventType = line.slice(7).trim();
-            // Wait for data line
             const dataLineIdx = lines.indexOf(line) + 1;
             if (dataLineIdx < lines.length && lines[dataLineIdx].startsWith("data: ")) {
               const data = JSON.parse(lines[dataLineIdx].slice(6));
@@ -662,7 +801,6 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     }
   },
 
-  // Simpler SSE wrapper that parses the complete SSE response
   agentChatSSE: async (message: string, mode = "react", context?: Record<string, unknown>) => {
     const response = await fetch(`${API_BASE}/api/agent/chat/stream`, {
       method: "POST",
@@ -676,9 +814,6 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
 
     const text = await response.text();
     const events: { type: string; data: any }[] = [];
-
-    // Parse SSE format properly: event: TYPE\ndata: JSON\n\n
-    // Events are separated by \n\n, and JSON data can span multiple lines
     const eventBlocks = text.split(/\n\n(?=event:)/);
 
     for (const block of eventBlocks) {
@@ -686,19 +821,15 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
 
       const lines = block.split("\n");
       let eventType = "";
-      let jsonData = "";
+      const allDataLines = block.match(/^data: (.+)$/gm) || [];
 
       for (const line of lines) {
         if (line.startsWith("event: ")) {
           eventType = line.slice(7).trim();
-        } else if (line.startsWith("data: ")) {
-          jsonData = line.slice(6).trim();
         }
       }
 
-      // Handle multi-line JSON by collecting all data: lines
-      const allDataLines = block.match(/^data: (.+)$/gm) || [];
-      jsonData = allDataLines.map(l => l.slice(6)).join("");
+      const jsonData = allDataLines.map(l => l.slice(6)).join("");
 
       if (eventType && jsonData) {
         try {
@@ -765,7 +896,6 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        // Strip SSE routing prefix if present: "SSE: {cid} | " or just pass through
         let cleanLine = line;
         if (cleanLine.startsWith('SSE: ')) {
           const pipeIdx = cleanLine.indexOf('|');
@@ -781,7 +911,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
           try {
             const data = JSON.parse(jsonData);
             yield { type: currentEventType || "message", data };
-            currentEventType = ""; // reset after yielding
+            currentEventType = "";
           } catch (e) {
             console.warn("Failed to parse SSE data:", jsonData);
           }
@@ -807,9 +937,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
   },
 
   memoryGetEpisode: async (episodeId: string) => {
-    const res = await fetch(`${API_BASE}/api/agent/memory/episodes/${episodeId}`, {
-      method: "GET",
-    });
+    const res = await fetch(`${API_BASE}/api/agent/memory/episodes/${episodeId}`);
     return res.json();
   },
 
@@ -821,7 +949,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
   },
 
   memoryListSkills: async () => {
-    const res = await fetch(`${API_BASE}/api/agent/memory/skills`, { method: "GET" });
+    const res = await fetch(`${API_BASE}/api/agent/memory/skills`);
     return res.json();
   },
 
@@ -833,7 +961,7 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
   },
 
   memoryStats: async () => {
-    const res = await fetch(`${API_BASE}/api/agent/memory/stats`, { method: "GET" });
+    const res = await fetch(`${API_BASE}/api/agent/memory/stats`);
     return res.json();
   },
 
@@ -943,6 +1071,3 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 };
-
-// ── Re-export types ────────────────────────────────────────────────────────────
-// (types are exported as interfaces above)

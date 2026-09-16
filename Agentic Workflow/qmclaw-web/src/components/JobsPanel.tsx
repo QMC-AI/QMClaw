@@ -187,26 +187,30 @@ function DataVaultCard({ refreshTrigger }: { refreshTrigger: number }) {
   const [selectedDs, setSelectedDs] = useState<Dataset | null>(null);
   const PAGE_SIZE = 20;
 
-  // Load session config
+  // Load session config from quantum service
   useEffect(() => {
-    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
-    fetch(`${API_BASE}/sessions/config`)
-      .then(r => r.json())
-      .then(data => {
-        setSessionConfig({ user: data.user, path: data.path });
-      })
-      .catch(console.error);
+    const loadConfig = async () => {
+      try {
+        const res = await api.listQubits() as { sessionPath?: string[]; error?: string };
+        if (res.sessionPath && res.sessionPath.length > 0) {
+          // sessionPath format: ['', 'LQHL', 'test', '20260324']
+          const sp = res.sessionPath;
+          const user = sp.length > 1 ? sp[1] : 'LQHL';
+          const path = sp.slice(2);  // remove ['', user] prefix
+          setSessionConfig({ user, path });
+        }
+      } catch (e) {
+        console.error('[DataVaultCard] Failed to load config:', e);
+      }
+    };
+    loadConfig();
   }, []);
 
-  // Check LabRAD availability
+  // Check LabRAD availability via quantum service health
   const checkLabradAvailable = async (): Promise<boolean> => {
-    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
     try {
-      const res = await fetch(`${API_BASE}/hardware/quick`);
-      if (res.ok) {
-        const data = await res.json();
-        return data.labrad === "ok";
-      }
+      const res = await api.listQubits() as { error?: string };
+      return !res.error;
     } catch { /* ignore */ }
     return false;
   };
