@@ -206,20 +206,32 @@ export function CompactSessionManager() {
   // Load initial session tree (root level only)
   const loadSessionTree = useCallback(async () => {
     try {
-      const res = await api.getSessionTree() as { tree: TreeNode[] };
-      setSessionTree(res.tree || []);
+      const res = await api.getSessionTree() as { tree: TreeNode[]; error?: string };
+      if (res.error) {
+        console.error('[SessionManager] Session tree error:', res.error);
+        setSessionTree([]);
+      } else {
+        setSessionTree(res.tree || []);
+      }
     } catch (e) {
       console.error('[SessionManager] Load tree error:', e);
+      setSessionTree([]);
     }
   }, []);
 
   // Load current session path
   const loadCurrentPath = useCallback(async () => {
     try {
-      const res = await api.listQubits() as { sessionPath: string[] };
-      setCurrentPath(res.sessionPath || []);
+      const res = await api.listQubits() as { sessionPath: string[]; error?: string };
+      if (res.error) {
+        console.error('[SessionManager] Current path error:', res.error);
+        setCurrentPath([]);
+      } else {
+        setCurrentPath(res.sessionPath || []);
+      }
     } catch (e) {
       console.error('[SessionManager] Load current path error:', e);
+      setCurrentPath([]);
     }
   }, []);
 
@@ -366,7 +378,15 @@ export function CompactSessionManager() {
                 ⏳ Switching...
               </div>
             )}
-            {!switching && sessionTree.map(node => (
+            {!switching && sessionTree.length === 0 && (
+              <div style={{
+                padding: "1rem", textAlign: "center", color: "#64748b",
+                fontSize: "0.75rem",
+              }}>
+                📂 No sessions found
+              </div>
+            )}
+            {!switching && sessionTree.length > 0 && sessionTree.map(node => (
               <TreeNode
                 key={node.path.join("/")}
                 node={node}

@@ -67,6 +67,7 @@ const NodeConfigPanel = memo(({ nodeId, onClose, onRunNode }: Props) => {
     analyze: '📊 Analyze',
     adjust_params: '⚙️ Adjust Params',
     image_analysis: '🖼 Image Analysis',
+    image_classification: '🧠 Image Classification',
     print: '📝 Print',
     parallel: '⚡ Parallel',
     while: '🔄 While Loop',
@@ -1857,6 +1858,37 @@ const ConfigForm = memo(({ nodeType, config, allNodes, onChange, availableVariab
       );
     }
 
+    case 'image_classification': {
+      return (
+        <>
+          {renderField('qubit', config.qubit || '', 'Qubit ID (e.g. q10lu1)')}
+          {renderField('experimentType', config.experimentType || 'spectroscopy', 'Experiment Type')}
+          <div style={{ marginBottom: '12px' }}>
+            <label style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '4px', display: 'block' }}>Backend</label>
+            <select
+              value={String(config.backend || 'pytorch')}
+              onChange={(e) => onChange('backend', e.target.value)}
+              style={{
+                width: '100%',
+                padding: '8px 12px',
+                background: '#1e293b',
+                border: '1px solid #334155',
+                borderRadius: '6px',
+                color: '#e2e8f0',
+                fontSize: '12px',
+              }}
+            >
+              <option value="pytorch">PyTorch (default)</option>
+              <option value="onnx">ONNX Runtime</option>
+              <option value="quantized">INT8 Quantized</option>
+            </select>
+          </div>
+          {renderField('reviewThreshold', String(config.reviewThreshold ?? 0.75), 'Review Threshold (0-1)')}
+          {renderField('marginThreshold', String(config.marginThreshold ?? 0.15), 'Margin Threshold (0-1)')}
+        </>
+      );
+    }
+
     case 'parallel':
       return (
         <>
@@ -2789,6 +2821,45 @@ const ResultView = memo(({ nodeId, nodeType, lastResult, nodeStatus, nodeMetrics
             </ResultSection>
 
             <ResultSection title="Output" icon="📤" accentColor="#22c55e">
+              <StatusBadge status={nodeStatus} />
+            </ResultSection>
+          </>
+        );
+      }
+
+      case 'image_classification': {
+        // Image Classification: input = qubit/experiment_type, output = label/confidence/margin
+        const config = (lastResult?.config || {}) as Record<string, unknown>;
+        const metrics = lastResult?.metrics as { label?: string; confidence?: number; margin?: number; needReview?: boolean } | undefined;
+        const imagePath = lastResult?.imagePath as string | undefined;
+        return (
+          <>
+            <ResultSection title="Input" icon="📥" accentColor="#64748b">
+              {config.qubit ? <KeyValueRow label="Qubit" value={String(config.qubit)} /> : null}
+              {config.experimentType ? <KeyValueRow label="Experiment" value={String(config.experimentType)} /> : null}
+              {config.backend ? <KeyValueRow label="Backend" value={String(config.backend)} /> : null}
+            </ResultSection>
+
+            <ResultSection title="Output" icon="📤" accentColor="#22c55e">
+              {metrics?.label && (
+                <KeyValueRow
+                  label="Label"
+                  value={metrics.label === 'class_1' ? '🔴 class_1' : metrics.label === 'class_0' ? '🔵 class_0' : metrics.label}
+                  valueColor={metrics.needReview ? '#f59e0b' : '#22c55e'}
+                />
+              )}
+              {metrics?.confidence != null && <KeyValueRow label="Confidence" value={`${(metrics.confidence * 100).toFixed(1)}%`} />}
+              {metrics?.margin != null && <KeyValueRow label="Margin" value={metrics.margin.toFixed(3)} />}
+              {metrics?.needReview && (
+                <div style={{ fontSize: '10px', color: '#f59e0b', padding: '4px 8px', background: '#3a2a1a', borderRadius: '4px', marginTop: '4px' }}>
+                  ⚠️ 需要复核
+                </div>
+              )}
+              {imagePath && (
+                <div style={{ fontSize: '9px', color: '#64748b', marginTop: '6px', wordBreak: 'break-all' }}>
+                  📷 {imagePath}
+                </div>
+              )}
               <StatusBadge status={nodeStatus} />
             </ResultSection>
           </>

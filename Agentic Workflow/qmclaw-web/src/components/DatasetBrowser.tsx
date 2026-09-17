@@ -11,70 +11,74 @@ export default function DatasetBrowser() {
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [labradAvailable, setLabradAvailable] = useState(true);
   const [selectedDs, setSelectedDs] = useState<Dataset | null>(null);
   const [sessionConfig, setSessionConfig] = useState<{ user: string; path: string[] } | null>(null);
   const [showSessionSwitcher, setShowSessionSwitcher] = useState(false);
   const [switchUser, setSwitchUser] = useState("");
   const [switchPath, setSwitchPath] = useState("");
 
-  // Load session config on mount
+  // Load session config on mount from quantum service
   useEffect(() => {
-    loadSessionConfig();
+    const loadConfig = async () => {
+      try {
+        const res = await api.listQubits() as { sessionPath?: string[]; error?: string };
+        if (res.sessionPath && res.sessionPath.length > 0) {
+          const sp = res.sessionPath;
+          const user = sp.length > 1 ? sp[1] : 'LQHL';
+          const path = sp.slice(2);
+          setSessionConfig({ user, path });
+          setPath("/" + user + "/" + path.join("/"));
+          setSwitchUser(user);
+          setSwitchPath(path.join("/"));
+        }
+      } catch (e) {
+        console.error("[DatasetBrowser] Failed to load session config:", e);
+      }
+    };
+    loadConfig();
   }, []);
 
-  const loadSessionConfig = async () => {
-    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
+  // Check LabRAD availability via quantum service
+  const checkLabradAvailable = async (): Promise<boolean> => {
     try {
-      const res = await fetch(`${API_BASE}/sessions/config`);
-      if (res.ok) {
-        const data = await res.json();
-        setSessionConfig({ user: data.user, path: data.path });
-        setPath("/" + data.user + "/" + data.path.join("/"));
-        setSwitchUser(data.user);
-        setSwitchPath(data.path.join("/"));
-      }
-    } catch (e) {
-      console.error("Failed to load session config:", e);
-    }
+      const res = await api.listQubits() as { error?: string };
+      return !res.error;
+    } catch { /* ignore */ }
+    return false;
   };
 
   const handleSwitchSession = async () => {
     if (!switchUser || !switchPath) return;
     const pathSegments = switchPath.split("/").filter(Boolean);
-    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
     try {
-      // First save to config file
-      const saveRes = await fetch(`${API_BASE}/sessions/config`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user: switchUser, path: pathSegments }),
-      });
-
-      if (!saveRes.ok) {
-        throw new Error("Failed to save config");
-      }
-
-      // Then switch session in job_runner.py (this updates the _data object)
-      const switchRes = await fetch(`${API_BASE}/sessions/switch`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user: switchUser, path: pathSegments }),
-      });
-
-      if (switchRes.ok) {
-        await loadSessionConfig();
-        setShowSessionSwitcher(false);
-        // Reload datasets with new path
-        loadDatasets("/" + switchUser + "/" + switchPath);
-      } else {
-        throw new Error("Failed to switch session");
-      }
-    } catch (e) {
+      // Switch session via quantum service API
+      const sessionPath = ['', switchUser, ...pathSegments];
+      await api.switchSession(sessionPath);
+      setSessionConfig({ user: switchUser, path: pathSegments });
+      setPath("/" + switchUser + "/" + pathSegments.join("/"));
+      setShowSessionSwitcher(false);
+      // Reload datasets with new path
+      loadDatasets("/" + switchUser + "/" + switchPath);
+      // Notify other components
+      window.dispatchEvent(new CustomEvent('qmclaw:session-changed', { detail: { path: sessionPath } }));
+    } catch (e: any) {
       console.error("Failed to switch session:", e);
+      setError(e.message);
     }
   };
 
   const loadDatasets = useCallback(async (p: string) => {
+    // Check if LabRAD is available first
+    const available = await checkLabradAvailable();
+    setLabradAvailable(available);
+
+    if (!available) {
+      setLoading(false);
+      setError("LabRAD 服务器未连接");
+      return;
+    }
+
     setLoading(true);
     setError("");
     try {
@@ -85,13 +89,23 @@ export default function DatasetBrowser() {
       setGroups(res.groups);
       setDatasets(res.datasets);
     } catch (e: any) {
-      setError(e.message || "Failed to load datasets");
+      // Check for LabRAD-related errors
+      if (e.message?.includes("data_vault") || e.message?.includes("NoneType")) {
+        setLabradAvailable(false);
+        setError("LabRAD 服务器未连接");
+      } else {
+        setError(e.message || "Failed to load datasets");
+      }
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => { loadDatasets(path); }, [loadDatasets, path]);
+  useEffect(() => {
+    if (labradAvailable) {
+      loadDatasets(path);
+    }
+  }, [loadDatasets, path, labradAvailable]);
 
   const pathSegments = path ? path.replace(/^\/+|\/+$/g, '').split("/") : [];
 
@@ -278,6 +292,30 @@ export default function DatasetBrowser() {
         </div>
       )}
 
+      {/* Error / LabRAD unavailable message */}
+      {error && (
+        <div style={{
+          margin: "0.75rem",
+          padding: "0.75rem",
+          background: !labradAvailable ? "#422006" : "#451a1a",
+          border: `1px solid ${!labradAvailable ? "#f59e0b" : "#ef4444"}`,
+          borderRadius: "0.5rem",
+        }}>
+          {!labradAvailable ? (
+            <>
+              <div style={{ fontSize: "0.8rem", color: "#fbbf24", fontWeight: 600, marginBottom: "0.5rem" }}>
+                ⚠️ LabRAD 服务器未连接
+              </div>
+              <div style={{ fontSize: "0.7rem", color: "#fcd34d", lineHeight: 1.6 }}>
+                请在「服务控制」面板中启动测控服务后再使用 DataVault 功能。
+              </div>
+            </>
+          ) : (
+            <div style={{ fontSize: "0.7rem", color: "#f87171" }}>{error}</div>
+          )}
+        </div>
+      )}
+
       {/* Datasets */}
       <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
         {loading && (
@@ -285,10 +323,12 @@ export default function DatasetBrowser() {
             Loading...
           </div>
         )}
-        {error && (
-          <div style={{ padding: "0.75rem", color: "#f87171", fontSize: "0.7rem" }}>{error}</div>
+        {!loading && !error && !labradAvailable && (
+          <div style={{ padding: "1rem", color: "#f59e0b", fontSize: "0.75rem", textAlign: "center" }}>
+            请先启动测控服务
+          </div>
         )}
-        {!loading && !error && datasets.map((ds) => (
+        {!loading && !error && labradAvailable && datasets.map((ds) => (
           <div
             key={ds.id}
             onClick={() => setSelectedDs(selectedDs?.id === ds.id ? null : ds)}
@@ -307,34 +347,56 @@ export default function DatasetBrowser() {
             </div>
           </div>
         ))}
-        {!loading && !error && datasets.length === 0 && groups.length === 0 && (
+        {!loading && !error && datasets.length === 0 && groups.length === 0 && labradAvailable && (
           <div style={{ padding: "1rem", color: "#334569", fontSize: "0.75rem", textAlign: "center" }}>
             No datasets in this folder
           </div>
         )}
       </div>
 
-      {/* Selected dataset plot */}
+      {/* Selected dataset actions */}
       {selectedDs && (
         <div style={{
           borderTop: "1px solid #1e293b",
-          padding: "0.5rem",
+          padding: "0.5rem 0.75rem",
           background: "#0f172a",
+          display: "flex",
+          flexDirection: "column",
+          gap: "0.35rem",
         }}>
           <div style={{
             fontSize: "0.65rem", color: "#475569",
-            marginBottom: "0.3rem", fontFamily: "monospace",
+            fontFamily: "monospace",
           }}>
             📊 {selectedDs.name}
           </div>
-          <img
-            src={api.datasetPlotUrl(selectedDs.id, path)}
-            alt={selectedDs.name}
-            style={{ display: "block", width: "100%", maxHeight: "300px", objectFit: "contain", borderRadius: "0.25rem" }}
-            onError={(e) => {
-              (e.target as HTMLImageElement).src = `data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='100'><text x='10' y='60' font-size='12' fill='%23f87171'>Plot unavailable</text></svg>`;
+          <button
+            onClick={() => {
+              // Dispatch event to plot this dataset in the experiments page
+              window.dispatchEvent(new CustomEvent("dataset:plot-in-experiments", {
+                detail: {
+                  name: selectedDs.id,
+                  path: path,
+                }
+              }));
             }}
-          />
+            style={{
+              padding: "0.35rem 0.75rem",
+              background: "#6366f1",
+              border: "none",
+              borderRadius: "0.25rem",
+              color: "#fff",
+              fontSize: "0.7rem",
+              fontWeight: 600,
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: "0.4rem",
+            }}
+          >
+            📊 在 Experiments 绘图
+          </button>
         </div>
       )}
     </div>

@@ -4,24 +4,31 @@
       "name": "Spectroscopy",
       "description": "VNA spectroscopy — broad frequency scan to find qubit resonance",
       "function": "sq.spectroscopy",
-      "defaultPlotCommand": "plt.title('Spectroscopy')\nplt.xlabel('Frequency (Hz)')\nplt.ylabel('S21 (dB)')\nplt.grid(True)",
+      "defaultCommand": "sq.spectroscopy({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
       "defaultAnalysisCommand": "",
-      "metricsToExtract": []
+      "metricsToExtract": [
+        "f10"
+      ]
     },
     "s21": {
       "name": "Cavity S21",
       "description": "Cavity S21 — narrowband frequency scan around cavity resonance",
       "function": "sq.s21",
-      "defaultPlotCommand": "plt.title('Cavity S21')\nplt.xlabel('Frequency (Hz)')\nplt.ylabel('S21 (dB)')\nplt.grid(True)",
+      "defaultCommand": "sq.s21({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
       "defaultAnalysisCommand": "",
-      "metricsToExtract": []
+      "metricsToExtract": [
+        "fread"
+      ]
     },
     "iqraw": {
       "name": "IQ Raw",
       "description": "Acquire raw I/Q data for qubit state discrimination",
       "function": "sq.iqraw",
-      "defaultPlotCommand": "qter.fitData(-1)",
-      "defaultAnalysisCommand": "qter.fitData(-1, collect=True, do_plot=False)",
+      "defaultCommand": "sq.iqraw({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
+      "defaultAnalysisCommand": "qter.fitData({exp_num}, collect=True, do_plot=False)",
       "metricsToExtract": [
         "SNR",
         "F0",
@@ -33,8 +40,9 @@
       "name": "T1 Relaxation",
       "description": "Measure qubit relaxation time via variable delay pulse sequence",
       "function": "sq.t1",
-      "defaultPlotCommand": "plt.title('T1 Relaxation')\nplt.xlabel('Delay (ns)')\nplt.ylabel('Population')\nplt.grid(True)",
-      "defaultAnalysisCommand": "dp.T1(data)",
+      "defaultCommand": "sq.t1({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
+      "defaultAnalysisCommand": "",
       "metricsToExtract": [
         "T1"
       ]
@@ -43,8 +51,9 @@
       "name": "Ramsey",
       "description": "Ramsey with detuning — measure T2* dephasing time",
       "function": "sq.ramsey",
-      "defaultPlotCommand": "plt.title('Ramsey Interference')\nplt.xlabel('Delay (ns)')\nplt.ylabel('Population')\nplt.grid(True)",
-      "defaultAnalysisCommand": "dp.Ramsey(data)",
+      "defaultCommand": "sq.ramsey_df({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
+      "defaultAnalysisCommand": "",
       "metricsToExtract": [
         "T2",
         "detuning"
@@ -54,7 +63,8 @@
       "name": "Pi Pulse Amplitude",
       "description": "Calibrate π-pulse amplitude for X gate via Rabi oscillation",
       "function": "sq.piamp",
-      "defaultPlotCommand": "plt.title('Pi Pulse Calibration')\nplt.xlabel('Amplitude')\nplt.ylabel('Population')\nplt.grid(True)",
+      "defaultCommand": "sq.piamp({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
       "defaultAnalysisCommand": "",
       "metricsToExtract": [
         "pi_amplitude"
@@ -64,7 +74,8 @@
       "name": "Cross-Entropy Benchmarking",
       "description": "Measure single-qubit gate fidelity",
       "function": "sq.xeb",
-      "defaultPlotCommand": "from lqms.data_process.xeb import process_xeb as px\npx.XEB(data,[-1],collect=True, do_plot=True)",
+      "defaultCommand": "sq.xeb({qubit}, do_plot=True)",
+      "defaultPlotCommand": "from lqms.data_process.xeb import process_xeb as px\npx.XEB(data,[{exp_num}],collect=True, do_plot=True)",
       "defaultAnalysisCommand": "",
       "metricsToExtract": [
         "gate_fidelity",
@@ -75,7 +86,8 @@
       "name": "S21 Dispersive Shift",
       "description": "Measure cavity transmission shift vs qubit state",
       "function": "sq.s21_dis",
-      "defaultPlotCommand": "plt.title('Dispersive Shift')\nplt.xlabel('Frequency (Hz)')\nplt.ylabel('S21 (dB)')\nplt.grid(True)",
+      "defaultCommand": "sq.s21_dis({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
       "defaultAnalysisCommand": "",
       "metricsToExtract": [
         "dispersive_shift"
@@ -85,7 +97,8 @@
       "name": "AllXY",
       "description": "Characterize all 21 gate error combinations",
       "function": "sq.allxy",
-      "defaultPlotCommand": "plt.title('AllXY Characterization')\nplt.xlabel('Gate Pair')\nplt.ylabel('Fidelity')\nplt.grid(True)",
+      "defaultCommand": "sq.allxy({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
       "defaultAnalysisCommand": "",
       "metricsToExtract": [
         "average_fidelity",
@@ -96,7 +109,8 @@
       "name": "Single-shot Fidelity",
       "description": "Measure qubit readout fidelity in single-shot regime",
       "function": "sq.single_shot",
-      "defaultPlotCommand": "plt.title('Single Shot Fidelity')\nplt.xlabel('I')\nplt.ylabel('Q')\nplt.grid(True)\nplt.axis('equal')",
+      "defaultCommand": "sq.single_shot({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
       "defaultAnalysisCommand": "",
       "metricsToExtract": [
         "readout_fidelity"
@@ -106,7 +120,8 @@
       "name": "Pulsed Spectroscopy",
       "description": "Qubit spectroscopy with pump pulse for higher SNR",
       "function": "sq.pulsed_spec",
-      "defaultPlotCommand": "plt.title('Pulsed Spectroscopy')\nplt.xlabel('Frequency (Hz)')\nplt.ylabel('Population')\nplt.grid(True)",
+      "defaultCommand": "sq.pulsed_spec({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
       "defaultAnalysisCommand": "",
       "metricsToExtract": [
         "qubit_frequency"
@@ -116,7 +131,8 @@
       "name": "SWAP",
       "description": "Characterize SWAP gate for two-qubit operations",
       "function": "sq.swap",
-      "defaultPlotCommand": "plt.title('SWAP Characterization')\nplt.xlabel('Duration (ns)')\nplt.ylabel('Fidelity')\nplt.grid(True)",
+      "defaultCommand": "sq.swap({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
       "defaultAnalysisCommand": "",
       "metricsToExtract": [
         "swap_fidelity"
@@ -126,7 +142,8 @@
       "name": "DRAG Calibration",
       "description": "Optimize DRAG coefficient for leakage suppression",
       "function": "sq.drag_calibrate",
-      "defaultPlotCommand": "plt.title('DRAG Calibration')\nplt.xlabel('DRAG Coefficient')\nplt.ylabel('Fidelity')\nplt.grid(True)",
+      "defaultCommand": "sq.drag_calibrate({qubit}, do_plot=True)",
+      "defaultPlotCommand": "qter.fitData({exp_num})",
       "defaultAnalysisCommand": "",
       "metricsToExtract": [
         "optimal_drag"

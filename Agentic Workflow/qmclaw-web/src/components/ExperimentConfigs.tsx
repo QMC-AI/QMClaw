@@ -333,7 +333,7 @@ export default function ExperimentConfigs({ onClose }: ExperimentConfigsProps) {
                     Default Analyse Command
                   </label>
                   <textarea
-                    value={editForm.defaultAnalysisCommand || ""}
+                    value={String(editForm.defaultAnalysisCommand || "")}
                     onChange={(e) => setEditForm({ ...editForm, defaultAnalysisCommand: e.target.value })}
                     rows={6}
                     style={{
@@ -408,7 +408,7 @@ export default function ExperimentConfigs({ onClose }: ExperimentConfigsProps) {
                       {config.defaultPlotCommand?.split('\n')[0] || "(no command)"}
                     </td>
                     <td style={{ padding: "0.5rem", color: config.defaultAnalysisCommand ? "#22c55e" : "#475569", fontSize: "0.75rem", maxWidth: "150px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {config.defaultAnalysisCommand?.split('(')[0] || "(none)" || "(none)"}
+                      {String(config.defaultAnalysisCommand || "").split('(')[0] || "(none)"}
                     </td>
                     <td style={{ padding: "0.5rem", textAlign: "right" }}>
                       <button

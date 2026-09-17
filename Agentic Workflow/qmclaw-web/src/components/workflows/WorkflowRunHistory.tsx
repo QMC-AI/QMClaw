@@ -95,6 +95,7 @@ export default function WorkflowRunHistory({ workflowId, workflowName, onBack }:
     analyze: "📊",
     adjust_params: "⚙️",
     image_analysis: "🖼",
+    image_classification: "🧠",
     notify: "📢",
     code: "🐍",
     print: "📝",
@@ -194,7 +195,7 @@ export default function WorkflowRunHistory({ workflowId, workflowName, onBack }:
           ) : (
             runs.map(run => {
               const isSelected = selectedRun?.id === run.id;
-              const successCount = run.nodes.filter(n => n.status === "completed" || n.status === "passed").length;
+              const successCount = (run as any).nodes?.filter((n: any) => n.status === "completed" || n.status === "passed").length ?? 0;
 
               return (
                 <div
@@ -212,7 +213,7 @@ export default function WorkflowRunHistory({ workflowId, workflowName, onBack }:
                   {/* Time and status */}
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
                     <span style={{ fontSize: "12px", fontWeight: 600, color: "#e2e8f0" }}>
-                      {formatTime(run.completedAt)}
+                      {formatTime(new Date(run.completedAt).toISOString())}
                     </span>
                     <span style={{
                       padding: "2px 8px",
@@ -228,13 +229,13 @@ export default function WorkflowRunHistory({ workflowId, workflowName, onBack }:
 
                   {/* Duration and node count */}
                   <div style={{ display: "flex", gap: "12px", fontSize: "11px", color: "#64748b", marginBottom: "8px" }}>
-                    <span>⏱ {formatDuration(run.totalDuration)}</span>
-                    <span>📦 {successCount}/{run.nodes.length} nodes</span>
+                    <span>⏱ {formatDuration((run as any).totalDuration)}</span>
+                    <span>📦 {successCount}/{(run as any).nodes?.length ?? 0} nodes</span>
                   </div>
 
                   {/* Mini node status bar */}
                   <div style={{ display: "flex", gap: "2px" }}>
-                    {run.nodes.slice(0, 10).map((node, i) => (
+                    {(run as any).nodes?.slice(0, 10).map((node: any, i: number) => (
                       <div
                         key={i}
                         style={{
@@ -245,9 +246,9 @@ export default function WorkflowRunHistory({ workflowId, workflowName, onBack }:
                         }}
                       />
                     ))}
-                    {run.nodes.length > 10 && (
+                    {((run as any).nodes?.length ?? 0) > 10 && (
                       <span style={{ fontSize: "9px", color: "#64748b", marginLeft: "4px" }}>
-                        +{run.nodes.length - 10}
+                        +{((run as any).nodes?.length ?? 0) - 10}
                       </span>
                     )}
                   </div>
@@ -294,10 +295,10 @@ export default function WorkflowRunHistory({ workflowId, workflowName, onBack }:
             scrollbarColor: "#334155 #0a0f1a",
           }}>
             <div style={{ fontSize: "12px", fontWeight: 600, color: "#475569", marginBottom: "8px" }}>
-              Node Details ({selectedRun.nodes.length} nodes)
+              Node Details ({(selectedRun as any).nodes?.length ?? 0} nodes)
             </div>
 
-            {selectedRun.nodes.map(node => (
+            {(selectedRun as any).nodes?.map((node: any) => (
               <NodeDetailCard
                 key={node.nodeId}
                 node={node}
@@ -315,7 +316,7 @@ export default function WorkflowRunHistory({ workflowId, workflowName, onBack }:
 // ── Node Detail Card ─────────────────────────────────────────────────────────
 
 interface NodeDetailCardProps {
-  node: WorkflowRunNode;
+  node: any;
   nodeTypeIcons: Record<string, string>;
   getNodeStatusColor: (status: string) => string;
 }
@@ -324,7 +325,7 @@ function NodeDetailCard({ node, nodeTypeIcons, getNodeStatusColor }: NodeDetailC
   const [expanded, setExpanded] = useState(false);
 
   // Parse metrics from output
-  const metrics = node.output?.metrics || {};
+  const metrics = (node as any).output?.metrics || node.metrics || {};
   const hasMetrics = Object.keys(metrics).length > 0;
 
   return (
@@ -357,13 +358,13 @@ function NodeDetailCard({ node, nodeTypeIcons, getNodeStatusColor }: NodeDetailC
           {node.status.toUpperCase()}
         </span>
         <span style={{ fontSize: "14px" }}>
-          {nodeTypeIcons[node.nodeType] || "📦"}
+          {nodeTypeIcons[(node as any).nodeType] || "📦"}
         </span>
         <span style={{ fontSize: "12px", fontWeight: 600, color: "#e2e8f0" }}>
           {node.nodeId}
         </span>
         <span style={{ fontSize: "10px", color: "#64748b" }}>
-          {node.nodeType}
+          {(node as any).nodeType}
         </span>
         {node.duration && (
           <span style={{ fontSize: "10px", color: "#64748b", marginLeft: "auto" }}>
@@ -403,7 +404,7 @@ function NodeDetailCard({ node, nodeTypeIcons, getNodeStatusColor }: NodeDetailC
           )}
 
           {/* Input config */}
-          {node.input?.config && Object.keys(node.input.config).length > 0 && (
+          {(node as any).input?.config && Object.keys((node as any).input.config).length > 0 && (
             <div style={{ marginBottom: "12px" }}>
               <div style={{ fontSize: "10px", color: "#475569", marginBottom: "6px" }}>INPUT CONFIG</div>
               <div style={{
@@ -417,14 +418,14 @@ function NodeDetailCard({ node, nodeTypeIcons, getNodeStatusColor }: NodeDetailC
                 maxHeight: "120px",
               }}>
                 <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
-                  {JSON.stringify(node.input.config, null, 2)}
+                  {JSON.stringify((node as any).input.config, null, 2)}
                 </pre>
               </div>
             </div>
           )}
 
           {/* Resolved context */}
-          {node.input?.resolvedContext && Object.keys(node.input.resolvedContext).length > 0 && (
+          {(node as any).input?.resolvedContext && Object.keys((node as any).input.resolvedContext).length > 0 && (
             <div style={{ marginBottom: "12px" }}>
               <div style={{ fontSize: "10px", color: "#475569", marginBottom: "6px" }}>RESOLVED VALUES</div>
               <div style={{
@@ -438,7 +439,7 @@ function NodeDetailCard({ node, nodeTypeIcons, getNodeStatusColor }: NodeDetailC
                 maxHeight: "100px",
               }}>
                 <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
-                  {JSON.stringify(node.input.resolvedContext, null, 2)}
+                  {JSON.stringify((node as any).input.resolvedContext, null, 2)}
                 </pre>
               </div>
             </div>

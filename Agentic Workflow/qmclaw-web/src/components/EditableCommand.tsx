@@ -8,6 +8,8 @@ interface EditableCommandProps {
   qubit: string;
   expType: ExpType;
   onRun: (command: string) => void;
+  onSave?: (command: string) => void;
+  initialCommand?: string;
   disabled?: boolean;
 }
 
@@ -32,18 +34,32 @@ function buildCommand(qubit: string, expType: ExpType): string {
   return fn + "(" + qubit + ", do_plot=True)";
 }
 
-export default function EditableCommand({ qubit, expType, onRun, disabled }: EditableCommandProps) {
+export default function EditableCommand({ qubit, expType, onRun, onSave, initialCommand, disabled }: EditableCommandProps) {
   const [expanded, setExpanded] = useState(false);
-  const [command, setCommand] = useState(() => buildCommand(qubit, expType));
+  const [command, setCommand] = useState(() => initialCommand || buildCommand(qubit, expType));
+  const [isSaving, setIsSaving] = useState(false);
 
   // Sync when qubit or expType changes (unless manually edited while expanded)
   useEffect(() => {
-    if (!expanded) setCommand(buildCommand(qubit, expType));
-  }, [qubit, expType, expanded]);
+    if (!expanded) {
+      // Use initialCommand if provided, otherwise build default
+      setCommand(initialCommand || buildCommand(qubit, expType));
+    }
+  }, [qubit, expType, expanded, initialCommand]);
 
   const handleRun = () => {
     if (!command.trim()) return;
     onRun(command.trim());
+  };
+
+  const handleSave = async () => {
+    if (!onSave || !command.trim()) return;
+    setIsSaving(true);
+    try {
+      await onSave(command.trim());
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -96,11 +112,11 @@ export default function EditableCommand({ qubit, expType, onRun, disabled }: Edi
             overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
           }}
         >
-          {buildCommand(qubit, expType)}
+          {command}
         </div>
       )}
 
-      {/* Run button row */}
+      {/* Button row */}
       {expanded ? (
         <div style={{ padding: "0.4rem 0.75rem", borderTop: "1px solid #1e293b", display: "flex", gap: "0.5rem", alignItems: "center" }}>
           <button
@@ -118,6 +134,23 @@ export default function EditableCommand({ qubit, expType, onRun, disabled }: Edi
           >
             ▶ Run
           </button>
+          {onSave && (
+            <button
+              onClick={handleSave}
+              disabled={isSaving || !command.trim()}
+              style={{
+                padding: "0.4rem 0.75rem",
+                borderRadius: "0.375rem",
+                border: "1px solid #3b82f6",
+                background: "transparent",
+                color: isSaving ? "#64748b" : "#3b82f6",
+                cursor: isSaving ? "not-allowed" : "pointer",
+                fontSize: "0.75rem", fontWeight: 600,
+              }}
+            >
+              {isSaving ? "..." : "💾 Save"}
+            </button>
+          )}
           <span style={{ fontSize: "0.65rem", color: "#475569" }}>Ctrl+Enter to run</span>
         </div>
       ) : null}

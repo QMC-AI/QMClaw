@@ -53,7 +53,7 @@ function JobDetailPanel({ job }: { job: JobEntry }) {
         borderBottom: "1px solid #1e293b",
         display: "flex", justifyContent: "space-between", alignItems: "center",
       }}>
-        <span>JOB DETAIL — {job.id.slice(0, 16)}...</span>
+        <span>JOB DETAIL — {job.qubit || "?"}-{job.experiment || "?"} (ID: {job.id.slice(0, 12)}...)</span>
         <span style={{ color: "#64748b" }}>{job.status}</span>
       </div>
       <div style={{ display: "flex", minHeight: 0 }}>
@@ -114,7 +114,7 @@ export default function JobManager({ currentJobId, onJobSelect }: JobManagerProp
       try {
         const list = await api.listJobs();
         setJobs(list);
-        setRunningIds(new Set(list.filter((j) => j.status === "pending" || j.status === "running").map((j) => j.id)));
+        setRunningIds(new Set(list.filter((j: any) => j.status === "pending" || j.status === "running").map((j: any) => j.id)));
       } catch { /* ignore */ }
     };
     fetchJobs();
@@ -178,7 +178,7 @@ export default function JobManager({ currentJobId, onJobSelect }: JobManagerProp
             No jobs yet
           </div>
         )}
-        {jobs.map((job) => (
+        {jobs.map((job, index) => (
           <div key={job.id}>
             <div
               onClick={() => handleToggleExpand(job.id)}
@@ -199,7 +199,7 @@ export default function JobManager({ currentJobId, onJobSelect }: JobManagerProp
                     color: job.id === currentJobId ? "#38bdf8" : "#94a3b8",
                     overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                   }}>
-                    {job.id.slice(0, 20)}...
+                    #{jobs.length - index} {job.qubit || "?"}-{job.experiment || "?"}
                   </span>
                   {job.plotPath && job.status === "completed" && (
                     <span style={{ fontSize: "0.6rem", marginLeft: "0.4rem", flexShrink: 0 }}>📊</span>

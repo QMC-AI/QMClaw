@@ -18,16 +18,375 @@ Usage:
 import os
 import sys
 import json
+import subprocess
+from typing import Dict, Any, Optional, List
 import base64
 import time
 import signal
 import traceback
 import tempfile
 import urllib.parse
+import threading
+import atexit
 
 # PLOTS_DIR shared with Express server
 PLOTS_DIR = os.environ.get("PLOTS_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "..", "qmclaw-web", "public", "plots"))
 from io import StringIO
+
+# ── Service Manager (Auto-start microservices) ─────────────────────────────────
+
+class ServiceManager:
+    """自动管理微服务的启动和停止"""
+
+    SERVICES = {
+        "llm": {
+            "port": 3006,
+            "script": "services/llm_service/server.py",
+            "description": "LLM Service",
+        },
+        "quantum": {
+            "port": 3003,
+            "script": "services/quantum_service/server.py",
+            "description": "Quantum Service",
+        },
+        "analysis": {
+            "port": 3004,
+            "script": "services/analysis_service/server.py",
+            "description": "Analysis Service",
+        },
+        "agent": {
+            "port": 3005,
+            "script": "services/agent_service/server.py",
+            "description": "Agent Service",
+        },
+        "image": {
+            "port": 3007,
+            "script": "services/image_service/server.py",
+            "description": "Image Service",
+        },
+        "workflow": {
+            "port": 3008,
+            "script": "services/workflow_service/server.py",
+            "description": "Workflow Service",
+        },
+        "task_queue": {
+            "port": 3009,
+            "script": "services/task_queue/server.py",
+            "description": "Task Queue Service",
+        },
+    }
+
+    def __init__(self):
+        self.processes: Dict[str, Any] = {}
+        self.server_dir = os.path.dirname(os.path.dirname(__file__))
+        self._started = False
+
+    def _check_port_available(self, port: int) -> bool:
+        """检查端口是否可用"""
+        import socket
+        try:
+            with socket.create_connection(("localhost", port), timeout=1):
+                return False  # 端口被占用
+        except (OSError, socket.timeout):
+            return True  # 端口可用
+
+    def _wait_for_service(self, name: str, port: int, timeout: int = 30) -> bool:
+        """等待服务就绪"""
+        import urllib.request
+        import urllib.error
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self._check_port_available(port):
+                time.sleep(0.5)
+                continue
+            try:
+                url = f"http://localhost:{port}/health"
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=2) as response:
+                    if response.status == 200:
+                        print(f"SERVICE_MGR: {name} is ready (port {port})", file=sys.stderr, flush=True)
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        print(f"SERVICE_MGR: {name} failed to start within {timeout}s", file=sys.stderr, flush=True)
+        return False
+
+    def start_all(self, services: Optional[List[str]] = None, timeout: int = 30) -> bool:
+        """启动所有或指定的服务"""
+        if self._started:
+            print("SERVICE_MGR: Already started", file=sys.stderr, flush=True)
+            return True
+
+        if services is None:
+            services = list(self.SERVICES.keys())
+
+        print(f"SERVICE_MGR: Starting services: {', '.join(services)}", file=sys.stderr, flush=True)
+
+        started = []
+        for name in services:
+            if name not in self.SERVICES:
+                print(f"SERVICE_MGR: Unknown service: {name}", file=sys.stderr, flush=True)
+                continue
+
+            svc = self.SERVICES[name]
+            port = svc["port"]
+
+            # 检查端口是否已被占用
+            if not self._check_port_available(port):
+                print(f"SERVICE_MGR: {name} port {port} already in use, skipping", file=sys.stderr, flush=True)
+                continue
+
+            script_path = os.path.join(self.server_dir, svc["script"])
+            if not os.path.exists(script_path):
+                print(f"SERVICE_MGR: {name} script not found: {script_path}", file=sys.stderr, flush=True)
+                continue
+
+            print(f"SERVICE_MGR: Starting {name} ({svc['description']})...", file=sys.stderr, flush=True)
+
+            try:
+                env = os.environ.copy()
+                # 确保 Python 使用 UTF-8 编码
+                env["PYTHONIOENCODING"] = "utf-8"
+
+                proc = subprocess.Popen(
+                    [sys.executable, script_path],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=self.server_dir,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if sys.platform == 'win32' else 0,
+                )
+                self.processes[name] = proc
+                started.append(name)
+                print(f"SERVICE_MGR: {name} started (PID: {proc.pid})", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"SERVICE_MGR: Failed to start {name}: {e}", file=sys.stderr, flush=True)
+
+        if not started:
+            print("SERVICE_MGR: No services started", file=sys.stderr, flush=True)
+            self._started = True
+            return True
+
+        # 等待所有服务就绪
+        print(f"SERVICE_MGR: Waiting for {len(started)} services to be ready...", file=sys.stderr, flush=True)
+        all_ready = True
+        for name in started:
+            svc = self.SERVICES[name]
+            if not self._wait_for_service(name, svc["port"], timeout):
+                all_ready = False
+
+        if all_ready:
+            print(f"SERVICE_MGR: All {len(started)} services ready!", file=sys.stderr, flush=True)
+        else:
+            print("SERVICE_MGR: Some services failed to start", file=sys.stderr, flush=True)
+
+        self._started = True
+        return all_ready
+
+    def stop_all(self):
+        """停止所有服务"""
+        if not self.processes:
+            return
+
+        print("SERVICE_MGR: Stopping all services...", file=sys.stderr, flush=True)
+        for name, proc in self.processes.items():
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    print(f"SERVICE_MGR: {name} terminated", file=sys.stderr, flush=True)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    print(f"SERVICE_MGR: {name} killed", file=sys.stderr, flush=True)
+
+        self.processes.clear()
+        print("SERVICE_MGR: All services stopped", file=sys.stderr, flush=True)
+
+
+# 全局服务管理器
+_service_manager: Optional[ServiceManager] = None
+
+def _get_service_manager() -> ServiceManager:
+    global _service_manager
+    if _service_manager is None:
+        _service_manager = ServiceManager()
+    return _service_manager
+
+
+# ── Service Proxy (Progressive Migration) ──────────────────────────────────────
+# 尝试导入服务代理模块用于渐进式迁移
+_service_proxy = None
+_use_services = os.environ.get("QMCLAW_USE_SERVICES", "false").lower() == "true"
+
+if _use_services:
+    try:
+        # 添加 server 目录到路径
+        _server_dir = os.path.dirname(os.path.dirname(__file__))
+        if _server_dir not in sys.path:
+            sys.path.insert(0, _server_dir)
+        from services import client_proxy
+        _service_proxy = client_proxy
+        print(f"SERVICE_PROXY: Using microservices mode", file=sys.stderr, flush=True)
+
+        # 自动启动所有微服务
+        mgr = _get_service_manager()
+        mgr.start_all()
+
+        # 注册退出时停止所有服务
+        atexit.register(_stop_all_services)
+    except ImportError as e:
+        print(f"SERVICE_PROXY: Failed to import client_proxy: {e}", file=sys.stderr, flush=True)
+        _service_proxy = None
+else:
+    print(f"SERVICE_PROXY: Using legacy mode (set QMCLAW_USE_SERVICES=true to enable)", file=sys.stderr, flush=True)
+
+def _stop_all_services():
+    """退出时停止所有微服务"""
+    global _service_manager
+    if _service_manager:
+        _service_manager.stop_all()
+        _service_manager = None
+
+# 注册信号处理器 - 当收到终止信号时停止服务
+def _signal_handler(signum, frame):
+    print(f"SERVICE_MGR: Received signal {signum}, stopping services...", file=sys.stderr, flush=True)
+    _stop_all_services()
+    # 重新抛出信号让默认处理器继续
+    signal.signal(signum, signal.SIG_DFL)
+    raise KeyboardInterrupt
+
+# 只在启用服务模式时注册信号处理器
+if _use_services:
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+else:
+    print(f"SERVICE_PROXY: Using legacy mode (set QMCLAW_USE_SERVICES=true to enable)", file=sys.stderr, flush=True)
+
+
+# ── Migration Helper Functions ──────────────────────────────────────────────────
+# 渐进式迁移: 优先使用服务代理，失败时回退到本地实现
+
+def _try_service_call(service_method, fallback_result=None, fallback_error_msg=None):
+    """尝试调用服务方法，失败时返回回退值"""
+    if not _service_proxy:
+        return fallback_result
+    try:
+        result = service_method()
+        if "error" in result and result["error"]:
+            print(f"SERVICE_PROXY: Service call failed: {result['error']}, falling back to legacy", file=sys.stderr)
+            return fallback_result
+        return result
+    except Exception as e:
+        print(f"SERVICE_PROXY: Service call exception: {e}, falling back to legacy", file=sys.stderr)
+        return fallback_result
+
+
+# ── Backend action handlers (progressive migration to services) ─────────────────
+
+def _handle_backend_action(action: str, data: dict, cid: str = "") -> dict:
+    """Handle backend-style requests - progressive migration to microservices.
+
+    When QMCLAW_USE_SERVICES=true, this function will delegate to microservices.
+    Otherwise, it uses the legacy direct LabRAD calls.
+    """
+    # 如果启用服务模式，尝试使用服务代理
+    if _use_services and _service_proxy:
+        return _handle_backend_action_via_services(action, data, cid)
+    else:
+        # 保持原有实现直到迁移完成
+        return _handle_backend_request_legacy(action, data, cid)
+
+
+def _handle_backend_action_via_services(action: str, data: dict, cid: str = "") -> dict:
+    """Handle backend actions via microservices."""
+    try:
+        # ── health ──────────────────────────────────────────────────────────────
+        if action == "health":
+            result = _service_proxy.quantum.status()
+            return {"cid": cid, "action": action, "data": {
+                "status": "running",
+                "ready": True,
+                "busy": False,
+                "session": result if result.get("connected") else {
+                    "conn_id": "",
+                    "name": "",
+                    "host": "",
+                    "port": 0,
+                    "connected": False,
+                }
+            }}
+
+        # ── experiments ────────────────────────────────────────────────────────
+        elif action == "experiments":
+            result = _service_proxy.quantum.experiments()
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── sessions ────────────────────────────────────────────────────────────
+        elif action == "sessions":
+            result = _service_proxy.quantum.sessions()
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── session_tree ────────────────────────────────────────────────────────
+        elif action == "session_tree":
+            max_depth = data.get("max_depth", 5)
+            result = _service_proxy.quantum.session_tree(max_depth)
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── switch_session ──────────────────────────────────────────────────────
+        elif action == "switch_session":
+            # switch_session 需要特殊处理(保存配置、重新加载qubits)，保持本地
+            return _handle_backend_request_original(action, data, cid)
+
+        # ── list_qubits ────────────────────────────────────────────────────────
+        elif action == "list_qubits":
+            result = _service_proxy.quantum.qubits()
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── get_qubit_params ───────────────────────────────────────────────────
+        elif action == "get_qubit_params":
+            qname = data.get("name")
+            if not qname:
+                return {"cid": cid, "action": action, "error": "Qubit name required"}
+            result = _service_proxy.quantum.qubit_params(qname)
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── set_qubit_params ────────────────────────────────────────────────────
+        elif action == "set_qubit_params":
+            qname = data.get("name")
+            params = data.get("params", {})
+            if not qname:
+                return {"cid": cid, "action": action, "error": "Qubit name required"}
+            result = _service_proxy.quantum.set_qubit_params(qname, params)
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── datasets ────────────────────────────────────────────────────────────
+        elif action == "datasets":
+            path = data.get("path")
+            result = _service_proxy.quantum.datasets(path)
+            return {"cid": cid, "action": action, "data": result}
+
+        # ── debug_env, debug_data, test_load_dataset, plot_dataset, plot ────────
+        # 这些操作需要访问本地状态，保持本地实现
+        else:
+            return _handle_backend_request_original(action, data, cid)
+
+    except Exception as e:
+        print(f"SERVICE_PROXY: Error handling {action}: {e}", file=sys.stderr)
+        # 服务出错时回退到本地实现
+        return _handle_backend_request_original(action, data, cid)
+
+
+def _legacy_handle_backend_request(action: str, data: dict, cid: str = "") -> dict:
+    """Legacy implementation of backend request handling.
+
+    This is the original handle_backend_request function preserved for
+    backward compatibility and for actions that haven't been migrated yet.
+    """
+    # The original implementation is below, after the Image Classification section
+    return _handle_backend_request_original(action, data, cid)
 
 
 def _sanitize_string(s):
@@ -42,12 +401,17 @@ def _sanitize_string(s):
         # Remove lone surrogates and any other problematic characters
         result = []
         for char in s:
-            try:
-                # Try to encode each character - lone surrogates will fail
-                char.encode('utf-8')
-                result.append(char)
-            except UnicodeEncodeError:
-                pass  # Skip problematic characters
+            codepoint = ord(char)
+            # Skip UTF-16 surrogates (U+D800 to U+DFFF) which are invalid in UTF-8
+            if 0xD800 <= codepoint <= 0xDFFF:
+                continue
+            # Skip other problematic characters
+            if codepoint < 0x110000:  # Valid Unicode range
+                try:
+                    char.encode('utf-8')
+                    result.append(char)
+                except UnicodeEncodeError:
+                    continue
         return ''.join(result)
 
 
@@ -60,6 +424,30 @@ MEASURE_SCRIPTS = os.environ.get("MEASURE_SCRIPTS", os.path.join(_DEFAULT_ROOT, 
 
 sys.path.insert(0, MEASURE_SCRIPTS)
 sys.path.insert(0, BACKEND_DIR)
+
+# Debug: print sys.path
+print(f"INIT: sys.path after inserts: {sys.path[:5]}", file=sys.stderr, flush=True)
+print(f"INIT: BACKEND_DIR={BACKEND_DIR} exists={os.path.exists(BACKEND_DIR)}", file=sys.stderr, flush=True)
+print(f"INIT: MEASURE_SCRIPTS={MEASURE_SCRIPTS} exists={os.path.exists(MEASURE_SCRIPTS)}", file=sys.stderr, flush=True)
+
+# ── Image Classifier Paths ─────────────────────────────────────────────────────
+# D:\Documents\图像二分类代码
+_IMAGE_CLASSIFIER_DIR = os.environ.get(
+    "IMAGE_CLASSIFIER_DIR",
+    r"D:\Documents\图像二分类代码"
+)
+if os.path.exists(_IMAGE_CLASSIFIER_DIR):
+    sys.path.insert(0, _IMAGE_CLASSIFIER_DIR)
+    print(f"IMAGE_CLASSIFIER: Added to sys.path: {_IMAGE_CLASSIFIER_DIR}", file=sys.stderr, flush=True)
+else:
+    print(f"IMAGE_CLASSIFIER: Directory not found: {_IMAGE_CLASSIFIER_DIR}", file=sys.stderr, flush=True)
+
+# Lazy-load image classifier components (imported on first use)
+_image_classifier = None
+_activity_classifier = None
+_onnx_classifier = None
+_quantized_classifier = None
+_classifier_model_path = None
 
 # ── IPython patch (suppress UI) ───────────────────────────────────────────────
 
@@ -130,26 +518,114 @@ def _save_rules_config(rules: list):
 _default_rules = _load_rules_config()
 print(f"INIT: Loaded {len(_default_rules)} rules from config file", file=sys.stderr, flush=True)
 
-# ── Backend initialization (done once at startup) ─────────────────────────────
+# ── Backend Adapter Layer ─────────────────────────────────────────────────────
+# Use the new backends adapter for all initialization
+_BACKEND_ADAPTER = None  # New adapter instance
+
+def _setup_backends_path():
+    """Add qmclaw-server directory to Python path for backends module."""
+    # __file__ = scripts/job_runner.py
+    # server_dir = qmclaw-server (parent of scripts)
+    server_dir = os.path.dirname(os.path.dirname(__file__))
+    if server_dir not in sys.path:
+        sys.path.insert(0, server_dir)
+        print(f"BACKENDS: Added server_dir to sys.path: {server_dir}", file=sys.stderr, flush=True)
+
+_setup_backends_path()
+
+# ── Ray initialization ──────────────────────────────────────────────────────────
+
+def _setup_ray():
+    """Initialize Ray connection and start Device Manager actor."""
+    try:
+        import ray
+
+        # Skip if already initialized
+        if ray.is_initialized():
+            print("RAY: Already initialized", file=sys.stderr, flush=True)
+            return True
+
+        # Get Ray config from lqcs.system_config
+        try:
+            from lqcs import system_config
+            head_ip = system_config.get_ray_head()
+            node_ip = system_config.get_config()['ip']
+            port = system_config.get_ray_port()
+        except ImportError:
+            print("RAY: lqcs.system_config not available, skipping Ray init", file=sys.stderr, flush=True)
+            return False
+
+        print(f"RAY: Connecting to {head_ip}:{port}...", file=sys.stderr, flush=True)
+        ray.init(
+            address=f"{head_ip}:{port}",
+            namespace='main',
+            _node_ip_address=node_ip,
+            log_to_driver=False,
+        )
+        print("RAY: Connected successfully", file=sys.stderr, flush=True)
+
+        # Try to get or create Device Manager
+        try:
+            device_manager = ray.get_actor('Device Manager')
+            print("RAY: Device Manager already exists", file=sys.stderr, flush=True)
+        except Exception:
+            print("RAY: Starting Device Manager...", file=sys.stderr, flush=True)
+            try:
+                from lqcs.servers_control.start_server import start_managers
+                start_managers.startServer(
+                    node_ip,
+                    start_managers.DeviceManagerActor,
+                    'Device Manager',
+                    blocking=False
+                )
+                print("RAY: Device Manager started", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"RAY: Failed to start Device Manager: {e}", file=sys.stderr, flush=True)
+
+        return True
+    except Exception as e:
+        print(f"RAY: Initialization failed: {e}", file=sys.stderr, flush=True)
+        return False
+
+# Call Ray setup before backend init
+_setup_ray()
+
+# ── Backend initialization (done once at startup) ──────────────────────────────
 
 print("INIT: Starting backend initialization...", file=sys.stderr, flush=True)
 sys.stderr.flush()
 
 _cxn = _s = _sq = _data = _qter = _BasicTuner = _generate_qubit = _backend = None
+_all_qubits: Dict[str, Any] = {}
+_all_couplers: Dict[str, Any] = {}
 _current_session_path = []  # Track current session path for qubit reloading
 
 def reload_qubits(session_path):
-    """Reload qubits for the given session path."""
-    global _s, _data, _qter, _backend, _current_session_path
-    import labrad
-    from lqms.pyle.workflow import switchSession
-    from lqms.utils.save_path import get_info_path
-    from lqms.data_process import dataAnalysisCore as dc
+    """Reload qubits for the given session path using adapter or direct lqms calls."""
+    global _s, _data, _qter, _backend, _current_session_path, _BACKEND_ADAPTER, _all_qubits, _all_couplers
 
     print(f"RELOAD_QUBITS: Starting reload for path={session_path}", file=sys.stderr, flush=True)
     _current_session_path = session_path
 
+    # Try using adapter first, fall back to direct lqms calls
+    if _BACKEND_ADAPTER is not None:
+        try:
+            success = _BACKEND_ADAPTER.reload_qubits(session_path)
+            if success:
+                # Update global references
+                _update_globals_from_adapter()
+            return success
+        except Exception as e:
+            print(f"RELOAD_QUBITS: Adapter failed, falling back to direct calls: {e}", file=sys.stderr)
+
+    # Fall back to direct lqms calls
     try:
+        import labrad
+        from lqms.pyle.workflow import switchSession
+        from lqms.utils.save_path import get_info_path
+        from lqms.data_process import dataAnalysisCore as dc
+        import threading
+
         # Switch session
         if session_path:
             # Extract user from path (e.g., ['', 'LQHL', 'test', '20260324'] -> 'LQHL')
@@ -159,8 +635,27 @@ def reload_qubits(session_path):
 
         print(f"RELOAD_QUBITS: Switching to session path={session_path}, user={user}", file=sys.stderr, flush=True)
 
-        # Create new session switcher
-        _s = switchSession(_cxn, user=user)
+        # Create new session switcher with timeout protection
+        switch_result = {"session": None, "error": None}
+        def _switch():
+            try:
+                switch_result["session"] = switchSession(_cxn, user=user)
+            except Exception as e:
+                switch_result["error"] = e
+
+        switch_thread = threading.Thread(target=_switch)
+        switch_thread.daemon = True
+        switch_thread.start()
+        switch_thread.join(timeout=30)  # 30 second timeout
+
+        if switch_thread.is_alive():
+            print("RELOAD_QUBITS: switchSession TIMEOUT after 30 seconds!", file=sys.stderr, flush=True)
+            return False
+        elif switch_result["error"]:
+            raise switch_result["error"]
+        else:
+            _s = switch_result["session"]
+
         print(f"RELOAD_QUBITS: Created new session switcher, _s keys count={len(list(_s.keys()))}", file=sys.stderr, flush=True)
 
         # Reload info and data lab
@@ -174,19 +669,13 @@ def reload_qubits(session_path):
             _qter.data = _data
             print(f"RELOAD_QUBITS: Updated _qter.data to new DataLab", file=sys.stderr, flush=True)
 
-        # Regenerate qubits from the new session's info
+        # Regenerate qubits from the new session's info (switchSession already loads qubits)
         if _generate_qubit:
             from lqms.measure import generate_qubit, generate_coupler
             print(f"RELOAD_QUBITS: Calling generate_qubit with session={session_path}", file=sys.stderr, flush=True)
-            all_qubits = generate_qubit({'s': _s}, info=info, sample=_s)
-            all_couplers = generate_coupler({'s': _s}, info=info, sample=_s)
-            print(f"RELOAD_QUBITS: generate_qubit returned {len(all_qubits)} qubits: {list(all_qubits.keys())[:10]}...", file=sys.stderr, flush=True)
-
-            # Inject qubits into _s registry
-            for qname, qobj in all_qubits.items():
-                _s._set(qname, qobj)
-
-            print(f"RELOAD_QUBITS: Injected {len(all_qubits)} qubits into _s", file=sys.stderr, flush=True)
+            _all_qubits = generate_qubit({'s': _s}, info=info, sample=_s)
+            _all_couplers = generate_coupler({'s': _s}, info=info, sample=_s)
+            print(f"RELOAD_QUBITS: generate_qubit returned {len(_all_qubits)} qubits: {list(_all_qubits.keys())[:10]}...", file=sys.stderr, flush=True)
 
         # Count qubits in _s after reload
         q_keys = [k for k in _s.keys() if k.startswith('q')]
@@ -198,25 +687,151 @@ def reload_qubits(session_path):
         print(f"RELOAD_QUBITS ERROR: {tb.format_exc()}", file=sys.stderr, flush=True)
         return False
 
+def _update_globals_from_adapter():
+    """Update job_runner globals from backend adapter for backward compatibility."""
+    global _cxn, _s, _sq, _data, _qter, _BasicTuner, _generate_qubit, _backend, _all_qubits, _all_couplers
+
+    if _BACKEND_ADAPTER is None:
+        return
+
+    _cxn = _BACKEND_ADAPTER.cxn
+    _s = _BACKEND_ADAPTER.s
+    _sq = _BACKEND_ADAPTER.sq
+    _data = _BACKEND_ADAPTER.data
+    _qter = _BACKEND_ADAPTER.qter
+    _BasicTuner = _BACKEND_ADAPTER._BasicTuner
+    _generate_qubit = _BACKEND_ADAPTER._generate_qubit
+    _all_qubits = _BACKEND_ADAPTER._all_qubits
+    _all_couplers = _BACKEND_ADAPTER._all_couplers
+    _backend = _BACKEND_ADAPTER  # Reference to adapter for qubit lookup
+
+
 def init_backend(max_retries=3, delay=5):
-    global _cxn, _s, _sq, _data, _qter, _BasicTuner, _generate_qubit, _backend, _current_session_path
+    global _cxn, _s, _sq, _data, _qter, _BasicTuner, _generate_qubit, _backend, _current_session_path, _BACKEND_ADAPTER, _all_qubits, _all_couplers
     last_error = None
+
+    # Try using the new backends adapter first
+    try:
+        print("INIT: Attempting to import backends...", file=sys.stderr, flush=True)
+        print(f"INIT: sys.path[0] = {sys.path[0]}", file=sys.stderr, flush=True)
+        import backends as _backends_module
+        print(f"INIT: backends.__file__ = {getattr(_backends_module, '__file__', 'N/A')}", file=sys.stderr, flush=True)
+        from backends import init_backend as create_backend_adapter, BackendStatus
+        print("INIT: backends import succeeded", file=sys.stderr, flush=True)
+        print("INIT: init_backend function:", init_backend, file=sys.stderr, flush=True)
+
+        # Load session config and initialize backend adapter
+        session_path = _get_full_session_path()
+        print(f"INIT: Using backends adapter, session path = {session_path}", file=sys.stderr, flush=True)
+        print("INIT: Calling create_backend_adapter()...", file=sys.stderr, flush=True)
+        print(f"INIT: create_backend_adapter type = {type(create_backend_adapter)}", file=sys.stderr, flush=True)
+        try:
+            _BACKEND_ADAPTER = create_backend_adapter(session_path=session_path)
+            print("INIT: create_backend_adapter() returned successfully", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"INIT: create_backend_adapter() raised exception: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            raise  # Re-raise to trigger fallback
+
+        if _BACKEND_ADAPTER is not None and _BACKEND_ADAPTER.status == BackendStatus.READY:
+            _update_globals_from_adapter()
+            _current_session_path = session_path
+            print(f"INIT: Backends adapter ready — system=lqcs, session={_current_session_path}", file=sys.stderr, flush=True)
+            return True
+        else:
+            print(f"INIT: Backends adapter status = {_BACKEND_ADAPTER.status if _BACKEND_ADAPTER else 'None'}", file=sys.stderr, flush=True)
+    except ImportError as e:
+        print(f"INIT: Backends adapter not available ({e}), using direct lqms import", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"INIT: Backends adapter failed ({e}), using direct lqms import", file=sys.stderr, flush=True)
+
+    # Fall back to direct lqms import (without measure_scripts/backend.py)
     for attempt in range(max_retries):
         try:
-            import backend
-            _backend = backend
-            from backend import cxn, s, sq, data, qter, BasicTuner, generate_qubit
-            _cxn = cxn; _s = s; _sq = sq; _data = data
-            _qter = qter; _BasicTuner = BasicTuner; _generate_qubit = generate_qubit
+            # Add measure_scripts to path for lqms imports
+            if BACKEND_DIR not in sys.path:
+                sys.path.insert(0, BACKEND_DIR)
+
+            import labrad
+            from lqms.pyle.workflow import switchSession
+            from lqms.utils.save_path import get_info_path
+            from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
+            from lqms.measure import generate_qubit, generate_coupler
+            from lqms.measure.basic import BasicTuner, util
+            from lqms.measure.tuners import sq_nodes as sq_module
+
+            # Store for later use
+            _generate_qubit = generate_qubit
+
+            # Connect to LabRAD
+            _cxn = labrad.connect()
+            util.setWiringInfo(_cxn)
 
             # Load session path from config file
             _current_session_path = _get_full_session_path()
             print(f"INIT: Config session path = {_current_session_path}", file=sys.stderr, flush=True)
 
-            # Reload _data with the configured session path
-            from lqms.data_process import dataAnalysisCore as dc
+            # Create session switcher with timeout protection
+            user = _current_session_path[1] if len(_current_session_path) > 1 else 'LQHL'
+            print(f"INIT: Calling switchSession for user={user}...", file=sys.stderr, flush=True)
+            switch_result = {"session": None, "error": None}
+            def _switch_with_timeout():
+                import threading  # Ensure threading is available in nested scope
+                try:
+                    switch_result["session"] = switchSession(_cxn, user=user)
+                except Exception as e:
+                    switch_result["error"] = e
+            switch_thread = threading.Thread(target=_switch_with_timeout)
+            switch_thread.daemon = True
+            switch_thread.start()
+            switch_thread.join(timeout=30)
+            if switch_thread.is_alive():
+                print("INIT: switchSession TIMEOUT after 30 seconds!", file=sys.stderr, flush=True)
+                raise TimeoutError("switchSession timed out")
+            elif switch_result["error"]:
+                raise switch_result["error"]
+            else:
+                _s = switch_result["session"]
+            print("INIT: switchSession done", file=sys.stderr, flush=True)
+
+            # Initialize data lab
             _data = dc.DataLab(_current_session_path, _cxn.data_vault, dv_type='data_vault')
-            print(f"INIT: Backend ready — sq={sq}, session={_current_session_path}", file=sys.stderr, flush=True)
+
+            # Load or create info
+            info_path = get_info_path(_s)
+            info = dc.InfoBase(info_path) if os.path.exists(info_path) else None
+
+            # Initialize analysis tools
+            _qter = QubitUpdater(_data, info)
+
+            # Generate qubits (switchSession already loads qubits from registry)
+            _all_qubits = generate_qubit({'s': _s}, info=info, sample=_s)
+            _all_couplers = generate_coupler({'s': _s}, info=info, sample=_s)
+
+            # No need to inject - switchSession loads qubits automatically
+
+            # Initialize BasicTuner
+            auto_config = {
+                'stats': 300,
+                'correctX': False,
+                'correctZ': False,
+                'reset': False,
+                'apply_21': False,
+                'run_mode': 'local',
+            }
+            _BasicTuner = BasicTuner(**auto_config)
+            # Set on CLASS for experiment functions to access (like original backend.py)
+            BasicTuner._sample = _s
+            BasicTuner._all_qobjs = _all_qubits | _all_couplers
+
+            # Get experiment module
+            _sq = sq_module
+
+            # For backward compatibility, _backend is the adapter if available
+            _backend = _BACKEND_ADAPTER if _BACKEND_ADAPTER else _sq
+
+            print(f"INIT: Backend ready (direct lqms) — sq={sq_module}, session={_current_session_path}", file=sys.stderr, flush=True)
             return True
         except Exception as e:
             last_error = e
@@ -229,7 +844,7 @@ def init_backend(max_retries=3, delay=5):
     return False
 
 if not init_backend():
-    sys.exit(1)
+    print("WARNING: Backend (LabRAD) init failed — quantum experiments will be unavailable. Agent chat (LLM-only) will still work.", file=sys.stderr, flush=True)
 
 print("INIT: Ready to accept jobs", file=sys.stderr, flush=True)
 
@@ -266,15 +881,13 @@ def run_job(code_b64, job_id):
             "backend": _backend,
         }
 
-        # Get qubits from backend module (where generate_qubit injects them)
-        # The backend module has qubits like q10lu1, q10lu10 etc. injected by generate_qubit
-        if _backend:
-            for _n in dir(_backend):
-                if _n.startswith('q') and not _n.startswith('qq'):
-                    obj = getattr(_backend, _n)
-                    # Accept actual qubit objects or RegistryWrapper objects
-                    if hasattr(obj, 'qName') or hasattr(obj, 'regs') or 'RegistryWrapper' in str(type(obj)):
-                        exec_globals[_n] = obj
+        # Add qubits from _all_qubits (actual Qubit objects with qName)
+        # These are the actual qubit objects generated by generate_qubit
+        if _all_qubits:
+            for _n, obj in _all_qubits.items():
+                if _n.startswith('q') and _n not in exec_globals:
+                    exec_globals[_n] = obj
+            print(f"EXEC: Added {len(_all_qubits)} qubits from _all_qubits", file=sys.stderr)
 
         # Also try to get qubits from _s registry (for session-switched qubits)
         if _s:
@@ -283,13 +896,14 @@ def run_job(code_b64, job_id):
                 if _n.startswith('q') and _n not in exec_globals:
                     try:
                         obj = _s[_n]
-                        # Accept qubit-like objects
-                        if hasattr(obj, 'qName') or hasattr(obj, 'regs') or 'RegistryWrapper' in str(type(obj)):
+                        # Only accept actual qubit objects, not RegistryWrapper
+                        if hasattr(obj, 'qName') or hasattr(obj, 'regs'):
                             exec_globals[_n] = obj
                             qubit_count += 1
                     except:
                         pass
-            print(f"EXEC: Added {qubit_count} qubits from _s registry", file=sys.stderr)
+            if qubit_count > 0:
+                print(f"EXEC: Added {qubit_count} qubits from _s registry", file=sys.stderr)
 
         # Debug: check q10lu1
         if 'q10lu1' in exec_globals:
@@ -297,6 +911,25 @@ def run_job(code_b64, job_id):
             print(f"EXEC: q10lu1 type={type(val).__name__}", file=sys.stderr)
         else:
             print(f"EXEC: q10lu1 NOT in exec_globals", file=sys.stderr)
+
+        # Debug: check qubit existence before execution
+        if 'q25_7' in exec_globals:
+            val = exec_globals['q25_7']
+            print(f"EXEC: q25_7 type={type(val).__name__}, qName={getattr(val, 'qName', 'N/A')}", file=sys.stderr, flush=True)
+            # Check key attributes needed for iqraw
+            print(f"EXEC: q25_7 has qf={hasattr(val, 'qf')}, qread={hasattr(val, 'qread')}, qrr={hasattr(val, 'qrr')}", file=sys.stderr, flush=True)
+            # List all attributes that might be relevant
+            attrs = [a for a in dir(val) if not a.startswith('_')]
+            print(f"EXEC: q25_7 attributes: {attrs}", file=sys.stderr, flush=True)
+            # Check qf value if exists
+            if hasattr(val, 'qf'):
+                print(f"EXEC: q25_7.qf = {val.qf}", file=sys.stderr, flush=True)
+            # Check qread
+            if hasattr(val, 'qread'):
+                qr = val.qread
+                print(f"EXEC: q25_7.qread type={type(qr).__name__}, value={qr}", file=sys.stderr, flush=True)
+        else:
+            print(f"EXEC: q25_7 NOT in exec_globals", file=sys.stderr, flush=True)
 
         # Debug: log session info before execution
         print(f"EXEC DEBUG: _current_session_path={_current_session_path}", file=sys.stderr, flush=True)
@@ -323,6 +956,10 @@ def run_job(code_b64, job_id):
         sys.stdout = old_out
         sys.stderr = old_err
         result_status = "error"
+        # Enhanced error reporting for debugging
+        error_trace = traceback.format_exc()
+        print(f"EXEC ERROR: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        print(f"EXEC ERROR TRACE: {error_trace}", file=sys.stderr, flush=True)
         result_error = traceback.format_exc()
 
     return {
@@ -837,12 +1474,14 @@ def run_workflow_node(node, node_results, workflow_ctx, check_cancel_fn):
                 # Resolve qubit name to qubit object if needed
                 exp_qubit_obj = exp_qubit
                 if isinstance(exp_qubit, str):
-                    if _s and exp_qubit in _s:
-                        exp_qubit_obj = _s[exp_qubit]
+                    if exp_qubit in _all_qubits:
+                        exp_qubit_obj = _all_qubits[exp_qubit]
+                    elif _s and exp_qubit in _s:
+                        exp_qubit_obj = _s[exp_qubit]  # Fallback (may be RegistryWrapper)
                     elif _backend and hasattr(_backend, exp_qubit):
                         exp_qubit_obj = getattr(_backend, exp_qubit)
                     else:
-                        q_keys = [k for k in (_s.keys() if _s else []) if k.startswith('q')]
+                        q_keys = [k for k in (_all_qubits.keys() if _all_qubits else []) if k.startswith('q')]
                         print(f"WORKFLOW_DEBUG: batch qubit '{exp_qubit}' NOT found! Available: {q_keys[:5]}...", file=sys.stderr, flush=True)
 
                 # Set the qubit object in exec globals for this experiment
@@ -1417,6 +2056,43 @@ def run_workflow_node(node, node_results, workflow_ctx, check_cancel_fn):
                 result["status"] = "failed"
                 result["error"] = f"No metrics found in node '{ref}' or no analysis commands configured"
 
+        elif node_type == "image_classification":
+            # Image classification node: takes qubit ID + experiment type, outputs label + confidence
+            qubit_id = resolve_template(config.get("qubit", ""), node_results, workflow_ctx)
+            experiment_type = resolve_template(config.get("experimentType", "spectroscopy"), node_results, workflow_ctx)
+            backend = config.get("backend", "pytorch")
+            review_threshold = float(config.get("reviewThreshold", 0.75))
+            margin_threshold = float(config.get("marginThreshold", 0.15))
+
+            result["type"] = "image_classification"
+            result["config"] = {
+                "qubit": qubit_id,
+                "experimentType": experiment_type,
+                "backend": backend,
+                "reviewThreshold": review_threshold,
+                "marginThreshold": margin_threshold,
+            }
+
+            try:
+                classification = _run_image_classify_latest_experiment(
+                    qubit_id, experiment_type, backend, review_threshold, margin_threshold
+                )
+                result["status"] = "completed"
+                result["stdout"] = f"Label: {classification['label']}, Confidence: {classification['confidence']:.4f}, Margin: {classification['margin']:.4f}"
+                result["metrics"] = {
+                    "label": classification["label"],
+                    "confidence": classification["confidence"],
+                    "margin": classification["margin"],
+                    "needReview": classification.get("needReview", False),
+                    "probClass0": classification.get("probClass0", 0.0),
+                    "probClass1": classification.get("probClass1", 0.0),
+                }
+                result["imagePath"] = classification.get("imagePath", "")
+                result["datasetName"] = classification.get("datasetName", "")
+            except Exception as e:
+                result["status"] = "failed"
+                result["error"] = str(e)
+
         elif node_type == "code":
             # Code execution node: sandboxed Python execution
             code = config.get("code", "")
@@ -1721,8 +2397,6 @@ def infer_provider_from_model(model: str) -> str:
 
 def get_openai_client(api_key: str, provider: str = "", base_url: str = ""):
     """Create an OpenAI-compatible client based on provider."""
-    import openai
-
     if base_url:
         # Custom base URL provided
         return openai.OpenAI(api_key=api_key, base_url=base_url)
@@ -1731,12 +2405,15 @@ def get_openai_client(api_key: str, provider: str = "", base_url: str = ""):
         # MiniMax requires special header format, use httpx directly
         return None  # Will be handled specially
     elif provider == "deepseek":
+        import openai
         return openai.OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
     elif provider == "anthropic":
         # Anthropic uses OpenAI SDK with their base URL
+        import openai
         return openai.OpenAI(api_key=api_key, base_url="https://anthropic.ai/v1")
     else:
         # Default OpenAI
+        import openai
         return openai.OpenAI(api_key=api_key)
 
 
@@ -1746,95 +2423,57 @@ def _get_minimax_key() -> str:
 
 
 def call_minimax_api(messages: list, model: str, api_key: str, temperature: float = 0.3, max_tokens: int = 500) -> dict:
-    """Call MiniMax API using Anthropic-compatible endpoint.
+    """Call MiniMax API using OpenAI-compatible endpoint (matches Model Registry)."""
+    from urllib.request import urlopen, Request
+    from urllib.error import URLError, HTTPError
+    import socket
 
-    MiniMax provides an Anthropic-compatible API at https://api.minimaxi.com/anthropic
-    See: https://platform.minimaxi.com/document/Guides/Authentication/anthropic-compatible-api
-    """
-    import httpx
-
-    # Debug: Log the model and api_key (masked)
-    print(f"[MiniMax Debug] model={model}", file=sys.stderr, flush=True)
-    print(f"[MiniMax Debug] api_key provided: {bool(api_key)}, prefix={api_key[:15] if api_key else 'EMPTY'}...", file=sys.stderr, flush=True)
-
-    # MiniMax Anthropic-compatible API endpoint
-    # Model names: MiniMax-Text-01, MiniMax-M2.7, etc.
-    minimax_api_base = "https://api.minimaxi.com/anthropic"
-
+    print(f"[MiniMax API] Calling API with {len(messages)} messages", file=sys.stderr, flush=True)
+    endpoint = "https://api.minimax.chat/v1/text/chatcompletion_v2"
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {api_key}",  # Full key for request
         "Content-Type": "application/json",
-        "x-api-key": api_key,
     }
+    # Log only first 10 chars for debugging
+    print(f"[MiniMax API] Request headers - Authorization: Bearer {api_key[:10]}...", file=sys.stderr, flush=True)
 
-    # Debug: Print headers (masked)
-    masked_headers = {k: (v[:20]+"..." if k == "Authorization" and len(v) > 20 else v) for k, v in headers.items()}
-    print(f"[MiniMax Debug] headers={masked_headers}", file=sys.stderr, flush=True)
-
-    # Convert OpenAI-style messages to Anthropic format
-    anthropic_messages = []
-    system_content = ""
+    # Convert messages to the format expected by MiniMax
+    minimax_messages = []
     for msg in messages:
-        if msg.get("role") == "system":
-            system_content = _sanitize_string(msg.get("content", ""))
-        else:
-            anthropic_messages.append({
-                "role": msg.get("role", "user"),
-                "content": _sanitize_string(msg.get("content", ""))
-            })
+        minimax_messages.append({
+            "role": msg.get("role", "user"),
+            "content": _sanitize_string(msg.get("content", ""))
+        })
 
     payload = {
         "model": model,
-        "messages": anthropic_messages,
+        "messages": minimax_messages,
         "max_tokens": max_tokens,
     }
-    if temperature != 0.3:  # Only include if non-default
+    if temperature != 0.3:
         payload["temperature"] = temperature
-    if system_content:
-        payload["system"] = system_content
 
+    data_bytes = json.dumps(payload).encode("utf-8")
+    req = Request(endpoint, data=data_bytes, headers=headers, method="POST")
     try:
-        with httpx.Client(timeout=60.0) as client:
-            print(f"[MiniMax Debug] Sending POST to {minimax_api_base}/v1/messages", file=sys.stderr, flush=True)
-            response = client.post(
-                f"{minimax_api_base}/v1/messages",
-                headers=headers,
-                json=payload,
-            )
-            print(f"[MiniMax Debug] Response status={response.status_code}", file=sys.stderr, flush=True)
-            if response.status_code != 200:
-                print(f"[MiniMax Debug] Response body={_sanitize_string(response.text[:500])}", file=sys.stderr, flush=True)
-            response.raise_for_status()
-            result = response.json()
+        # Use longer timeout with retry for reliability
+        print(f"[MiniMax API] Sending request with 60s timeout...", file=sys.stderr, flush=True)
+        resp = urlopen(req, timeout=60)  # 60 second timeout
+        print(f"[MiniMax API] Response received", file=sys.stderr, flush=True)
+        result = json.loads(resp.read().decode("utf-8"))
 
-            # Convert Anthropic response to OpenAI-style format for compatibility
-            # MiniMax may return multiple content blocks (thinking, text, etc.)
-            content = ""
-            for block in result.get("content", []):
-                if block.get("type") == "text":
-                    content = _sanitize_string(block.get("text", ""))
-                    break
-            # Safely handle usage which might be a list or dict
-            usage_data = result.get("usage", {})
-            if isinstance(usage_data, dict):
-                usage = {
-                    "prompt_tokens": usage_data.get("input_tokens", 0),
-                    "completion_tokens": usage_data.get("output_tokens", 0),
-                    "total_tokens": usage_data.get("input_tokens", 0) + usage_data.get("output_tokens", 0),
-                }
-            else:
-                usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                print(f"[MiniMax Debug] usage is not a dict: {type(usage_data)}", file=sys.stderr)
+        content = ""
+        choices = result.get("choices", [])
+        if choices and len(choices) > 0:
+            msg = choices[0].get("message", {})
+            content = _sanitize_string(msg.get("content", ""))
 
-            return {"choices": [{"message": {"content": content}}], "usage": usage}
-    except httpx.HTTPStatusError as e:
-        error_body = _sanitize_string(e.response.text[:500])
-        print(f"[MiniMax Debug] HTTP error: {e.response.status_code}, body={error_body}", file=sys.stderr, flush=True)
-        raise Exception(f"MiniMax API error: {e.response.status_code} - {error_body}")
-    except Exception as e:
-        error_str = _sanitize_string(str(e))
-        print(f"[MiniMax Debug] Exception: {error_str}", file=sys.stderr, flush=True)
-        raise Exception(f"MiniMax API error: {error_str}")
+        usage = result.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+        print(f"[MiniMax API] Success, content length: {len(content)}", file=sys.stderr, flush=True)
+        return {"choices": [{"message": {"content": content}}], "usage": usage}
+    except (URLError, HTTPError, socket.timeout, Exception) as e:
+        print(f"[MiniMax API] Error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        raise Exception(f"MiniMax API error: {type(e).__name__}: {e}")
 
 
 def llm_decide(prompt: str, context: str, api_key: str, model: str = "gpt-4o", temperature: float = 0.3, max_tokens: int = 500, system_prompt: str = "", provider: str = "", base_url: str = "") -> dict:
@@ -2514,10 +3153,23 @@ def run_workflow(workflow_json: str, workflow_id: str):
     }
 
 
-# ── Flask-style endpoints (integrated, no separate Flask server) ──────────────────
+# ── backend-style endpoints (integrated, no separate backend server) ──────────────────
 
-def handle_flask_request(action, data):
-    """Handle Flask-style requests using the pre-initialized LabRAD connection."""
+def handle_backend_request(action, data):
+    """Handle backend-style requests - progressive migration to microservices.
+
+    When QMCLAW_USE_SERVICES=true and services are available, this delegates to microservices.
+    Otherwise, it falls back to the legacy implementation.
+    """
+    cid = data.get("cid", "")
+    return _handle_backend_action(action, data, cid)
+
+
+def _handle_backend_request_original(action, data, cid=""):
+    """Original implementation of handle_backend_request.
+
+    This contains all the original backend request handling logic.
+    """
     cid = data.get("cid", "")
 
     try:
@@ -2531,6 +3183,16 @@ def handle_flask_request(action, data):
                     "port": _cxn.port,
                     "connected": _cxn.connected,
                 }
+            }}
+
+        elif action == "debug_env":
+            # Debug endpoint to check environment variables
+            minimax_key = os.environ.get("MINIMAX_API_KEY", "")
+            return {"cid": cid, "action": action, "data": {
+                "minimax_api_key_set": bool(minimax_key),
+                "minimax_api_key_len": len(minimax_key),
+                "openai_api_key_set": bool(os.environ.get("OPENAI_API_KEY", "")),
+                "all_env_keys": sorted([k for k in os.environ.keys() if any(x in k.upper() for x in ["KEY", "API", "MINIMAX", "OPENAI", "ANTHROPIC", "DEEPSEEK"])]),
             }}
 
         elif action == "experiments":
@@ -2605,20 +3267,60 @@ def handle_flask_request(action, data):
             return {"cid": cid, "action": action, "data": {"tree": tree}}
 
         elif action == "switch_session":
+            import threading  # Ensure threading is available in this scope
+            print(f"[EVENT] switch_session starting, cid={cid}, data={data}", file=sys.stderr, flush=True)
             session_path = data.get("path", [])
-            with _labrad_lock:
+
+            # Use lock with timeout to prevent deadlock
+            lock_acquired = _labrad_lock.acquire(timeout=5.0)
+            if not lock_acquired:
+                print(f"[EVENT] switch_session lock timeout, cid={cid}", file=sys.stderr, flush=True)
+                return {"cid": cid, "action": action, "data": {"success": False, "error": "Lock timeout"}}
+
+            try:
                 dv = _cxn.data_vault
                 dv.cd('')  # absolute: go to root first
                 clean_path = session_path[1:] if session_path and session_path[0] == '' else session_path
                 dv.cd(clean_path)
+                print(f"[EVENT] switch_session DataVault cd done, cid={cid}", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[EVENT] switch_session DataVault error: {e}", file=sys.stderr, flush=True)
+                _labrad_lock.release()
+                lock_acquired = False  # Prevent finally from releasing again
+                return {"cid": cid, "action": action, "data": {"success": False, "error": str(e)}}
+            finally:
+                if lock_acquired:
+                    _labrad_lock.release()
 
             # Save session to config file
             user = clean_path[0] if clean_path else 'LQHL'
             path_segments = clean_path[1:] if len(clean_path) > 1 else []
             _save_session_config(user, path_segments)
 
-            # Reload qubits for the new session
-            reload_qubits(clean_path)
+            # Reload qubits for the new session - run in thread with timeout
+            print(f"[EVENT] switch_session calling reload_qubits, cid={cid}", file=sys.stderr, flush=True)
+            reload_result = {"success": False, "error": None}
+            def _reload():
+                import threading  # Ensure threading is available in nested scope
+                try:
+                    reload_qubits(clean_path)
+                    reload_result["success"] = True
+                except Exception as e:
+                    reload_result["error"] = str(e)
+                    print(f"[EVENT] reload_qubits error: {e}", file=sys.stderr)
+
+            reload_thread = threading.Thread(target=_reload)
+            reload_thread.daemon = True
+            reload_thread.start()
+            reload_thread.join(timeout=30)  # 30 second timeout for qubit reload
+
+            if reload_thread.is_alive():
+                print(f"[EVENT] switch_session reload_qubits TIMEOUT, cid={cid}", file=sys.stderr, flush=True)
+                return {"cid": cid, "action": action, "data": {"success": False, "error": "Reload timeout"}}
+
+            if reload_result["error"]:
+                print(f"[EVENT] switch_session reload_qubits failed: {reload_result['error']}", file=sys.stderr, flush=True)
+
             # Get list of qubits for response
             qubits = []
             if _s:
@@ -2633,6 +3335,7 @@ def handle_flask_request(action, data):
                             })
                         except:
                             qubits.append({"name": qname})
+            print(f"[EVENT] switch_session returning, cid={cid}, qubits_count={len(qubits)}", file=sys.stderr, flush=True)
             return {"cid": cid, "action": action, "data": {"success": True, "path": session_path, "qubits": qubits}}
 
         elif action == "debug_data":
@@ -2744,7 +3447,6 @@ def handle_flask_request(action, data):
                 # Save the plot with unique filename to avoid cache
                 import time
                 _plots_dir = PLOTS_DIR
-                import os
                 os.makedirs(_plots_dir, exist_ok=True)
                 _plot_filename = f"plot_{int(time.time() * 1000)}.png"
                 _path = os.path.join(_plots_dir, _plot_filename)
@@ -3093,17 +3795,45 @@ def handle_flask_request(action, data):
 
         elif action == "quick_status":
             """Return quick status summary for header display."""
+            import time as _time
+            import threading
+            print(f"[EVENT] quick_status starting, cid={cid}", file=sys.stderr, flush=True)
             status = {"labrad": "error", "ray": "error", "datavault": "error", "message": ""}
             try:
-                if _cxn.connected:
+                # Check connection with timeout using threading
+                cxn_result = {"connected": False, "error": None}
+
+                def check_cxn():
+                    try:
+                        cxn_result["connected"] = _cxn.connected
+                    except Exception as e:
+                        cxn_result["error"] = str(e)
+
+                check_thread = threading.Thread(target=check_cxn)
+                check_thread.daemon = True
+                check_thread.start()
+                check_thread.join(timeout=5.0)  # 5 second timeout for connection check
+
+                print(f"[EVENT] quick_status LabRAD check done, cid={cid}, alive={check_thread.is_alive()}", file=sys.stderr, flush=True)
+
+                if check_thread.is_alive():
+                    status["message"] = "LabRAD connection check timeout"
+                    return {"cid": cid, "action": action, "data": status}
+
+                if cxn_result["error"]:
+                    status["message"] = f"Cannot connect to LabRAD: {cxn_result['error'][:50]}"
+                    return {"cid": cid, "action": action, "data": status}
+
+                if cxn_result["connected"]:
                     status["labrad"] = "ok"
                 else:
                     status["message"] = "LabRAD disconnected"
                     return {"cid": cid, "action": action, "data": status}
-            except:
-                status["message"] = "Cannot connect to LabRAD"
+            except Exception as e:
+                status["message"] = f"LabRAD check failed: {str(e)[:50]}"
                 return {"cid": cid, "action": action, "data": status}
 
+            print(f"[EVENT] quick_status checking Ray, cid={cid}", file=sys.stderr, flush=True)
             try:
                 import ray as _ray
                 if _ray.is_initialized():
@@ -3113,14 +3843,25 @@ def handle_flask_request(action, data):
             except:
                 status["ray"] = "warning"
 
-            try:
-                with _labrad_lock:
+            print(f"[EVENT] quick_status acquiring lock, cid={cid}", file=sys.stderr, flush=True)
+            # Use non-blocking lock with timeout to prevent hanging
+            lock_acquired = _labrad_lock.acquire(timeout=3.0)
+            print(f"[EVENT] quick_status lock acquired={lock_acquired}, cid={cid}", file=sys.stderr, flush=True)
+            if not lock_acquired:
+                status["datavault"] = "timeout"
+                status["message"] = "DataVault lock timeout"
+            else:
+                try:
                     dv = _cxn.data_vault
                     dv.cd([''])
                     status["datavault"] = "ok"
-            except:
-                status["datavault"] = "error"
-                status["message"] = "DataVault inaccessible"
+                except Exception as e:
+                    status["datavault"] = "error"
+                    status["message"] = f"DataVault error: {str(e)[:50]}"
+                finally:
+                    _labrad_lock.release()
+
+            print(f"[EVENT] quick_status returning, cid={cid}, status={status}", file=sys.stderr, flush=True)
 
             if status["labrad"] == "ok" and status["ray"] == "ok" and status["datavault"] == "ok":
                 status["message"] = "All systems ready"
@@ -3160,7 +3901,7 @@ def handle_flask_request(action, data):
                             content = ""
                     else:
                         content = ""
-                        print(f"FLASK_LLM: result is not a dict: {type(result)}", file=sys.stderr)
+                        print(f"BACKEND_LLM: result is not a dict: {type(result)}", file=sys.stderr)
                 else:
                     import openai
 
@@ -3198,6 +3939,289 @@ def handle_flask_request(action, data):
             except Exception as e:
                 return {"cid": cid, "action": action, "error": str(e)}
 
+        # ── Image Classification ─────────────────────────────────────────────────
+        elif action == "classify_images":
+            # Batch classify images in a folder
+            folder_path = data.get("folderPath", "")
+            backend = data.get("backend", "pytorch")
+            review_threshold = float(data.get("reviewThreshold", 0.75))
+            margin_threshold = float(data.get("marginThreshold", 0.15))
+            try:
+                results = _run_image_classify_images(folder_path, backend, review_threshold, margin_threshold)
+                return {"cid": cid, "action": action, "data": {"results": results}}
+            except Exception as e:
+                return {"cid": cid, "action": action, "error": str(e)}
+
+        elif action == "classify_single":
+            # Single image inference
+            image_path = data.get("imagePath", "")
+            backend = data.get("backend", "pytorch")
+            try:
+                result = _run_image_classify_single(image_path, backend)
+                return {"cid": cid, "action": action, "data": result}
+            except Exception as e:
+                return {"cid": cid, "action": action, "error": str(e)}
+
+        elif action == "classify_latest_experiment":
+            # Workflow node: get latest experiment image from DataVault and classify
+            qubit_id = data.get("qubit", "")
+            experiment_type = data.get("experimentType", "spectroscopy")
+            backend = data.get("backend", "pytorch")
+            review_threshold = float(data.get("reviewThreshold", 0.75))
+            margin_threshold = float(data.get("marginThreshold", 0.15))
+            try:
+                result = _run_image_classify_latest_experiment(qubit_id, experiment_type, backend, review_threshold, margin_threshold)
+                return {"cid": cid, "action": action, "data": result}
+            except Exception as e:
+                return {"cid": cid, "action": action, "error": str(e)}
+
+        elif action == "get_model_info":
+            # Return model file info
+            try:
+                info = _get_classifier_model_info()
+                return {"cid": cid, "action": action, "data": info}
+            except Exception as e:
+                return {"cid": cid, "action": action, "error": str(e)}
+
+        elif action == "get_classification_stats":
+            # Return classification statistics from SQLite
+            since_hours = int(data.get("sinceHours", 24))
+            try:
+                stats = _get_classification_stats(since_hours)
+                return {"cid": cid, "action": action, "data": stats}
+            except Exception as e:
+                return {"cid": cid, "action": action, "error": str(e)}
+
+        elif action == "train_model":
+            # Trigger model training
+            epochs = int(data.get("epochs", 20))
+            batch_size = int(data.get("batchSize", 32))
+            imbalance_mode = data.get("imbalanceMode", "weighted")
+            try:
+                result = _run_image_train_model(epochs, batch_size, imbalance_mode)
+                return {"cid": cid, "action": action, "data": result}
+            except Exception as e:
+                return {"cid": cid, "action": action, "error": str(e)}
+
+        elif action == "agent_chat":
+            message = data.get("message", "")
+            mode = data.get("mode", "react")
+            context = data.get("context", {})
+            try:
+                result = _run_agent_chat(message, mode, context)
+                return {"cid": cid, "action": action, "data": result}
+            except Exception as e:
+                return {"cid": cid, "action": action, "error": str(e)}
+
+        elif action == "agent_chat_stream":
+            # Streaming version of agent_chat - outputs SSE events for real-time progress
+            message = data.get("message", "")
+            mode = data.get("mode", "react")
+            context = data.get("context", {})
+            try:
+                result = _run_agent_chat_stream(cid, message, mode, context)
+                return {"cid": cid, "action": action, "data": result}
+            except Exception as e:
+                return {"cid": cid, "action": action, "error": str(e)}
+
+        elif action == "hermes_chat":
+            # Hermes-Agent based chat
+            message = data.get("message", "")
+            model = data.get("model")
+            base_url = data.get("base_url")
+            enabled_toolsets = data.get("enabled_toolsets")
+            session_id = data.get("session_id")
+            try:
+                from hermes_runner import _run_hermes_chat
+                result = _run_hermes_chat(
+                    message=message,
+                    model=model,
+                    base_url=base_url,
+                    enabled_toolsets=enabled_toolsets,
+                    session_id=session_id,
+                )
+                return {"cid": cid, "action": action, "data": result}
+            except Exception as e:
+                import traceback
+                return {"cid": cid, "action": action, "error": str(e), "traceback": traceback.format_exc()}
+
+        elif action == "hermes_chat_stream":
+            # Streaming Hermes-Agent chat
+            message = data.get("message", "")
+            model = data.get("model")
+            base_url = data.get("base_url")
+            session_id = data.get("session_id")
+            try:
+                from hermes_runner import _run_hermes_chat_stream
+                result = _run_hermes_chat_stream(
+                    cid=cid,
+                    message=message,
+                    model=model,
+                    base_url=base_url,
+                    session_id=session_id,
+                )
+                return {"cid": cid, "action": action, "data": result}
+            except Exception as e:
+                import traceback
+                return {"cid": cid, "action": action, "error": str(e), "traceback": traceback.format_exc()}
+
+        elif action == "run_analysis":
+            # Execute analysis command on the latest dataset
+            command = data.get("command", "")
+            if not command:
+                return {"cid": cid, "action": action, "error": "command is required"}
+
+            try:
+                from io import StringIO
+                import matplotlib.pyplot as plt
+
+                # Load latest dataset
+                if _data is None:
+                    return {"cid": cid, "action": action, "error": "DataLab not initialized"}
+
+                _data.loadDataset(-1)
+
+                # Execute analysis command
+                stdout_buf = StringIO()
+                stderr_buf = StringIO()
+                old_out, old_err = sys.stdout, sys.stderr
+                sys.stdout = stdout_buf
+                sys.stderr = stderr_buf
+
+                try:
+                    analysis_globals = {
+                        "__name__": "__analysis__",
+                        "__builtins__": __builtins__,
+                        "os": os,
+                        "sys": sys,
+                        "data": _data,
+                        "qter": _qter,
+                        "dp": _data,
+                        "plt": plt,
+                    }
+                    exec(command, analysis_globals)
+                finally:
+                    sys.stdout = old_out
+                    sys.stderr = old_err
+
+                analysis_output = stdout_buf.getvalue()
+                analysis_error = stderr_buf.getvalue()
+
+                # Parse metrics from output (look for key=value patterns)
+                metrics = {}
+                for line in analysis_output.split("\n"):
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        parts = line.split("=", 1)
+                        if len(parts) == 2:
+                            key = parts[0].strip()
+                            value_str = parts[1].strip().split()[0]  # Take first part before space
+                            try:
+                                metrics[key] = float(value_str)
+                            except ValueError:
+                                pass
+
+                print(f"RUN_ANALYSIS: executed, output length={len(analysis_output)}, metrics={metrics}", file=sys.stderr, flush=True)
+
+                return {"cid": cid, "action": action, "data": {
+                    "success": True,
+                    "stdout": analysis_output,
+                    "stderr": analysis_error,
+                    "metrics": metrics,
+                }}
+
+            except Exception as e:
+                import traceback as tb
+                print(f"RUN_ANALYSIS: error={e}\n{tb.format_exc()}", file=sys.stderr, flush=True)
+                return {"cid": cid, "action": action, "error": str(e), "traceback": tb.format_exc()}
+
+        elif action == "plot_historical_dataset":
+            # Plot historical dataset with custom command
+            dataset_name = urllib.parse.unquote(data.get("name", ""))
+            path_str = urllib.parse.unquote(data.get("path", ""))
+            custom_command = data.get("command", "")
+
+            if not dataset_name:
+                return {"cid": cid, "action": action, "error": "name required"}
+
+            path_parts = [p for p in path_str.strip("/").split("/") if p] if path_str else []
+
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            plot_data = None
+            dataset_label = dataset_name
+            with _labrad_lock:
+                dv = _cxn.data_vault
+                dv.cd('')
+                dv.cd(path_parts)
+                dirs = dv.dir()
+                names = dirs[1]
+                if dataset_name not in names:
+                    return {"cid": cid, "action": action, "error": f"Dataset '{dataset_name}' not found in {names[:5]}..."}
+                idx = names.index(dataset_name) + 1
+                dv.open(idx)
+                dv_dirs = dv.dir()
+                dataset_label = dv_dirs[1][idx - 1]
+                plot_data = dv.get()
+
+            # Handle different data formats from LabRAD
+            if hasattr(plot_data, '__iter__') and not isinstance(plot_data, str):
+                if isinstance(plot_data, tuple) and len(plot_data) >= 2:
+                    x_data, y_data = plot_data[0], plot_data[1]
+                elif hasattr(plot_data, 'shape') and len(plot_data.shape) == 2:
+                    x_data = list(range(plot_data.shape[1]))
+                    y_data = plot_data[0]
+                else:
+                    x_data = list(range(len(plot_data)))
+                    y_data = plot_data
+            else:
+                x_data = list(range(len(plot_data) if hasattr(plot_data, '__len__') else 1))
+                y_data = plot_data
+
+            # Create figure and execute custom command if provided
+            fig = plt.figure(figsize=(8, 6))
+            ax = fig.add_subplot(111)
+
+            if custom_command:
+                # Execute custom command with data context
+                exec_globals = {
+                    "__name__": "__plot__",
+                    "plt": plt,
+                    "fig": fig,
+                    "ax": ax,
+                    "x": x_data,
+                    "y": y_data,
+                    "np": __import__("numpy"),
+                }
+                try:
+                    exec(custom_command, exec_globals)
+                except Exception as e:
+                    print(f"PLOT_HISTORICAL: custom command error: {e}", file=sys.stderr, flush=True)
+                    # Fall back to default plotting
+                    ax.plot(x_data, y_data, "b.-")
+                    ax.set_title(dataset_label)
+            else:
+                # Default plotting
+                ax.plot(x_data, y_data, "b.-")
+                ax.set_title(dataset_label)
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+
+            fig.tight_layout()
+            plot_file = os.path.join(PLOTS_DIR, f"hist_{abs(hash(dataset_name))}.png")
+            os.makedirs(PLOTS_DIR, exist_ok=True)
+            fig.savefig(plot_file, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+            print(f"PLOT_HISTORICAL: saved to {plot_file}", file=sys.stderr, flush=True)
+            return {"cid": cid, "action": action, "data": {
+                "plotPath": plot_file,
+                "name": dataset_label,
+                "success": True
+            }}
+
         else:
             return {"cid": cid, "action": action, "error": f"Unknown action: {action}"}
 
@@ -3205,51 +4229,1002 @@ def handle_flask_request(action, data):
         return {"cid": cid, "action": action, "error": str(e)}
 
 
-# ── Flask background thread ──────────────────────────────────────────────────
-# Flask requests are handled in a dedicated thread so they never block
+# ── Image Classification Helpers ─────────────────────────────────────────────
+
+def _get_activity_classifier():
+    """Lazily initialize and return the ActivityClassifier."""
+    global _activity_classifier, _classifier_model_path
+    if _activity_classifier is None:
+        from integration_api import ActivityClassifier
+        model_path = os.path.join(_IMAGE_CLASSIFIER_DIR, "best_model.pth")
+        _classifier_model_path = model_path
+        _activity_classifier = ActivityClassifier(model_path=model_path)
+        print(f"IMAGE_CLASSIFIER: Loaded ActivityClassifier from {model_path}", file=sys.stderr, flush=True)
+    return _activity_classifier
+
+
+def _run_image_classify_images(folder_path, backend, review_threshold, margin_threshold):
+    """Batch classify all images in a folder."""
+    import glob
+    from PIL import Image
+
+    if not os.path.exists(folder_path):
+        raise FileNotFoundError(f"Folder not found: {folder_path}")
+
+    classifier = _get_activity_classifier()
+    image_exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff")
+    image_paths = []
+    for ext in image_exts:
+        image_paths.extend(glob.glob(os.path.join(folder_path, ext)))
+        image_paths.extend(glob.glob(os.path.join(folder_path, ext.upper())))
+
+    if not image_paths:
+        raise ValueError(f"No images found in: {folder_path}")
+
+    results = []
+    for img_path in image_paths:
+        try:
+            pred = classifier.predict(img_path, backend=backend if backend != "pytorch" else "pytorch")
+            label = pred.get("label", "unknown")
+            confidence = pred.get("confidence", 0.0)
+            prob_class0 = pred.get("probabilities", [0.5, 0.5])[0]
+            prob_class1 = pred.get("probabilities", [0.5, 0.5])[1]
+            margin = abs(prob_class1 - prob_class0)
+            need_review = confidence < review_threshold or margin < margin_threshold
+            results.append({
+                "imagePath": img_path,
+                "label": label,
+                "confidence": confidence,
+                "margin": round(margin, 4),
+                "needReview": need_review,
+                "probClass0": round(prob_class0, 4),
+                "probClass1": round(prob_class1, 4),
+            })
+        except Exception as e:
+            results.append({
+                "imagePath": img_path,
+                "label": "error",
+                "confidence": 0.0,
+                "margin": 0.0,
+                "needReview": True,
+                "error": str(e),
+            })
+    return results
+
+
+def _run_image_classify_single(image_path, backend):
+    """Single image inference."""
+    classifier = _get_activity_classifier()
+    pred = classifier.predict(image_path, backend=backend if backend != "pytorch" else "pytorch")
+    label = pred.get("label", "unknown")
+    confidence = pred.get("confidence", 0.0)
+    prob_class0 = pred.get("probabilities", [0.5, 0.5])[0]
+    prob_class1 = pred.get("probabilities", [0.5, 0.5])[1]
+    margin = abs(prob_class1 - prob_class0)
+    return {
+        "imagePath": image_path,
+        "label": label,
+        "confidence": confidence,
+        "margin": round(margin, 4),
+        "probClass0": round(prob_class0, 4),
+        "probClass1": round(prob_class1, 4),
+    }
+
+
+def _run_image_classify_latest_experiment(qubit_id, experiment_type, backend, review_threshold, margin_threshold):
+    """Find latest experiment image from DataVault and classify it."""
+    # Query DataVault for the latest dataset matching qubit_id + experiment_type
+    with _labrad_lock:
+        dv = _cxn.data_vault
+        # Navigate to experiments folder
+        try:
+            dv.cd(['', 'Experiments', experiment_type])
+        except Exception:
+            pass
+
+        # List datasets, find ones matching qubit_id
+        try:
+            dirs = dv.dir()
+            datasets = dirs[1] if len(dirs) > 1 else []
+            matching = [d for d in datasets if qubit_id.lower() in d.lower()]
+        except Exception:
+            matching = []
+
+        if not matching:
+            # Try root
+            dv.cd([''])
+            try:
+                dirs = dv.dir()
+                datasets = dirs[1] if len(dirs) > 1 else []
+                matching = [d for d in datasets if qubit_id.lower() in d.lower()]
+            except Exception:
+                matching = []
+
+        if not matching:
+            raise ValueError(f"No datasets found for qubit={qubit_id}, experiment={experiment_type}")
+
+        # Get the latest
+        latest = sorted(matching)[-1]
+        # Get plot path for this dataset
+        dv.open(latest)
+        plot_name = f"{latest}.png"
+        # Look in the plots directory
+        plots_dir = os.environ.get("PLOTS_DIR", os.path.join(os.path.dirname(BACKEND_DIR), "qmclaw-web", "public", "plots"))
+        img_path = os.path.join(plots_dir, plot_name)
+
+        # Fallback: search for any image with qubit_id in name
+        if not os.path.exists(img_path):
+            import glob as _glob
+            candidates = _glob.glob(os.path.join(plots_dir, f"*{qubit_id}*.png"))
+            if candidates:
+                img_path = sorted(candidates)[-1]
+            else:
+                raise FileNotFoundError(f"Plot image not found for dataset: {latest}")
+
+    # Now classify
+    result = _run_image_classify_single(img_path, backend)
+    result["datasetName"] = latest
+    result["imagePath"] = img_path
+    # Add need_review flag
+    result["needReview"] = result["confidence"] < review_threshold or result["margin"] < margin_threshold
+    return result
+
+
+def _get_classifier_model_info():
+    """Return model file info."""
+    model_path = os.path.join(_IMAGE_CLASSIFIER_DIR, "best_model.pth")
+    if not os.path.exists(model_path):
+        return {"exists": False, "error": f"Model file not found: {model_path}"}
+
+    stat = os.stat(model_path)
+    # Try to get accuracy info from classifier
+    info = {
+        "exists": True,
+        "modelPath": model_path,
+        "fileSizeBytes": stat.st_size,
+        "fileSizeMB": round(stat.st_size / (1024 * 1024), 2),
+    }
+
+    # Try to get stats from the classifier
+    try:
+        classifier = _get_activity_classifier()
+        stats = classifier.get_stats()
+        if stats:
+            info["accuracy"] = stats.get("accuracy")
+            info["f1Score"] = stats.get("f1")
+            info["totalPredictions"] = stats.get("total_predictions")
+    except Exception as e:
+        info["stats_error"] = str(e)
+
+    return info
+
+
+def _get_classification_stats(since_hours):
+    """Return classification stats from SQLite."""
+    try:
+        classifier = _get_activity_classifier()
+        # The ActivityClassifier uses an internal SQLite db
+        # We get stats via get_stats()
+        stats = classifier.get_stats()
+        return {
+            "sinceHours": since_hours,
+            "totalPredictions": stats.get("total_predictions", 0),
+            "accuracy": stats.get("accuracy"),
+            "f1Score": stats.get("f1"),
+        }
+    except Exception as e:
+        return {"error": str(e), "sinceHours": since_hours}
+
+
+def _run_image_train_model(epochs, batch_size, imbalance_mode):
+    """Trigger model training."""
+    from image_classifier import CompleteImageClassifier
+
+    train_dir = os.path.join(_IMAGE_CLASSIFIER_DIR, "train")
+    if not os.path.exists(train_dir):
+        raise FileNotFoundError(f"Train directory not found: {train_dir}")
+
+    classifier = CompleteImageClassifier(
+        train_dir=train_dir,
+        model_save_path=os.path.join(_IMAGE_CLASSIFIER_DIR, "best_model.pth"),
+    )
+
+    # Run training
+    results = classifier.train_with_f1_monitoring(
+        epochs=epochs,
+        batch_size=batch_size,
+        imbalance_mode=imbalance_mode,
+    )
+
+    # Reset lazy-loaded classifier so it reloads new model
+    global _activity_classifier
+    _activity_classifier = None
+
+    return {
+        "success": True,
+        "epochs": epochs,
+        "finalValAccuracy": results.get("val_accuracy") if results else None,
+        "finalValF1": results.get("val_f1") if results else None,
+    }
+
+
+# ── MCP Client ───────────────────────────────────────────────────────────────
+
+class MCPClient:
+    """MCP tool caller — connects to external MCP servers (streamable-http)."""
+
+    def __init__(self, config_path=None):
+        self.config_path = config_path or self._default_config()
+        self._servers = {}
+        self._tools = {}
+        self._load_config()
+
+    def _default_config(self):
+        return os.path.join(os.path.dirname(__file__), "..", "config", "mcp_tools.json")
+
+    def _load_config(self):
+        try:
+            with open(self.config_path) as f:
+                data = json.load(f)
+        except Exception:
+            data = {"mcp_servers": [], "mcp_tools": []}
+        for srv in data.get("mcp_servers", []):
+            if srv.get("enabled"):
+                self._servers[srv["id"]] = srv
+        for tool in data.get("mcp_tools", []):
+            if tool.get("enabled"):
+                self._tools[tool["id"]] = tool
+
+    def call_tool(self, tool_id, tool_input):
+        tool = self._tools.get(tool_id)
+        if not tool:
+            return {"error": f"MCP tool not found: {tool_id}"}
+        srv = self._servers.get(tool.get("server", ""))
+        if not srv:
+            return {"error": f"MCP server not found: {tool.get('server')}"}
+        url = f"{srv['url']}/tools/{tool['remote_name']}/call"
+        payload = {"input": tool_input, "jsonrpc": "2.0", "id": 1, "method": "tools/call"}
+        try:
+            from urllib.request import urlopen, Request
+            from urllib.error import URLError
+            data_bytes = json.dumps(payload).encode("utf-8")
+            req = Request(url, data=data_bytes, headers={"Content-Type": "application/json"}, method="POST")
+            resp = urlopen(req, timeout=30)
+            result = json.loads(resp.read().decode("utf-8"))
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def list_tools(self):
+        return {tid: {k: v for k, v in t.items() if k != "server"} for tid, t in self._tools.items()}
+
+    def list_servers(self):
+        return list(self._servers.values())
+
+
+# ── Skill Manager ────────────────────────────────────────────────────────────
+
+class SkillManager:
+    """Skill manager — loads skills.json, matches user messages, executes skill steps."""
+
+    SKILLS_BASE = os.path.join(os.path.dirname(__file__), "..", "..", "skills")
+
+    def __init__(self, config_path=None):
+        self.config_path = config_path or self._default_config()
+        self.skills = self._load_skills()
+
+    def _default_config(self):
+        return os.path.join(os.path.dirname(__file__), "..", "config", "skills.json")
+
+    def _load_skills(self):
+        try:
+            with open(self.config_path) as f:
+                data = json.load(f)
+        except Exception:
+            data = {"skills": []}
+        return {s["id"]: s for s in data.get("skills", []) if s.get("enabled", True)}
+
+    def match_skill(self, user_message):
+        msg_lower = user_message.lower()
+        matched = []
+        for sid, skill in self.skills.items():
+            for kw in skill.get("trigger_keywords", []):
+                if kw.lower() in msg_lower:
+                    matched.append(skill)
+                    break
+        return matched
+
+    def execute_skill(self, skill_id, params):
+        skill = self.skills.get(skill_id)
+        if not skill:
+            return {"error": f"Skill not found: {skill_id}"}
+        steps = []
+        for step in skill.get("steps", []):
+            resolved_input = {}
+            for k, v in step.get("input", {}).items():
+                if isinstance(v, str):
+                    resolved = v
+                    for pk, pv in params.items():
+                        resolved = resolved.replace(f"{{{{{pk}}}}}", str(pv))
+                    resolved_input[k] = resolved
+                else:
+                    resolved_input[k] = v
+            steps.append({"tool": step.get("tool", ""), "input": resolved_input})
+        return {"steps": steps}
+
+    def add_skill(self, skill_data):
+        skill_data["id"] = skill_data.get("id") or skill_data.get("name", "").lower().replace(" ", "_")
+        try:
+            with open(self.config_path) as f:
+                data = json.load(f)
+        except Exception:
+            data = {"skills": []}
+        data.setdefault("skills", []).append(skill_data)
+        with open(self.config_path, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        self.skills[skill_data["id"]] = skill_data
+        return skill_data
+
+    def delete_skill(self, skill_id):
+        try:
+            with open(self.config_path) as f:
+                data = json.load(f)
+        except Exception:
+            return
+        data["skills"] = [s for s in data.get("skills", []) if s["id"] != skill_id]
+        with open(self.config_path, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        self.skills.pop(skill_id, None)
+
+    def list_skills(self):
+        return list(self.skills.values())
+
+
+# ── Quantum Agent ─────────────────────────────────────────────────────────────
+
+class QuantumAgent:
+    """Quantum Control Agent with ReAct / Plan-and-Execute / Reflexion modes."""
+
+    def __init__(self, mode="react", model_name=None, sse_cid=None):
+        self.mode = mode
+        self.model_name = model_name or "gpt-4o"
+        self.max_steps = 20
+        self.tools = self._register_tools()
+        self.sse_cid = sse_cid  # If set, emit SSE events during execution
+
+    def _emit_sse(self, event_type, data):
+        """Emit an SSE event to stdout if sse_cid is set."""
+        if self.sse_cid:
+            sse_data = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+            print(f"SSE: {self.sse_cid}", flush=True)
+            print(sse_data, flush=True)
+
+    # ── Public API ─────────────────────────────────────────────────────────────
+
+    def chat(self, message, context=None):
+        """Main entry point. Returns dict with response, steps, results."""
+        print(f"[QuantumAgent.chat] mode={self.mode}, message='{message[:100]}...'", file=sys.stderr, flush=True)
+        intent = {"task": message, "context": context or {}}
+        if self.mode == "react":
+            print(f"[QuantumAgent.chat] Running ReAct loop...", file=sys.stderr, flush=True)
+            return self._react_loop(intent)
+        elif self.mode == "plan_and_execute":
+            print(f"[QuantumAgent.chat] Running Plan-and-Execute...", file=sys.stderr, flush=True)
+            return self._plan_and_execute(intent)
+        elif self.mode == "reflexion":
+            print(f"[QuantumAgent.chat] Running Reflexion...", file=sys.stderr, flush=True)
+            return self._reflexion_loop(intent)
+        else:
+            return {"error": f"Unknown mode: {self.mode}"}
+
+    # ── Tool Registry ──────────────────────────────────────────────────────────
+
+    def _register_tools(self):
+        return {
+            "run_experiment": {
+                "fn": self._tool_run_experiment,
+                "desc": "执行量子实验，如 sq.t1, sq.spectroscopy, sq.iqraw, sq.ramsey",
+                "params": ["qubit", "fn", "params"],
+            },
+            "query_datavault": {
+                "fn": self._tool_query_datavault,
+                "desc": "从 DataVault 查询历史实验数据",
+                "params": ["qubit", "experiment_type", "limit"],
+            },
+            "analyze_results": {
+                "fn": self._tool_analyze_results,
+                "desc": "分析实验结果，提取指标（T1, SNR, fidelity 等）",
+                "params": ["dataset_name"],
+            },
+            "classify_image": {
+                "fn": self._tool_classify_image,
+                "desc": "对实验图像进行 ML 分类",
+                "params": ["image_path"],
+            },
+            "llm_reasoning": {
+                "fn": self._tool_llm_reasoning,
+                "desc": "LLM 推理/决策，生成建议",
+                "params": ["prompt"],
+            },
+            "mcp_call": {
+                "fn": self._tool_mcp_call,
+                "desc": "调用外部 MCP 工具（文献检索、设备控制等）",
+                "params": ["tool_id", "input"],
+            },
+            "match_skill": {
+                "fn": self._tool_match_skill,
+                "desc": "根据用户消息匹配已学习的技能",
+                "params": ["message"],
+            },
+            "execute_skill": {
+                "fn": self._tool_execute_skill,
+                "desc": "执行一个已学习的技能模板",
+                "params": ["skill_id", "params"],
+            },
+        }
+
+    def _execute_tool(self, tool_name, tool_input):
+        """Execute a tool by name with given input dict."""
+        tool = self.tools.get(tool_name)
+        if not tool:
+            return {"error": f"Unknown tool: {tool_name}"}
+        try:
+            return tool["fn"](tool_input)
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ── ReAct Loop ─────────────────────────────────────────────────────────────
+
+    def _react_loop(self, intent):
+        print(f"[ReAct] Starting react loop, max_steps={self.max_steps}", file=sys.stderr, flush=True)
+        self._emit_sse("status", {"message": f"Starting ReAct loop (max {self.max_steps} steps)..."})
+        steps = []
+        observation = ""
+        for step_idx in range(self.max_steps):
+            step_num = step_idx + 1
+            print(f"[ReAct] Step {step_num}/{self.max_steps}", file=sys.stderr, flush=True)
+            self._emit_sse("step_start", {"step": step_num, "max_steps": self.max_steps})
+
+            prompt = self._build_react_prompt(intent, steps, observation)
+            self._emit_sse("thinking", {"step": step_num, "message": "Calling LLM to analyze situation..."})
+            print(f"[ReAct] Calling _call_llm...", file=sys.stderr, flush=True)
+            response = self._call_llm(prompt)
+            print(f"[ReAct] _call_llm returned, response length: {len(response)}", file=sys.stderr, flush=True)
+            parsed = self._parse_llm_response(response)
+            print(f"[ReAct] parsed type: {parsed.get('type')}, tool: {parsed.get('tool')}", file=sys.stderr, flush=True)
+
+            self._emit_sse("llm_response", {"step": step_num, "type": parsed.get("type"), "tool": parsed.get("tool")})
+
+            if parsed["type"] == "finish":
+                final_content = parsed.get("content", "")
+                print(f"[ReAct] Finish received, content length={len(final_content)}, content={final_content[:200]}...", file=sys.stderr, flush=True)
+                self._emit_sse("status", {"message": "Generating final response..."})
+                return self._summarize(intent, steps, final_content)
+
+            tool_name = parsed.get("tool", "")
+            tool_input = parsed.get("input", {})
+            self._emit_sse("tool_call", {"step": step_num, "tool": tool_name, "input": tool_input})
+            print(f"[ReAct] Executing tool: {tool_name}", file=sys.stderr, flush=True)
+            observation = self._execute_tool(tool_name, tool_input)
+            print(f"[ReAct] Tool executed, observation type: {type(observation)}", file=sys.stderr, flush=True)
+            steps.append({
+                "thought": parsed.get("thought", ""),
+                "tool": tool_name,
+                "input": tool_input,
+                "observation": observation,
+            })
+            self._emit_sse("tool_result", {"step": step_num, "tool": tool_name, "result": str(observation)[:200]})
+        print(f"[ReAct] Max steps reached, summarizing...", file=sys.stderr, flush=True)
+        self._emit_sse("status", {"message": "Max steps reached, generating response..."})
+        return self._summarize(intent, steps, "执行达到最大步数限制")
+
+    # ── Plan-and-Execute ───────────────────────────────────────────────────────
+
+    def _plan_and_execute(self, intent):
+        # Planning phase
+        plan_prompt = self._build_plan_prompt(intent)
+        plan_response = self._call_llm(plan_prompt)
+        safe_plan_response = _sanitize_string(plan_response)
+        try:
+            plan_steps = json.loads(safe_plan_response)
+        except Exception:
+            plan_steps = [{"tool": "llm_reasoning", "input": {"prompt": safe_plan_response}}]
+
+        # Execution phase
+        steps = []
+        for step in plan_steps:
+            tool_name = step.get("tool", "")
+            tool_input = step.get("input", {})
+            observation = self._execute_tool(tool_name, tool_input)
+            steps.append({
+                "tool": tool_name,
+                "input": tool_input,
+                "observation": observation,
+            })
+        return self._summarize(intent, steps, None)
+
+    # ── Reflexion Loop ─────────────────────────────────────────────────────────
+
+    def _reflexion_loop(self, intent):
+        # Reflexion uses plan_and_execute as base, then reviews each step
+        result = self._plan_and_execute(intent)
+        steps = result.get("steps", [])
+        for i, step in enumerate(steps):
+            observation = step.get("observation", "")
+            reflection_prompt = (
+                f"任务：{intent['task']}\n"
+                f"步骤 {i+1}：{step['tool']}({step.get('input', {})})\n"
+                f"结果：{observation}\n"
+                f"这个结果是否正确？有无错误？如果正确回复 OK，如果有错误说明问题并给出修正建议："
+            )
+            reflection = self._call_llm(reflection_prompt)
+            step["reflection"] = reflection
+            if not self._is_ok(reflection):
+                # Retry this step
+                retry_input = step.get("input", {})
+                retry_obs = self._execute_tool(step["tool"], retry_input)
+                step["observation"] = retry_obs
+                step["retried"] = True
+        return result
+
+    # ── LLM Helpers ────────────────────────────────────────────────────────────
+
+    def _call_llm(self, prompt, temperature=0.3):
+        """Call LLM with a text prompt. Returns the response text."""
+        import traceback as _traceback
+        # Check both if key exists AND if it's non-empty
+        minimax_key = os.environ.get("MINIMAX_API_KEY", "")
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        print(f"[Agent LLM] Env check - MINIMAX_API_KEY len={len(minimax_key)}, OPENAI_API_KEY len={len(openai_key)}", file=sys.stderr, flush=True)
+
+        last_error = "Unknown error"
+        last_error_type = None
+
+        # Try MiniMax first
+        if minimax_key:
+            print(f"[Agent LLM] Calling MiniMax API with key starting: {minimax_key[:8]}...", file=sys.stderr, flush=True)
+            try:
+                result = call_minimax_api(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="MiniMax-M2.7",
+                    api_key=minimax_key,
+                    temperature=temperature,
+                    max_tokens=2048,
+                )
+                if result and isinstance(result, dict):
+                    choices = result.get("choices", [])
+                    if choices and len(choices) > 0:
+                        msg = choices[0].get("message", {})
+                        if isinstance(msg, dict):
+                            content = msg.get("content", "")
+                            if content:
+                                print(f"[Agent LLM] MiniMax success, content length={len(content)}", file=sys.stderr, flush=True)
+                                return content
+                            else:
+                                last_error = "Empty content"
+                        else:
+                            last_error = f"Message is not dict: {type(msg)}"
+                    else:
+                        last_error = f"No choices in response: {result}"
+                else:
+                    last_error = f"Invalid response type: {type(result)}"
+            except Exception as e:
+                last_error = str(e)
+                last_error_type = type(e).__name__
+                print(f"[Agent LLM] MiniMax error ({last_error_type}): {last_error}", file=sys.stderr, flush=True)
+
+        print(f"[Agent LLM] Trying OpenAI fallback...", file=sys.stderr, flush=True)
+        if openai_key:
+            try:
+                from urllib.request import urlopen, Request
+                endpoint = "https://api.openai.com/v1/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 2048,
+                    "temperature": temperature,
+                }
+                req = Request(endpoint, data=json.dumps(payload).encode(), headers=headers)
+                resp = urlopen(req, timeout=60)
+                result = json.loads(resp.read())
+                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if content:
+                    return content
+            except Exception as e:
+                last_error = str(e)
+                last_error_type = type(e).__name__
+                print(f"[Agent LLM] OpenAI error ({last_error_type}): {last_error}", file=sys.stderr, flush=True)
+
+        # Return the actual error, not misleading "no API key" message
+        if last_error_type in ("TimeoutError", "URLError", "HTTPError"):
+            return f"[LLM Error: Network error - {last_error_type}: {last_error}]"
+        elif not minimax_key and not openai_key:
+            return "[LLM Error: No API key configured. Set MINIMAX_API_KEY or OPENAI_API_KEY environment variable.]"
+        else:
+            return f"[LLM Error: {last_error}]"
+
+    def _build_react_prompt(self, intent, steps, observation):
+        tools_desc = "\n".join(
+            f"- {name}: {t['desc']} (params: {', '.join(t['params'])})"
+            for name, t in self.tools.items()
+        )
+        steps_text = ""
+        if steps:
+            for s in steps:
+                steps_text += f"  - [{s['tool']}] input={s['input']} → {s['observation']}\n"
+        ctx = intent.get("context", {})
+        ctx_str = ", ".join(f"{k}={v}" for k, v in ctx.items()) if ctx else "无"
+
+        return f"""你是一个量子测控智能体。根据用户任务按以下格式选择下一步操作：
+
+任务：{intent['task']}
+上下文：{ctx_str}
+历史步骤：
+{steps_text or '  (空)'}
+当前观察：{observation or '(开始)'}
+
+可用工具：
+{tools_desc}
+
+重要：只返回一个 JSON 对象，不要返回多个，不要在 JSON 前后添加任何文字说明。
+执行动作：
+{{"type": "action", "thought": "你的思考", "tool": "工具名", "input": {{"参数": "值"}}}}
+任务完成：
+{{"type": "finish", "content": "执行结果总结"}}
+"""
+
+    def _build_plan_prompt(self, intent):
+        tools_desc = "\n".join(
+            f"- {name}: {t['desc']} (params: {', '.join(t['params'])})"
+            for name, t in self.tools.items()
+        )
+        ctx = intent.get("context", {})
+        ctx_str = ", ".join(f"{k}={v}" for k, v in ctx.items()) if ctx else "无"
+
+        return f"""你是一个量子测控智能体。请将以下任务拆解为执行步骤列表：
+
+任务：{intent['task']}
+上下文：{ctx_str}
+
+可用工具：
+{tools_desc}
+
+请返回 JSON 数组，每个元素描述一个步骤：
+[{{"tool": "工具名", "input": {{"参数": "值"}}}}, ...]
+仅返回 JSON，不要其他内容。"""
+
+    def _parse_llm_response(self, response):
+        """Parse LLM text response to extract action/finish.
+
+        Handles cases where LLM returns multiple JSON blocks or extra text.
+        Only parses the first valid JSON object.
+        """
+        # Sanitize the response first to remove problematic surrogate characters
+        safe_response = _sanitize_string(response)
+        print(f"[ParseLLM] Raw response length: {len(safe_response)}, preview: {safe_response[:200]}", file=sys.stderr, flush=True)
+
+        try:
+            # Strategy: find first '{' and try to parse incrementally
+            # This handles cases where LLM returns multiple JSON blocks
+            start = safe_response.find("{")
+            if start < 0:
+                print("[ParseLLM] No JSON object found, using fallback", file=sys.stderr, flush=True)
+                return {"type": "finish", "content": safe_response}
+
+            # Find the first complete JSON object starting from position start
+            # Use a depth counter to find matching closing brace
+            depth = 0
+            json_end = -1
+            for i in range(start, len(safe_response)):
+                c = safe_response[i]
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        json_end = i + 1
+                        break
+
+            if json_end < 0:
+                print("[ParseLLM] Incomplete JSON object, using fallback", file=sys.stderr, flush=True)
+                return {"type": "finish", "content": safe_response}
+
+            json_str = safe_response[start:json_end]
+            obj = json.loads(json_str)
+            print(f"[ParseLLM] Successfully parsed first JSON: type={obj.get('type')}, tool={obj.get('tool')}", file=sys.stderr, flush=True)
+            return obj
+
+        except json.JSONDecodeError as e:
+            print(f"[ParseLLM] JSON parse failed: {e}, response={safe_response[:200]}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[ParseLLM] Unexpected error: {e}", file=sys.stderr, flush=True)
+
+        # Fallback: treat as finish with the raw response
+        print(f"[ParseLLM] Using fallback for response: {safe_response[:100]}", file=sys.stderr, flush=True)
+        return {"type": "finish", "content": safe_response}
+
+    def _is_ok(self, reflection_text):
+        """Check if reflection indicates success."""
+        return "ok" in reflection_text[:10].lower() or "正确" in reflection_text[:20]
+
+    def _summarize(self, intent, steps, final_content):
+        """Build final result dict."""
+        results = {}
+        charts = []
+        for step in steps:
+            obs = step.get("observation", {})
+            if isinstance(obs, dict):
+                if "metrics" in obs:
+                    results.update(obs["metrics"])
+                if "plot_path" in obs:
+                    charts.append(obs["plot_path"])
+        # Sanitize final_content to remove any problematic characters
+        safe_content = _sanitize_string(final_content) if final_content else "执行完成"
+        return {
+            "response": safe_content,
+            "steps": steps,
+            "results": results,
+            "charts": charts,
+        }
+
+    # ── Tool Implementations ───────────────────────────────────────────────────
+
+    def _tool_run_experiment(self, inp):
+        """Execute a quantum experiment. Reuses run_workflow_node logic."""
+        qubit = inp.get("qubit", "")
+        fn = inp.get("fn", "sq.iqraw")
+        params = inp.get("params", {})
+        if not qubit:
+            return {"error": "qubit 参数缺失"}
+        try:
+            result = _run_single_experiment(qubit, fn, params)
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _tool_query_datavault(self, inp):
+        """Query DataVault for historical experiment data."""
+        qubit = inp.get("qubit", "")
+        exp_type = inp.get("experiment_type", "")
+        limit = int(inp.get("limit", 5))
+        try:
+            with _labrad_lock:
+                dv = _cxn.data_vault
+                dv.cd([''])
+                try:
+                    dv.cd(['', 'Experiments', exp_type])
+                except Exception:
+                    pass
+                dirs = dv.dir()
+                datasets = dirs[1] if len(dirs) > 1 else []
+                matching = [d for d in datasets if qubit.lower() in d.lower()]
+                recent = sorted(matching)[-limit:] if matching else []
+                return {"datasets": recent, "count": len(recent)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _tool_analyze_results(self, inp):
+        """Analyze experiment results and extract metrics."""
+        dataset_name = inp.get("dataset_name", "")
+        try:
+            with _labrad_lock:
+                dv = _cxn.data_vault
+                if dataset_name:
+                    dv.open(dataset_name)
+                _data.loadDataset(-1)
+                metrics = parse_metrics("")  # Will be populated by fitting
+                # Run the analysis command if available
+                from lqms.data_process import dataAnalysisCore as dc
+                analysis = dc.DataLab(_current_session_path, dv, dv_type='data_vault')
+                analysis.loadDataset(-1)
+                metrics = parse_metrics(str(analysis.data))
+                return {"metrics": metrics}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _tool_classify_image(self, inp):
+        """Classify an experiment image using ML model."""
+        image_path = inp.get("image_path", "")
+        try:
+            result = _run_image_classify_single(image_path, "pytorch")
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _tool_llm_reasoning(self, inp):
+        """Simple LLM reasoning tool."""
+        prompt = inp.get("prompt", "")
+        result = self._call_llm(prompt, temperature=0.5)
+        return {"reasoning": result}
+
+    def _tool_mcp_call(self, inp):
+        """Call an external MCP tool."""
+        mcp = MCPClient()
+        return mcp.call_tool(inp.get("tool_id", ""), inp.get("input", {}))
+
+    def _tool_match_skill(self, inp):
+        """Match skills based on user message."""
+        mgr = SkillManager()
+        matched = mgr.match_skill(inp.get("message", ""))
+        return {"matched_skills": matched}
+
+    def _tool_execute_skill(self, inp):
+        """Execute a learned skill template."""
+        mgr = SkillManager()
+        return mgr.execute_skill(inp.get("skill_id", ""), inp.get("params", {}))
+
+
+def _run_single_experiment(qubit, fn, params):
+    """Run a single experiment and return results. Reuses experiment node logic."""
+    fn_name = fn if fn.startswith("sq.") else f"sq.{fn}"
+    # Build call code using the qubit object from _s registry
+    call_code = f"{fn_name}(_current_qubit, {', '.join(f'{k}={repr(v)}' for k, v in params.items())})"
+
+    # Get qubit object from _all_qubits (actual Qubit objects)
+    qubit_obj = None
+    if isinstance(qubit, str) and qubit in _all_qubits:
+        qubit_obj = _all_qubits[qubit]
+    if qubit_obj is None and _s and qubit in _s:
+        qubit_obj = _s[qubit]  # Fallback to _s (may be RegistryWrapper)
+    if qubit_obj is None:
+        return {"error": f"Qubit not found: {qubit}"}
+
+    stdout_buf = StringIO()
+    stderr_buf = StringIO()
+    old_out, old_err = sys.stdout, sys.stderr
+    exec_globals = {
+        "__builtins__": __builtins__,
+        "sys": sys,
+        "sq": _sq,
+        "_s": _s,
+        "_current_qubit": qubit_obj,
+    }
+    try:
+        sys.stdout = stdout_buf
+        sys.stderr = stderr_buf
+        exec(call_code, exec_globals)
+        sys.stdout = old_out
+        sys.stderr = old_err
+        stdout = stdout_buf.getvalue()
+    except Exception:
+        sys.stdout = old_out
+        sys.stderr = old_err
+        stdout = stdout_buf.getvalue() + f"\nError: {traceback.format_exc()}"
+        return {"error": stdout}
+
+    metrics = parse_metrics(stdout)
+    return {"stdout": stdout, "metrics": metrics}
+
+
+def _run_agent_chat(message, mode, context):
+    """Top-level handler for agent_chat backend action."""
+    print(f"[Agent] Starting agent_chat: message='{message[:50]}...', mode={mode}", file=sys.stderr, flush=True)
+
+    # Debug: Check environment variables - print all keys containing API or KEY
+    api_keys = [k for k in os.environ.keys() if 'KEY' in k.upper() or 'API' in k.upper()]
+    print(f"[Agent] API-related env keys: {api_keys}", file=sys.stderr, flush=True)
+
+    # Try to load .env file directly in Python if MINIMAX_API_KEY is not set
+    if not os.environ.get("MINIMAX_API_KEY"):
+        env_file = os.path.join(os.path.dirname(__file__), "..", ".env")
+        print(f"[Agent] MINIMAX_API_KEY not in env, trying to load from: {env_file}", file=sys.stderr, flush=True)
+        if os.path.exists(env_file):
+            try:
+                with open(env_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            os.environ[key.strip()] = value.strip()
+                print(f"[Agent] Loaded .env, MINIMAX_API_KEY now: {bool(os.environ.get('MINIMAX_API_KEY'))}", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[Agent] Failed to load .env: {e}", file=sys.stderr, flush=True)
+        else:
+            print(f"[Agent] .env file does not exist at: {env_file}", file=sys.stderr, flush=True)
+
+    ctx = dict(context) if context else {}
+    model_name = ctx.pop("model_name", None)
+    print(f"[Agent] Creating QuantumAgent: mode={mode}, model_name={model_name}", file=sys.stderr, flush=True)
+    agent = QuantumAgent(mode=mode, model_name=model_name)
+    print(f"[Agent] Calling agent.chat()...", file=sys.stderr, flush=True)
+    result = agent.chat(message, ctx)
+    print(f"[Agent] agent.chat() completed, result keys: {list(result.keys()) if isinstance(result, dict) else 'not a dict'}", file=sys.stderr, flush=True)
+    return result
+
+
+def _emit_sse(cid, event_type, data):
+    """Emit an SSE event to stdout for streaming to frontend."""
+    sse_data = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    print(f"SSE: {cid}", flush=True)
+    print(sse_data, flush=True)
+
+
+def _run_agent_chat_stream(cid, message, mode, context):
+    """Streaming version of agent_chat - emits SSE events for real-time progress."""
+    print(f"[Agent] Starting agent_chat_stream: message='{message[:50]}...', mode={mode}, cid={cid}", file=sys.stderr, flush=True)
+
+    # Load API key if needed
+    if not os.environ.get("MINIMAX_API_KEY"):
+        env_file = os.path.join(os.path.dirname(__file__), "..", ".env")
+        if os.path.exists(env_file):
+            try:
+                with open(env_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            os.environ[key.strip()] = value.strip()
+                print(f"[Agent] Loaded .env", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[Agent] Failed to load .env: {e}", file=sys.stderr, flush=True)
+
+    ctx = dict(context) if context else {}
+    model_name = ctx.pop("model_name", None)
+    _emit_sse(cid, "status", {"message": "Initializing agent..."})
+    agent = QuantumAgent(mode=mode, model_name=model_name, sse_cid=cid)
+    _emit_sse(cid, "status", {"message": "Starting conversation..."})
+    result = agent.chat(message, ctx)
+    _emit_sse(cid, "done", result)
+    print(f"[Agent] agent_chat_stream completed, result keys: {list(result.keys()) if isinstance(result, dict) else 'not a dict'}", file=sys.stderr, flush=True)
+    return result
+
+
+# ── backend background thread ──────────────────────────────────────────────────
+# backend requests are handled in a dedicated thread so they never block
 # while a job/experiment is running in the main thread.
 
 import threading, queue as _queue
 
-_flask_queue: _queue.Queue = _queue.Queue()
-_flask_results: dict = {}  # cid -> result (populated by background thread)
+_backend_queue: _queue.Queue = _queue.Queue()
+_backend_results: dict = {}  # cid -> result (populated by background thread)
 _results_lock = threading.Lock()
 _stdin_lock = threading.Lock()  # protect stdout writes
 _labrad_lock = threading.Lock()  # protect shared LabRAD connection
 
-def _flask_worker():
-    """Background thread: process Flask requests from queue, write results."""
-    print("FLASK_WORKER: Started", file=sys.stderr, flush=True)
+def _backend_worker():
+    """Background thread: process backend requests from queue, write results."""
+    # Debug: check environment in background thread
+    api_keys_in_thread = [k for k in os.environ.keys() if 'KEY' in k.upper() or 'API' in k.upper()]
+    minimax_in_thread = os.environ.get("MINIMAX_API_KEY", "")
+    print(f"BACKEND_WORKER: Started, API keys={api_keys_in_thread}, MINIMAX first10='{minimax_in_thread[:10] if minimax_in_thread else 'EMPTY'}'", file=sys.stderr, flush=True)
     while True:
         try:
-            item = _flask_queue.get(timeout=0.5)
+            item = _backend_queue.get(timeout=0.5)
             if item is None:
                 break  # shutdown signal
             cid, action, data = item
-            print(f"FLASK_WORKER: Processing cid={cid} action={action}", file=sys.stderr, flush=True)
+            print(f"BACKEND_WORKER: Processing cid={cid} action={action}", file=sys.stderr, flush=True)
+            # Debug: show MINIMAX key when processing agent_chat
+            if action == "agent_chat":
+                minimax_key = os.environ.get("MINIMAX_API_KEY", "")
+                print(f"BACKEND_WORKER: agent_chat MINIMAX_API_KEY len={len(minimax_key)}, first10='{minimax_key[:10] if minimax_key else 'EMPTY'}'", file=sys.stderr, flush=True)
             try:
-                result = handle_flask_request(action, data)
-                print(f"FLASK_WORKER: handle_flask_request returned cid={cid}", file=sys.stderr, flush=True)
+                result = handle_backend_request(action, data)
+                print(f"BACKEND_WORKER: handle_backend_request returned cid={cid}", file=sys.stderr, flush=True)
             except Exception as e:
                 import traceback
                 result = {"cid": cid, "action": action, "error": str(e)}
-                print(f"FLASK_WORKER: Exception: {e}", file=sys.stderr, flush=True)
-                print(f"FLASK_WORKER: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+                print(f"BACKEND_WORKER: Exception: {e}", file=sys.stderr, flush=True)
+                print(f"BACKEND_WORKER: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
             with _results_lock:
-                _flask_results[cid] = result
+                _backend_results[cid] = result
                 # Write result directly so Express can collect it
                 with _stdin_lock:
-                    print(f"FLASK_WORKER: Writing result for cid={cid}", file=sys.stderr, flush=True)
+                    print(f"BACKEND_WORKER: Writing result for cid={cid}", file=sys.stderr, flush=True)
                     print(json.dumps(result), flush=True)
-                    print(f"FLASK_WORKER: Done writing result for cid={cid}", file=sys.stderr, flush=True)
-            _flask_queue.task_done()
+                    print(f"BACKEND_WORKER: Done writing result for cid={cid}", file=sys.stderr, flush=True)
+            _backend_queue.task_done()
         except _queue.Empty:
             continue
         except Exception:
             pass
 
-_flask_thread = threading.Thread(target=_flask_worker, daemon=True)
-_flask_thread.start()
+_backend_thread = threading.Thread(target=_backend_worker, daemon=True)
+_backend_thread.start()
 
 
 # ── Event loop ────────────────────────────────────────────────────────────────
@@ -3259,9 +5234,18 @@ def check_workflow_cancel(workflow_id=None):
     return os.path.exists(flag)
 
 print("READY", file=sys.stderr, flush=True)
+print('{"ready": true, "id": null}', flush=True)
+sys.stderr.flush()
+sys.stdout.flush()
 
-# Process Flask requests in the main thread to avoid threading issues with stdin
+# Process backend requests in the main thread to avoid threading issues with stdin
+print("[EVENT_LOOP] About to enter stdin loop, sys.stdin type:", type(sys.stdin), file=sys.stderr, flush=True)
+print("[EVENT_LOOP] sys.stdin.isatty():", sys.stdin.isatty(), file=sys.stderr, flush=True)
+print("[EVENT_LOOP] sys.stdin.fileno():", sys.stdin.fileno() if hasattr(sys.stdin, 'fileno') else 'N/A', file=sys.stderr, flush=True)
+sys.stdout.flush()
+print("[EVENT_LOOP] Starting event loop...", file=sys.stderr, flush=True)
 for line in sys.stdin:
+    print(f"[EVENT_LOOP] Received line: {line[:200]}", file=sys.stderr, flush=True)
     line = line.strip()
     if not line:
         continue
@@ -3304,23 +5288,39 @@ for line in sys.stdin:
             result = run_workflow_node(node_data, node_results, workflow_ctx, check_workflow_cancel)
             print(json.dumps(result), flush=True)
 
-        elif msg_type == "flask":
-            # Process Flask requests in the main thread (non-blocking)
+        elif msg_type == "backend":
+            # Process backend requests - long-running tasks go to background queue
             cid = obj.get("cid", "")
             action = obj.get("action", "health")
-            flask_data = obj.get("data", {})  # Extract the data field
-            flask_data["cid"] = cid  # Pass cid in data for handle_flask_request
-            try:
-                result = handle_flask_request(action, flask_data)
-                output = json.dumps(result)
-                sys.stdout.write(output + "\n")
-                sys.stdout.flush()
-            except Exception as e:
-                import traceback
-                result = {"cid": cid, "action": action, "error": str(e)}
-                output = json.dumps(result)
-                sys.stdout.write(output + "\n")
-                sys.stdout.flush()
+            backend_data = obj.get("data", {})  # Extract the data field
+            backend_data["cid"] = cid  # Pass cid in data for handle_backend_request
+            print(f"[EVENT] backend request: cid={cid}, action={action}", file=sys.stderr, flush=True)
+
+            # Long-running actions that should run in background thread
+            LONG_RUNNING_ACTIONS = {"agent_chat", "agent_chat_stream", "hermes_chat", "hermes_chat_stream"}
+
+            if action in LONG_RUNNING_ACTIONS:
+                # Put in background queue for async processing
+                print(f"[EVENT] Queuing {action} to background thread, cid={cid}", file=sys.stderr, flush=True)
+                _backend_queue.put((cid, action, backend_data))
+                # Don't write response here - background thread will do it
+            else:
+                # Fast actions: process in main thread (non-blocking)
+                try:
+                    result = handle_backend_request(action, backend_data)
+                    print(f"[EVENT] handle_backend_request returned, cid={cid}", file=sys.stderr, flush=True)
+                    output = json.dumps(result)
+                    sys.stdout.write(output + "\n")
+                    sys.stdout.flush()
+                    print(f"[EVENT] Response written for cid={cid}", file=sys.stderr, flush=True)
+                except Exception as e:
+                    import traceback
+                    print(f"[EVENT] Exception in backend handling: {e}", file=sys.stderr, flush=True)
+                    print(traceback.format_exc(), file=sys.stderr, flush=True)
+                    result = {"cid": cid, "action": action, "error": str(e)}
+                    output = json.dumps(result)
+                    sys.stdout.write(output + "\n")
+                    sys.stdout.flush()
             continue
 
         else:

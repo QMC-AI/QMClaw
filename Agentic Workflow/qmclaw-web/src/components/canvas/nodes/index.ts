@@ -14,6 +14,7 @@ import NotifyNode from './NotifyNode';
 import DefaultNode from './DefaultNode';
 import DecisionNode from './DecisionNode';
 import ImageAnalysisNode from './ImageAnalysisNode';
+import ImageClassificationNode from './ImageClassificationNode';
 import AdjustParamsNode from './AdjustParamsNode';
 import ContextNode from './ContextNode';
 import CodeNode from './CodeNode';
@@ -28,6 +29,7 @@ export const nodeTypes = {
   notify: NotifyNode,
   decision: DecisionNode,
   image_analysis: ImageAnalysisNode,
+  image_classification: ImageClassificationNode,
   adjust_params: AdjustParamsNode,
   context: ContextNode,
   code: CodeNode,
@@ -35,4 +37,4 @@ export const nodeTypes = {
   workflowNode: DefaultNode,
 };
 
-export { ExperimentNode, PrintNode, AnalyzeNode, QualityGateNode, WhileNode, ParallelNode, NotifyNode, DefaultNode, DecisionNode, ImageAnalysisNode, AdjustParamsNode, ContextNode, CodeNode };
+export { ExperimentNode, PrintNode, AnalyzeNode, QualityGateNode, WhileNode, ParallelNode, NotifyNode, DefaultNode, DecisionNode, ImageAnalysisNode, ImageClassificationNode, AdjustParamsNode, ContextNode, CodeNode };

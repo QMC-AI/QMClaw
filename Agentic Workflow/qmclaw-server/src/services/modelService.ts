@@ -179,7 +179,7 @@ function readConfig(): ModelsConfig | null {
     const content = fs.readFileSync(MODELS_CONFIG_FILE, 'utf-8');
     return JSON.parse(content) as ModelsConfig;
   } catch (e) {
-    console.error(`[model-service] Failed to read config: ${e}`);
+    console.error(`[Database] Failed to read config: ${e}`);
     return null;
   }
 }
@@ -261,7 +261,7 @@ export function saveModel(
   }
 
   writeConfig(config);
-  console.log(`[model-service] Saved model: ${modelId} (${model.name})`);
+  console.log(`[Database] Saved model: ${modelId} (${model.name})`);
   return model;
 }
 
@@ -279,7 +279,7 @@ export function deleteModel(id: string): boolean {
 
   config.models.splice(index, 1);
   writeConfig(config);
-  console.log(`[model-service] Deleted model: ${id}`);
+  console.log(`[Database] Deleted model: ${id}`);
   return true;
 }
 
@@ -295,7 +295,7 @@ export function initializeDefaultModels(): void {
 
   if (!config) {
     // 配置文件不存在，创建默认模型
-    console.log('[model-service] Initializing default models...');
+    console.log('[Database] Initializing default models...');
     const now = new Date().toISOString();
     const models: LLMModel[] = DEFAULT_MODELS.map((m, i) => ({
       ...m,
@@ -304,7 +304,7 @@ export function initializeDefaultModels(): void {
       updatedAt: now,
     }));
     writeConfig({ models });
-    console.log(`[model-service] Created ${DEFAULT_MODELS.length} default models`);
+    console.log(`[Database] Created ${DEFAULT_MODELS.length} default models`);
     return;
   }
 
@@ -328,7 +328,7 @@ export function initializeDefaultModels(): void {
 
   if (added > 0) {
     writeConfig(config);
-    console.log(`[model-service] Added ${added} new default model(s)`);
+    console.log(`[Database] Added ${added} new default model(s)`);
   }
-  console.log(`[model-service] Loaded ${config.models.length} model(s)`);
+  console.log(`[Database] Loaded ${config.models.length} model(s)`);
 }

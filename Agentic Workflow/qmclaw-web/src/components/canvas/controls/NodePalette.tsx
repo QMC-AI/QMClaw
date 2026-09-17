@@ -77,6 +77,7 @@ const nodeTypes: Omit<NodePaletteItemProps, 'onClick'>[] = [
   { type: 'decision', label: 'LLM Decision', icon: '🧠', description: 'AI-powered branch' },
   { type: 'adjust_params', label: 'Adjust Params', icon: '⚙️', description: 'Update qubit params' },
   { type: 'image_analysis', label: 'Image Analysis', icon: '🖼', description: 'Analyze experiment plot' },
+  { type: 'image_classification', label: 'Image Classification', icon: '🧠', description: 'ML image classification' },
   { type: 'notify', label: 'Notify', icon: '📢', description: 'Send notification' },
   { type: 'code', label: 'Code', icon: '🐍', description: 'Run Python code' },
 ];

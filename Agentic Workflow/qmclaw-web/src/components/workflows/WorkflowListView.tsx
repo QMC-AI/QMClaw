@@ -25,6 +25,7 @@ const NODE_TYPE_ICONS: Record<string, string> = {
   analyze: "📊",
   adjust_params: "⚙️",
   image_analysis: "🖼",
+  image_classification: "🧠",
   notify: "📢",
   code: "🐍",
   print: "📝",

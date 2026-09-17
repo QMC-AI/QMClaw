@@ -90,33 +90,7 @@ D:\qmclaw\
     └── measure_scripts.py       # 主测控脚本
 ```
 
-## 一键启动（推荐）
-
-### 方式一：双击启动器 ⚡
-
-直接双击 `一键启动.cmd` 文件，一键启动所有服务：
-
-```powershell
-D:\QMClaw\一键启动.cmd
-```
-
-启动器会：
-1. 检查 LabRAD 服务器状态
-2. 自动启动 Express 后端（端口 3002）
-3. 自动启动 Next.js 前端（端口 3001）
-4. 打开浏览器访问 http://localhost:3001
-
-### 方式二：Python 启动管理器
-
-```powershell
-cd D:\QMClaw
-python start_manager.py
-```
-
-支持参数：
-- `--check-only` - 仅检查服务状态，不启动
-
-### 方式三：分别启动（开发模式）
+### 方式一：分别启动（开发模式）
 
 手动启动服务
 终端 1 - 后端 (端口 3002)
@@ -132,16 +106,6 @@ set PATH="C:\Program Files\AutoClaw\resources\node;%PATH%"
 npm run dev
 访问地址: http://localhost:3001
 
-### 方式四：使用 AutoClaw IDE
-
-AutoClaw 会自动启动后端服务（Express），只需启动前端：
-
-```powershell
-cd D:\qmclaw\qmclaw-web
-npm run dev
-```
-
-> **注意**：AutoClaw 管理的后端进程 PID 固定，关闭 VSCode 时后端会继续运行。
 
 ### 启动后访问
 
@@ -193,6 +157,128 @@ $env:PYTHON_BIN = "C:\Users\lqcs\Programs\Python\Python311\python.exe"
 $env:PLOTS_DIR = "D:\qmclaw\qmclaw-web\public\plots"
 $env:OPENAI_API_KEY = "your-api-key"  # 用于工作流中的 LLM 决策
 ```
+
+---
+
+## 安装依赖
+
+### 1. 安装 Node.js
+
+下载并安装 Node.js (LTS 版本 v18+)：https://nodejs.org/
+
+验证安装：
+```bash
+node -v
+npm -v
+```
+
+> **Windows PowerShell 用户**：如果遇到脚本执行错误，以管理员身份运行：
+> ```powershell
+> Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+> ```
+
+### 2. 安装 Python 依赖
+
+```bash
+cd "d:\Documents\QMClaw\Agentic Workflow\qmclaw-server\python"
+pip install -r requirements.txt
+```
+
+主要依赖：
+- `labrad` — LabRAD 通信库
+- `lqms` — 量子测量系统
+- `matplotlib` — 绘图生成
+- `numpy`, `scipy` — 数值计算
+
+### 3. 安装 Node.js 依赖
+
+**后端 (Express)：**
+```bash
+cd "d:\Documents\QMClaw\Agentic Workflow\qmclaw-server"
+npm install
+```
+
+**前端 (Next.js)：**
+```bash
+cd "d:\Documents\QMClaw\Agentic Workflow\qmclaw-web"
+npm install
+```
+
+如果 npm 安装慢，可以使用淘宝镜像：
+```bash
+npm config set registry https://registry.npmmirror.com
+npm install
+```
+
+### 4. 配置环境变量
+
+```bash
+cd "d:\Documents\QMClaw\Agentic Workflow\qmclaw-server"
+copy .env.example .env
+```
+
+编辑 `.env` 文件，填入你的 API Key（至少需要一个）：
+
+```env
+# LLM API Keys（至少填一个）
+MINIMAX_API_KEY=your_minimax_api_key_here
+MINIMAX_GROUP_ID=your_group_id_here
+
+# 或使用其他 Provider
+# OPENAI_API_KEY=sk-your-openai-key
+# ANTHROPIC_API_KEY=sk-ant-your-key
+# DEEPSEEK_API_KEY=sk-your-deepseek-key
+
+# Python 路径（Windows）
+PYTHON_BIN=C:\Users\你的用户名\Programs\Python\Python311\python.exe
+
+# 图表输出目录
+PLOTS_DIR=d:\Documents\QMClaw\Agentic Workflow\qmclaw-web\public\plots
+```
+
+### 5. 创建必要的目录
+
+```bash
+# 创建图表输出目录
+mkdir -p "d:\Documents\QMClaw\Agentic Workflow\qmclaw-web\public\plots"
+
+# 创建数据目录
+mkdir -p "d:\Documents\QMClaw\Agentic Workflow\qmclaw-server\data\workflows"
+mkdir -p "d:\Documents\QMClaw\Agentic Workflow\qmclaw-server\data\templates"
+```
+
+---
+
+## 快速启动
+
+### 方式一：一键启动（推荐）
+
+```powershell
+cd "d:\Documents\QMClaw\Agentic Workflow"
+.\一键启动.cmd
+```
+
+### 方式二：分别启动
+
+**终端 1 — 后端 (端口 3002)：**
+```bash
+cd "d:\Documents\QMClaw\Agentic Workflow\qmclaw-server"
+npm run dev
+```
+
+**终端 2 — 前端 (端口 3001)：**
+```bash
+cd "d:\Documents\QMClaw\Agentic Workflow\qmclaw-web"
+npm run dev
+```
+
+### 启动后访问
+
+- 前端：http://localhost:3001
+- 后端：http://localhost:3002
+- 健康检查：http://localhost:3002/health
+
+> **首次启动**：Python 子进程初始化 LabRAD 连接需要约 20 秒，请耐心等待。
 
 ## 核心功能
 

@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Build output
+Agentic Workflow/qmclaw-web/.next/
+Agentic Workflow/qmclaw-server/dist/
+Agentic Workflow/qmclaw-server/data/
+Agentic Workflow/qmclaw-server/logs/
+Agentic Workflow/qmclaw-web/public/plots/
+Agentic Workflow/qmclaw-server/config/memory/episodes/
+Agentic Workflow/qmclaw-server/config/memory/skills/
+.claude/
+CLAUDE.md
+build/
+dist/
+
+# Environment (secrets)
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+*.bak
+*.tmp
+.pytest_cache/

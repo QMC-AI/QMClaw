@@ -1,0 +1,35 @@
+{
+  "skills": [
+    {
+      "id": "t1_full_characterization",
+      "name": "T1 全流程表征",
+      "description": "对指定量子比特完成 T1 弛豫时间测量全流程：先做 spectroscopy 确认频率，再做 T1 测量，最后分析结果",
+      "skill_file": "t1_full_characterization.md",
+      "trigger_keywords": ["t1", "弛豫时间", "t1 characterization", "relaxation"],
+      "steps": [
+        { "tool": "run_experiment", "input": { "fn": "sq.spectroscopy", "qubit": "{{qubit}}" } },
+        { "tool": "run_experiment", "input": { "fn": "sq.t1", "qubit": "{{qubit}}" } },
+        { "tool": "analyze_results", "input": { "dataset_name": "{{qubit}}_t1" } }
+      ],
+      "parameters": ["qubit"],
+      "createdAt": "2026-09-02T00:00:00Z",
+      "enabled": true
+    },
+    {
+      "id": "qubit_health_check",
+      "name": "量子比特健康检查",
+      "description": "快速评估量子比特状态：测量 SNR、T1、门保真度，生成健康报告",
+      "skill_file": "qubit_health_check.md",
+      "trigger_keywords": ["健康检查", "health check", "qubit status", "检查状态"],
+      "steps": [
+        { "tool": "run_experiment", "input": { "fn": "sq.iqraw", "qubit": "{{qubit}}" } },
+        { "tool": "analyze_results", "input": { "dataset_name": "{{qubit}}_iqraw" } },
+        { "tool": "run_experiment", "input": { "fn": "sq.t1", "qubit": "{{qubit}}" } },
+        { "tool": "run_experiment", "input": { "fn": "sq.xeb", "qubit": "{{qubit}}" } }
+      ],
+      "parameters": ["qubit"],
+      "createdAt": "2026-09-02T00:00:00Z",
+      "enabled": true
+    }
+  ]
+}

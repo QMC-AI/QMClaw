@@ -49,7 +49,7 @@ export function createSession(modelId: string, modelName: string): ChatSession {
   };
   const filePath = path.join(CHAT_DIR, `${session.id}.json`);
   fs.writeFileSync(filePath, JSON.stringify(session, null, 2), 'utf-8');
-  console.log(`[chat-service] Created session: ${session.id} for model: ${modelName}`);
+  console.log(`[Database] Created session: ${session.id} for model: ${modelName}`);
   return session;
 }
 
@@ -94,7 +94,7 @@ export function listSessions(): ChatSession[] {
       const content = fs.readFileSync(path.join(CHAT_DIR, file), 'utf-8');
       sessions.push(JSON.parse(content) as ChatSession);
     } catch (e) {
-      console.error(`[chat-service] Failed to read ${file}:`, e);
+      console.error(`[Database] Failed to read ${file}:`, e);
     }
   }
   return sessions.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
@@ -105,7 +105,7 @@ export function deleteSession(sessionId: string): boolean {
   const filePath = path.join(CHAT_DIR, `${sessionId}.json`);
   if (!fs.existsSync(filePath)) return false;
   fs.unlinkSync(filePath);
-  console.log(`[chat-service] Deleted session: ${sessionId}`);
+  console.log(`[Database] Deleted session: ${sessionId}`);
   return true;
 }
 

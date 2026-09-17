@@ -20,6 +20,7 @@ export type NodeType =
   | 'analyze'
   | 'adjust_params'
   | 'image_analysis'
+  | 'image_classification'
   | 'print'
   | 'parallel'
   | 'while'
@@ -245,6 +246,7 @@ const getNodeTypePrefix = (type: NodeType): string => {
     analyze: 'ana',
     adjust_params: 'adj',
     image_analysis: 'img',
+    image_classification: 'icls',
     print: 'prt',
     parallel: 'par',
     while: 'loop',
@@ -282,6 +284,7 @@ const getDefaultNodeConfig = (type: NodeType): Record<string, unknown> => {
     analyze: { ref: '', experimentsToAnalyze: [] },
     adjust_params: { param: 'fread', value: '' },
     image_analysis: { prompt: 'Analyze this plot', imagePath: '' },
+    image_classification: { qubit: '', experimentType: 'spectroscopy', backend: 'pytorch', reviewThreshold: 0.75, marginThreshold: 0.15 },
     print: { message: 'Step completed' },
     parallel: { mode: 'auto', waitFor: 'all' },
     while: { condition: '{{nodes.n1.SNR}} < 2.0', maxIterations: 10, timeout: 300 },
@@ -306,6 +309,7 @@ const getNodeLabel = (type: NodeType): string => {
     analyze: '📊 Analyze',
     adjust_params: '⚙️ Adjust Params',
     image_analysis: '🖼 Image Analysis',
+    image_classification: '🧠 Image Classification',
     print: '📝 Print',
     parallel: '⚡ Parallel',
     while: '🔄 While Loop',
@@ -349,6 +353,7 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
     analyze: 0,
     adjust_params: 0,
     image_analysis: 0,
+    image_classification: 0,
     print: 0,
     parallel: 0,
     while: 0,
@@ -660,7 +665,7 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
     // Update node counters
     const counters: Record<NodeType, number> = {
       experiment: 0, quality_gate: 0, decision: 0, analyze: 0,
-      adjust_params: 0, image_analysis: 0, print: 0, parallel: 0,
+      adjust_params: 0, image_analysis: 0, image_classification: 0, print: 0, parallel: 0,
       while: 0, notify: 0, context: 0, code: 0,
     };
     nodes.forEach((node) => {
@@ -714,7 +719,7 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
       historyIndex: -1,
       nodeCounters: {
         experiment: 0, quality_gate: 0, decision: 0, analyze: 0,
-        adjust_params: 0, image_analysis: 0, print: 0, parallel: 0,
+        adjust_params: 0, image_analysis: 0, image_classification: 0, print: 0, parallel: 0,
         while: 0, notify: 0, context: 0, code: 0,
       },
     });

@@ -190,8 +190,7 @@ export default function WorkflowCanvas({ onLog }: Props) {
               }
             }
           });
-        },
-        600000
+        }
       );
 
       if (result.status === 'completed') {

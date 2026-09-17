@@ -1,0 +1,43 @@
+{
+  "mcp_servers": [
+    {
+      "id": "qmclaw_mcp",
+      "name": "QMClaw MCP Server",
+      "transport": "streamable-http",
+      "url": "http://localhost:8008",
+      "enabled": true
+    }
+  ],
+  "mcp_tools": [
+    {
+      "id": "qmclaw_s21",
+      "server": "qmclaw_mcp",
+      "remote_name": "s21",
+      "name": "腔体 S21 测量",
+      "description": "窄带频率扫描测量腔体透射谱",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "qubit": { "type": "string" }
+        },
+        "required": ["qubit"]
+      },
+      "enabled": true
+    },
+    {
+      "id": "qmclaw_t1",
+      "server": "qmclaw_mcp",
+      "remote_name": "t1",
+      "name": "T1 弛豫时间测量",
+      "description": "变延迟脉冲序列测量量子比特弛豫时间",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "qubit": { "type": "string" }
+        },
+        "required": ["qubit"]
+      },
+      "enabled": true
+    }
+  ]
+}

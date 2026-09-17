@@ -30,6 +30,7 @@ const NODE_TYPES = [
   { value: "analyze", label: "📊 Analyze", desc: "Parse metrics from previous node" },
   { value: "adjust_params", label: "⚙️ Adjust Params", desc: "Update qubit parameters" },
   { value: "image_analysis", label: "🖼 Image Analysis", desc: "LLM analysis of experiment plot" },
+  { value: "image_classification", label: "🧠 Image Classification", desc: "ML classification of experiment image" },
   { value: "print", label: "📝 Print", desc: "Log a message" },
 ];
 
@@ -224,6 +225,7 @@ export default function WorkflowDesigner({ selectedQubit, onLog }: Props) {
       analyze: { ref: "", source: "realtime" },
       adjust_params: { param: "fread", value: "" },
       image_analysis: { prompt: "Analyze this plot", imagePath: "" },
+      image_classification: { qubit: "", experimentType: "spectroscopy", backend: "pytorch", reviewThreshold: 0.75, marginThreshold: 0.15 },
       print: { message: "Step completed" },
     };
     const newNode: WorkflowNode = { id, type, config: baseConfig[type] || {} };
@@ -291,8 +293,7 @@ export default function WorkflowDesigner({ selectedQubit, onLog }: Props) {
           setWfStatus(s);
           const done = Object.values(s.nodes || {}).filter((n: any) => n.status === "completed").length;
           onLog("  " + done + "/" + nodes.length + " nodes done");
-        },
-        600000
+        }
       );
       setWfStatus(result);
       if (result.status === "completed") {
@@ -602,6 +603,17 @@ function ConfigPanel({ node, allNodes, onUpdate, onAddDep, onRemoveDep, workflow
         <>
           <CfgField label="Prompt" value={String(node.config.prompt || "")} onChange={v => onUpdate("prompt", v)} />
           <CfgField label="Image Path" value={String(node.config.imagePath || "")} onChange={v => onUpdate("imagePath", v)} />
+        </>
+      ) : null}
+
+      {/* Image classification */}
+      {node.type === "image_classification" ? (
+        <>
+          <CfgField label="Qubit" value={String(node.config.qubit || "")} onChange={v => onUpdate("qubit", v)} />
+          <CfgField label="Experiment Type" value={String(node.config.experimentType || "spectroscopy")} onChange={v => onUpdate("experimentType", v)} />
+          <CfgField label="Backend" value={String(node.config.backend || "pytorch")} onChange={v => onUpdate("backend", v)} />
+          <CfgField label="Review Threshold" value={String(node.config.reviewThreshold ?? 0.75)} onChange={v => onUpdate("reviewThreshold", parseFloat(v) || 0.75)} />
+          <CfgField label="Margin Threshold" value={String(node.config.marginThreshold ?? 0.15)} onChange={v => onUpdate("marginThreshold", parseFloat(v) || 0.15)} />
         </>
       ) : null}
 

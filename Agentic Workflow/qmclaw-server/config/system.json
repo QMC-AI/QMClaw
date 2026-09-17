@@ -1,0 +1,39 @@
+{
+  "system": "lqcs",
+  "description": "Quantum measurement control system backend configuration",
+  "backends": {
+    "lqcs": {
+      "enabled": true,
+      "description": "Lab Quantum Control System - LabRAD-based measurement backend",
+      "version": "1.0.0",
+      "required_packages": ["lqms", "labrad", "pylab"]
+    },
+    "opensystemq": {
+      "enabled": false,
+      "description": "OpenSystemQ backend (future)",
+      "version": "0.0.0",
+      "required_packages": []
+    },
+    "qiskit": {
+      "enabled": false,
+      "description": "Qiskit backend for IBM quantum systems (future)",
+      "version": "0.0.0",
+      "required_packages": ["qiskit"]
+    }
+  },
+  "lqcs": {
+    "connection": {
+      "host": "localhost",
+      "port": 7682,
+      "timeout": 30
+    },
+    "session": {
+      "default_user": "LQHL",
+      "default_path": ["test", "20260324"]
+    },
+    "paths": {
+      "measure_scripts": null,
+      "backend_dir": null
+    }
+  }
+}

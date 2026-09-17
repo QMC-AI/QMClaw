@@ -1,0 +1,63 @@
+{
+  "mode": {
+    "use_microservices": true
+  },
+  "services": {
+    "llm": {
+      "host": "localhost",
+      "port": 3006,
+      "health_path": "/health",
+      "enabled": true,
+      "script": "services/llm_service/server.py",
+      "description": "LLM 推理服务 - 支持 MiniMax/OpenAI/DeepSeek"
+    },
+    "quantum": {
+      "host": "localhost",
+      "port": 3003,
+      "health_path": "/health",
+      "enabled": true,
+      "script": "services/quantum_service/server.py",
+      "description": "测控执行服务 - LabRAD 连接、实验执行"
+    },
+    "analysis": {
+      "host": "localhost",
+      "port": 3004,
+      "health_path": "/health",
+      "enabled": true,
+      "script": "services/analysis_service/server.py",
+      "description": "数据分析服务 - DataLab、绘图、统计"
+    },
+    "agent": {
+      "host": "localhost",
+      "port": 3005,
+      "health_path": "/health",
+      "enabled": true,
+      "script": "services/agent_service/server.py",
+      "description": "Agent 服务 - QuantumAgent、ReAct 推理"
+    },
+    "image": {
+      "host": "localhost",
+      "port": 3007,
+      "health_path": "/health",
+      "enabled": true,
+      "script": "services/image_service/server.py",
+      "description": "图像服务 - PyTorch/ONNX 推理"
+    },
+    "workflow": {
+      "host": "localhost",
+      "port": 3008,
+      "health_path": "/health",
+      "enabled": true,
+      "script": "services/workflow_service/server.py",
+      "description": "工作流服务 - 节点调度、依赖解析"
+    },
+    "task_queue": {
+      "host": "localhost",
+      "port": 3009,
+      "health_path": "/health",
+      "enabled": true,
+      "script": "services/task_queue/server.py",
+      "description": "任务队列服务 - 任务调度、重试"
+    }
+  }
+}
