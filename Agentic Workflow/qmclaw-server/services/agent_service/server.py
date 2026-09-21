@@ -169,24 +169,23 @@ class AgentService(BaseService):
         self._llm_service_url = "http://localhost:3006"
 
         # 默认系统提示
-        self._system_prompt = """你是一个量子测控智能体，可以帮助用户执行量子实验和分析结果。
+        # 工具的具体参数由原生 function calling 的 schema 携带，这里只补行为约束 ——
+        # 旧版本在这里逐条列工具名并教"写 sq.* 代码"，但从未教过 Action: 协议，
+        # 与运行时实际依赖的协议不符，导致模型无法触发任何工具。
+        self._system_prompt = """你是一个量子测控智能体，负责帮用户执行量子实验并解读结果。
 
-可用工具:
-- run_experiment: 执行量子实验代码
-- get_qubits: 获取可用量子比特列表
-- list_experiments: 列出可用的量子实验
+工作方式:
+1. 用户要求"运行/执行某个实验"时，调用 run_experiment 工具
+   - experiment_name: 取自 list_experiments 的实验名（例如 t1、ramsey、s21、spectroscopy）
+   - target: 用户指定的量子比特名（例如 q10lu12）
+2. 需要确认有哪些比特或实验时，调用 get_qubits / list_experiments
+3. 工具返回后，用中文简要说明这次实验做了什么、关键数值是多少
+4. 如果工具结果标注了"合成数据"或"离线模拟"，必须在回复里如实告知用户，
+   不要把它当成真实硬件测量结果
 
-执行实验时，你需要:
-1. 理解用户的实验需求
-2. 确定要使用的量子比特
-3. 编写或选择合适的实验代码
-4. 执行实验并等待结果
-5. 分析结果并给出建议
-
-重要提示:
-- 实验代码应该是有效的 Python 代码
-- 使用 sq.* 函数来执行实验
-- 量子比特名称格式如 q10lu1
+注意:
+- 不要自己编写 sq.* 代码，一律通过 run_experiment 工具执行
+- 量子比特名称形如 q10lu12（q + 行列号），实验名用小写
 """
 
         # quantum_service 地址（通过 HTTP 调用）
@@ -203,8 +202,14 @@ class AgentService(BaseService):
         self._tools[tool.name] = tool
         _log(f"Registered tool: {tool.name}")
 
-    def _call_llm(self, messages: List[Dict], model: str = "deepseek-flash", temperature: float = 0.7) -> Dict[str, Any]:
-        """调用 LLM 服务"""
+    def _call_llm(self, messages: List[Dict], model: str = "deepseek-flash",
+                  temperature: float = 0.7,
+                  tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """调用 LLM 服务
+
+        tools 非空时走原生 function calling；llm_service 会把响应里的 tool_calls
+        归一化成 [{id, name, arguments(dict)}] 并附带 assistant_message 供回灌。
+        """
         import urllib.request
         import urllib.error
 
@@ -214,8 +219,10 @@ class AgentService(BaseService):
             "temperature": temperature,
             "max_tokens": 4096,
         }
+        if tools:
+            payload["tools"] = tools
 
-        data = json.dumps(payload).encode("utf-8")
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             f"{self._llm_service_url}/chat",
             data=data,
@@ -230,116 +237,231 @@ class AgentService(BaseService):
         except Exception as e:
             return {"error": str(e)}
 
+    @staticmethod
+    def _compact_for_llm(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """压缩工具结果再喂给 LLM：曲线数组只留点数，避免白烧 token"""
+        try:
+            p = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+        except Exception:
+            return payload
+        d = p.get("data")
+        if isinstance(d, dict):
+            arrays = d.get("arrays")
+            if isinstance(arrays, dict):
+                d["arrays"] = {
+                    k: (f"<{len(v)} points, omitted>" if isinstance(v, list) else v)
+                    for k, v in arrays.items()
+                }
+        return p
+
+    @staticmethod
+    def _summarize_tool_result(payload: Dict[str, Any]) -> str:
+        """生成给人看的工具结果摘要（写入 steps[].observation）"""
+        if not payload.get("success"):
+            return f"失败: {payload.get('error')}"
+
+        d = payload.get("data")
+        meta = payload.get("metadata") or {}
+        bits: List[str] = []
+
+        # 不同工具的 data 形状不同：实验类返回 dict，get_qubits/list_experiments
+        # 返回的是 list。这里必须按类型分派，否则 list.get 会直接抛异常。
+        if isinstance(d, list):
+            bits.append(f"返回 {len(d)} 项")
+        elif isinstance(d, dict):
+            bits.append(f"status={d.get('status') or 'ok'}")
+            if d.get("target"):
+                bits.append(f"target={d['target']}")
+            results = d.get("results") or {}
+            if results:
+                bits.append("metrics=" + json.dumps(results, ensure_ascii=False))
+            if d.get("error"):
+                bits.append(f"error={d['error']}")
+        elif d is not None:
+            bits.append(str(d)[:200])
+
+        if meta.get("synthetic"):
+            bits.append("警告: 该 qubit 无历史数据，以下为合成数据")
+        elif meta.get("simulated"):
+            bits.append("(离线模拟)")
+
+        stdout = (meta.get("stdout") or "").strip()
+        if stdout:
+            tail = [ln for ln in stdout.splitlines() if ln.strip()][-1:]
+            if tail:
+                bits.append(tail[0])
+
+        return " | ".join(bits) if bits else "ok"
+
+    # metrics 的 key -> (前端显示标签, 缩放系数)
+    # 前端 AgentChatPanel 渲染 results 时走 v.toFixed(4)，因此必须换算成可读量级 ——
+    # 否则 T1=5.56e-5（秒）会被显示成 "0.0001"，精度全丢。
+    _METRIC_DISPLAY = {
+        "t1": ("T1 (µs)", 1e6),
+        "t2": ("T2 (µs)", 1e6),
+        "peak_freq": ("峰值频率 (GHz)", 1e-9),
+        "peak_value": ("峰值幅度", 1.0),
+        "gate_fidelity": ("门保真度", 1.0),
+        "average_fidelity": ("平均保真度", 1.0),
+        "swap_fidelity": ("SWAP 保真度", 1.0),
+        "error_per_cycle": ("单周期误差", 1.0),
+        "separation": ("IQ 分离度", 1.0),
+        "pi_amplitude": ("π 脉冲幅度", 1.0),
+        "optimal_drag": ("最优 DRAG", 1.0),
+    }
+
+    @staticmethod
+    def _finalize_response(result: Dict[str, Any]) -> str:
+        """组装最终回复文本。
+
+        合成数据时**强制**补一条提示，而不是依赖模型自觉说明 ——
+        这是给用户看的关键免责信息。
+        """
+        text = (result.get("response") or "").strip()
+        if result.get("synthetic") and "合成" not in text:
+            warn = ("⚠️ 该 qubit 在离线数据中没有对应的实验历史记录，"
+                    "以下结果由模拟器按通用参数合成，仅供流程验证，不代表真实硬件测量。")
+            text = f"{warn}\n\n{text}" if text else warn
+        return text
+
+    @classmethod
+    def _to_display_results(cls, metrics: Dict[str, Any]) -> Dict[str, float]:
+        """把工具返回的 metrics 换算成前端可直接显示的量"""
+        out: Dict[str, float] = {}
+        for k, v in (metrics or {}).items():
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                continue
+            label, scale = cls._METRIC_DISPLAY.get(k, (k, 1.0))
+            try:
+                out[label] = round(float(v) * scale, 6)
+            except Exception:
+                continue
+        return out
+
     def _react_reason(self, task: AgentTask) -> Dict[str, Any]:
-        """ReAct 推理循环"""
+        """ReAct 推理循环（原生 function calling 版本）
+
+        旧实现依赖文本 "Action: tool(args)" 协议 + eval 解析参数，但 system prompt
+        从未教会模型这个格式 —— 模型只会吐它原生的 tool-call 标记，解析不到就被当成
+        最终答案返回，导致工具从不执行。现改为把 registry 里的 OpenAI 工具定义直接
+        交给模型，用响应中的 tool_calls 驱动循环。
+        """
         max_iterations = 10
         iteration = 0
 
-        # 构建初始消息
-        messages = [
+        tools = self._registry.get_definitions()
+        messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self._system_prompt},
             {"role": "user", "content": task.message},
         ]
+
+        # 汇集给前端的结果（steps 已在 task.steps 里，这里收数值与图表）
+        collected_metrics: Dict[str, Any] = {}
+        collected_charts: List[str] = []
+        saw_synthetic = False
+        saw_simulated = False
+
+        def _final(success: bool, **extra) -> Dict[str, Any]:
+            return {
+                "success": success,
+                "iterations": iteration,
+                "messages": [{"role": m.get("role"), "content": m.get("content") or ""}
+                             for m in messages if m.get("role") in ("user", "assistant")],
+                "metrics": collected_metrics,
+                "charts": collected_charts,
+                "synthetic": saw_synthetic,
+                "simulated": saw_simulated,
+                **extra,
+            }
 
         while iteration < max_iterations:
             iteration += 1
             _log(f"ReAct iteration {iteration}/{max_iterations}")
 
-            # 本轮的结构化记录（最终写入 episode.steps）
-            step: Dict[str, Any] = {
-                "iteration": iteration,
-                "assistant": "",
-                "action": None,
-                "observation": None,
-            }
+            response = self._call_llm(messages, model=task.model, tools=tools)
+            if response.get("error"):
+                task.steps.append({"tool": "(llm)", "input": {}, "observation": response["error"]})
+                return _final(False, error=response["error"])
 
-            # 调用 LLM
-            response = self._call_llm(messages, model=task.model)
-            if "error" in response:
-                step["error"] = response["error"]
-                task.steps.append(step)
-                return {"error": response["error"]}
+            content = response.get("content") or ""
+            tool_calls = response.get("tool_calls") or []
 
-            assistant_content = response.get("content", "")
-            step["assistant"] = assistant_content
+            if not tool_calls:
+                # 没有工具调用 —— 这就是最终回复
+                task.messages.append(AgentMessage(role="assistant", content=content))
+                return _final(True, response=content)
 
-            # 添加助手回复
-            messages.append({"role": "assistant", "content": assistant_content})
-            task.messages.append(AgentMessage(role="assistant", content=assistant_content))
+            _log(f"Model requested {len(tool_calls)} tool call(s)")
 
-            # 检查是否完成（没有工具调用）
-            if "Action:" not in assistant_content and "Action:" not in assistant_content:
-                step["final"] = True
-                task.steps.append(step)
-                return {
-                    "success": True,
-                    "response": assistant_content,
-                    "iterations": iteration,
-                    "messages": [{"role": m.role, "content": m.content} for m in task.messages],
+            # 协议要求：带 tool_calls 的 assistant 消息必须原样回灌，
+            # 其后紧跟 role="tool" 的结果消息
+            assistant_msg = response.get("assistant_message")
+            if not assistant_msg:
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [
+                        {
+                            "id": tc.get("id") or "",
+                            "type": "function",
+                            "function": {
+                                "name": tc.get("name") or "",
+                                "arguments": json.dumps(tc.get("arguments") or {}, ensure_ascii=False),
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
                 }
+            messages.append(assistant_msg)
+            task.messages.append(AgentMessage(role="assistant", content=content))
 
-            # 解析工具调用
-            action_text = ""
-            for line in assistant_content.split("\n"):
-                if line.startswith("Action:"):
-                    action_text = line.replace("Action:", "").strip()
-                    break
+            for tc in tool_calls:
+                name = tc.get("name") or ""
+                args = tc.get("arguments") or {}
 
-            if not action_text:
-                step["final"] = True
-                step["note"] = "no Action: line found"
-                task.steps.append(step)
-                continue
-
-            step["action"] = action_text
-
-            # 解析工具和参数
-            try:
-                # 简单解析: tool_name(arg1=value1, arg2=value2)
-                if "(" in action_text:
-                    tool_name = action_text.split("(")[0].strip()
-                    args_str = action_text.split("(")[1].rstrip(")").strip()
-                    args = {}
-
-                    # 解析参数
-                    if args_str:
-                        for arg in args_str.split(","):
-                            if "=" in arg:
-                                key, value = arg.split("=", 1)
-                                args[key.strip()] = eval(value.strip())
-
-                    # 执行工具
-                    if tool_name in self._tools:
-                        tool_result = self._tools[tool_name].execute(**args)
-                    else:
-                        tool_result = {"error": f"Unknown tool: {tool_name}"}
-
+                if tc.get("parse_error"):
+                    payload: Dict[str, Any] = {
+                        "success": False,
+                        "error": f"Invalid tool arguments JSON: {tc['parse_error']}",
+                        "arguments_raw": tc.get("arguments_raw"),
+                    }
                 else:
-                    tool_name = action_text.strip()
-                    if tool_name in self._tools:
-                        tool_result = self._tools[tool_name].execute()
-                    else:
-                        tool_result = {"error": f"Unknown tool: {tool_name}"}
+                    _log(f"Executing tool: {name}({json.dumps(args, ensure_ascii=False)})")
+                    try:
+                        payload = self._registry.execute(name, args).to_dict()
+                    except Exception as e:
+                        payload = {"success": False, "error": f"Tool execution error: {e}"}
 
-            except Exception as e:
-                tool_result = {"error": f"Tool execution error: {e}"}
+                task.steps.append({
+                    "tool": name,
+                    "input": args,
+                    "observation": self._summarize_tool_result(payload),
+                })
 
-            # 添加工具结果
-            tool_result_str = json.dumps(tool_result, ensure_ascii=False)
-            observation = f"Observation: {tool_result_str}"
-            messages.append({"role": "user", "content": observation})
-            task.messages.append(AgentMessage(role="user", content=observation))
+                # 汇集数值与图表（供前端 results / charts）
+                if payload.get("success"):
+                    d = payload.get("data") or {}
+                    meta = payload.get("metadata") or {}
+                    if isinstance(d, dict):
+                        metrics = d.get("results")
+                        if isinstance(metrics, dict) and metrics:
+                            collected_metrics.update(metrics)
+                        for p in (d.get("plots") or []):
+                            path = p.get("path") if isinstance(p, dict) else p
+                            if path and path not in collected_charts:
+                                collected_charts.append(path)
+                    if meta.get("synthetic"):
+                        saw_synthetic = True
+                    if meta.get("simulated"):
+                        saw_simulated = True
 
-            # 收尾本轮步骤（action 已在上面记过，这里补 observation）
-            step["observation"] = tool_result_str[:2000]
-            task.steps.append(step)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or "",
+                    "content": json.dumps(self._compact_for_llm(payload), ensure_ascii=False),
+                })
 
-        return {
-            "success": False,
-            "error": "Max iterations reached",
-            "iterations": iteration,
-            "messages": [{"role": m.role, "content": m.content} for m in task.messages],
-        }
+        return _final(False, error="Max iterations reached")
 
     def handle_request(self, method: str, path: str, data: Dict[str, Any], query: Dict[str, List[str]]) -> Dict[str, Any]:
         """处理 Agent 请求"""
@@ -500,10 +622,15 @@ class AgentService(BaseService):
             payload = {
                 "success": result.get("success", False),
                 "task_id": task_id,
-                "response": result.get("response", ""),
+                "response": self._finalize_response(result),
                 "error": result.get("error"),
                 "iterations": result.get("iterations", 0),
                 "messages": result.get("messages", []),
+                # 前端 AgentChatPanel 期望的三个字段（此前一个都没返回，
+                # 导致步骤区与结果卡片永远不渲染）
+                "steps": task.steps,
+                "results": self._to_display_results(result.get("metrics") or {}),
+                "charts": result.get("charts") or [],
             }
 
             # 记录这一轮对话到记忆（失败不影响返回）

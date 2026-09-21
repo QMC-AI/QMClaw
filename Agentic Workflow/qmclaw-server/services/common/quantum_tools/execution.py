@@ -262,16 +262,43 @@ Returns experiment results including measured data and parameters."""
             elapsed = time.time() - start_time
 
             # 解析结果
-            success = result.get("status") == "success"
+            # 离线模式返回 status="offline_simulated"，与在线 "success" 一样视为执行成功。
+            # 原实现只认 "success"，导致离线跑通的实验被报成 failed。
+            status = result.get("status", "failed")
+            success = status in ("success", "offline_simulated")
+
+            # 结果字段：在线走 result，离线走 metrics
+            if result.get("result"):
+                results = result["result"]
+            else:
+                results = result.get("metrics") or {}
+
+            # 曲线数据 -> arrays；绘图路径 -> plots（沿用 ExperimentResult 既有字段）
+            offline_data = result.get("data") or {}
+            arrays: Dict[str, List[float]] = {}
+            if isinstance(offline_data, dict) and offline_data.get("x") is not None:
+                arrays = {
+                    "x": offline_data.get("x", []),
+                    "y": offline_data.get("y", []),
+                }
+            plots: List[Dict[str, Any]] = []
+            if result.get("plotPath"):
+                plots = [{
+                    "path": result["plotPath"],
+                    "title": result.get("exp_type", experiment_name),
+                }]
+
             experiment_result = ExperimentResult(
                 id=exp_id,
                 experiment_name=experiment_name,
                 status="success" if success else "failed",
                 started_at=now.isoformat().replace("+00:00", "Z"),
                 completed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                target=target,
+                target=result.get("qubit") or target,
                 params=params,
-                results=result.get("result", {}),
+                results=results,
+                arrays=arrays,
+                plots=plots,
                 error=result.get("error"),
                 notes=notes,
             )
@@ -279,7 +306,11 @@ Returns experiment results including measured data and parameters."""
             return ToolResult.ok(
                 data=experiment_result.to_dict(),
                 execution_time=elapsed,
-                source="labrad",
+                source="offline" if result.get("simulated") else "labrad",
+                simulated=bool(result.get("simulated")),
+                synthetic=bool(result.get("synthetic")),
+                stdout=result.get("stdout", ""),
+                code=code,
             )
 
         except QMClawError:

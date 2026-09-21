@@ -11,6 +11,7 @@ Agent Service 适配器
 import json
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..common.quantum_tools import (
@@ -27,6 +28,38 @@ from ..common.quantum_tools import (
 
 # quantum_service 地址
 QUANTUM_SERVICE_URL = "http://localhost:3003"
+
+# 服务根：<qmclaw-server>（本文件在 services/agent_service/ 下）
+_SERVER_ROOT = Path(__file__).resolve().parents[2]
+
+# experiment_configs.json 的 defaultCommand 模板缓存
+_EXPERIMENT_TEMPLATES: Dict[str, str] = {}
+_EXPERIMENT_TEMPLATES_LOADED = False
+
+
+def _load_experiment_templates() -> Dict[str, str]:
+    """读取 config/experiment_configs.json 的 defaultCommand 模板（带缓存）
+
+    返回 {experiment_key: "sq.t1({qubit}, do_plot=True)"}。
+    这是该配置文件里的权威调用约定；配置 key 与真实函数名可能不同
+    （例如 ramsey -> sq.ramsey_df），以模板为准可自动修正。
+    读取失败时返回空 dict，由 build_experiment_code 回退。
+    """
+    global _EXPERIMENT_TEMPLATES_LOADED
+    if _EXPERIMENT_TEMPLATES_LOADED:
+        return _EXPERIMENT_TEMPLATES
+    _EXPERIMENT_TEMPLATES_LOADED = True
+    try:
+        cfg = _SERVER_ROOT / "config" / "experiment_configs.json"
+        with open(cfg, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for key, info in (data.get("experiments") or {}).items():
+            cmd = (info or {}).get("defaultCommand")
+            if cmd:
+                _EXPERIMENT_TEMPLATES[key] = cmd
+    except Exception:
+        pass
+    return _EXPERIMENT_TEMPLATES
 
 
 def _http_call(url: str, data: dict = None, method: str = "GET") -> dict:
@@ -46,9 +79,18 @@ def _http_call(url: str, data: dict = None, method: str = "GET") -> dict:
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        return {"error": f"HTTP {e.code}: {e.reason}"}
+        # 必须把响应体带出来 —— 服务的 500 里通常写了真实原因（base_service 会
+        # send_json_response(500, {"error": str(e)})），只报状态码会让问题无法定位。
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        detail = f"HTTP {e.code}: {e.reason}"
+        if body:
+            detail += f" | body={body[:800]}"
+        return {"error": detail}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def setup_agent_tools(
@@ -104,30 +146,37 @@ def setup_agent_tools(
             {"code": code},
             "POST"
         )
-        if result.get("status") == "success":
+        # 离线模式返回 offline_simulated，同样视为执行成功
+        if result.get("status") in ("success", "offline_simulated"):
             return result
         return {"error": result.get("error", "Unknown error")}
 
-    def run_experiment(name: str, params: Dict, notes: str = "") -> Dict[str, Any]:
-        """执行命名实验"""
-        # 构建代码
-        func_name = f"sq.{name}"
-        param_str = ", ".join(f"{k}={repr(v)}" for k, v in params.items())
-        code = f"{func_name}({param_str})"
+    def build_experiment_code(name: str, target: str, params: Dict[str, Any]) -> str:
+        """按 config/experiment_configs.json 的 defaultCommand 模板生成实验代码。
 
-        result = _http_call(
-            f"{quantum_service_url}/execute",
-            {"code": code},
-            "POST"
-        )
+        模板形如 "sq.t1({qubit}, do_plot=True)"，是该配置文件里的权威调用约定。
+        旧实现生成的是 "sq.t1(target='q10lu12')"，有两个问题：
+          1. qubit 传成了关键字参数，而离线模拟器的解析正则期望**位置参数**，
+             会把 "target='q10lu12'" 整串当成 qubit 名
+          2. 函数名硬拼 "sq.<name>"，对 ramsey 是错的（模板里是 sq.ramsey_df）
+        """
+        template = _load_experiment_templates().get(name)
+        qubit_arg = target or ""
+        if not template:
+            # 模板缺失时回退，仍保持位置参数 + do_plot 的形式
+            template = f"sq.{name}({{qubit}}, do_plot=True)"
 
-        # 包装结果
-        return {
-            "id": result.get("task_id", ""),
-            "status": result.get("status", "failed"),
-            "results": result.get("result", {}),
-            "error": result.get("error"),
+        code = template.replace("{qubit}", qubit_arg)
+
+        # 追加调用方额外传入的参数（模板里已出现的键不重复加）
+        extra = {
+            k: v for k, v in (params or {}).items()
+            if k != "target" and f"{k}=" not in code
         }
+        if extra and code.endswith(")"):
+            arg_str = ", ".join(f"{k}={v!r}" for k, v in extra.items())
+            code = code[:-1] + f", {arg_str})"
+        return code
 
     def list_history(last_n: int, type: str = None) -> List[Dict[str, Any]]:
         """查询实验历史"""
@@ -139,8 +188,18 @@ def setup_agent_tools(
     registry.register_tool(GetQubitParamsTool(get_qubit_params, get_qubits))
     registry.register_tool(ListExperimentsTool(list_experiments))
     registry.register_tool(RunCodeTool(execute_code, is_connected))
+    # 注意 RunExperimentTool 的契约是：
+    #   code_builder(name, params) -> 代码字符串
+    #   executor(代码字符串) -> 执行结果
+    # 旧实现把 run_experiment 当成 code_builder 传进来，而它返回的是结果 dict，
+    # 于是 executor 把 dict 当代码 POST 给 quantum_service，服务端 code[:100]
+    # 直接抛 "unhashable type: 'slice'"。
+    # 现在传真正的代码构造器，由 RunExperimentTool 负责把执行结果包装成
+    # ExperimentResult（离线字段映射见 quantum_tools/execution.py）。
     registry.register_tool(RunExperimentTool(
-        lambda name, params: run_experiment(name, params),
+        lambda name, params: build_experiment_code(
+            name, (params or {}).get("target"), params or {}
+        ),
         execute_code,
         is_connected=is_connected
     ))
