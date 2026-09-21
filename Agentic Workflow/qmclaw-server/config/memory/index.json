@@ -1,16 +1,23 @@
 {
   "episodes": [
     {
+      "id": "ep_20260922_003122_470d0464",
+      "timestamp": "2026-09-22T00:31:22.757811",
+      "qubit": null,
+      "status": "success",
+      "task_preview": "你好"
+    },
+    {
       "id": "ep_20260903_200223_2b691ed4",
       "timestamp": "2026-09-03T20:02:23.057327",
-      "qubit": null,
+      "qubit": "q25_7",
       "status": "success",
       "task_preview": "??25_7???iqraw"
     },
     {
       "id": "ep_20260903_170551_22c337e4",
       "timestamp": "2026-09-03T17:05:51.269415",
-      "qubit": null,
+      "qubit": "q25_7",
       "status": "success",
       "task_preview": "瀵筿25_7鍋氫竴涓猧qraw瀹為獙"
     },
@@ -29,5 +36,5 @@
       "status": "active"
     }
   ],
-  "last_updated": "2026-09-03T20:02:33.847441"
+  "last_updated": "2026-09-22T00:31:22.757811"
 }

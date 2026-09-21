@@ -20,6 +20,10 @@ from enum import Enum
 from ..base import BaseService, ServiceConfig, run_service, _safe_print
 from ..common import setup_logging, config
 
+# 记忆与反思（由 scripts/ 移植而来，磁盘格式与旧版一致）
+from ..common import memory_store
+from ..common import reflection_engine
+
 # 导入统一量子工具
 from ..common.quantum_tools import ToolRegistry, ToolResult
 from .adapter import AgentServiceAdapter, setup_agent_tools
@@ -52,6 +56,7 @@ class AgentTask:
     task_id: str
     message: str
     mode: str = "react"
+    model: str = "deepseek-flash"
     context: Dict[str, Any] = field(default_factory=dict)
     status: TaskStatus = TaskStatus.PENDING
     result: Optional[Dict[str, Any]] = None
@@ -59,6 +64,8 @@ class AgentTask:
     created_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
     messages: List[AgentMessage] = field(default_factory=list)
+    # ReAct 每一轮的结构化记录，最终写入记忆 episode 的 steps
+    steps: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class Tool:
@@ -196,7 +203,7 @@ class AgentService(BaseService):
         self._tools[tool.name] = tool
         _log(f"Registered tool: {tool.name}")
 
-    def _call_llm(self, messages: List[Dict], model: str = "minimax", temperature: float = 0.7) -> Dict[str, Any]:
+    def _call_llm(self, messages: List[Dict], model: str = "deepseek-flash", temperature: float = 0.7) -> Dict[str, Any]:
         """调用 LLM 服务"""
         import urllib.request
         import urllib.error
@@ -238,12 +245,23 @@ class AgentService(BaseService):
             iteration += 1
             _log(f"ReAct iteration {iteration}/{max_iterations}")
 
+            # 本轮的结构化记录（最终写入 episode.steps）
+            step: Dict[str, Any] = {
+                "iteration": iteration,
+                "assistant": "",
+                "action": None,
+                "observation": None,
+            }
+
             # 调用 LLM
-            response = self._call_llm(messages)
+            response = self._call_llm(messages, model=task.model)
             if "error" in response:
+                step["error"] = response["error"]
+                task.steps.append(step)
                 return {"error": response["error"]}
 
             assistant_content = response.get("content", "")
+            step["assistant"] = assistant_content
 
             # 添加助手回复
             messages.append({"role": "assistant", "content": assistant_content})
@@ -251,6 +269,8 @@ class AgentService(BaseService):
 
             # 检查是否完成（没有工具调用）
             if "Action:" not in assistant_content and "Action:" not in assistant_content:
+                step["final"] = True
+                task.steps.append(step)
                 return {
                     "success": True,
                     "response": assistant_content,
@@ -266,7 +286,12 @@ class AgentService(BaseService):
                     break
 
             if not action_text:
+                step["final"] = True
+                step["note"] = "no Action: line found"
+                task.steps.append(step)
                 continue
+
+            step["action"] = action_text
 
             # 解析工具和参数
             try:
@@ -305,6 +330,10 @@ class AgentService(BaseService):
             messages.append({"role": "user", "content": observation})
             task.messages.append(AgentMessage(role="user", content=observation))
 
+            # 收尾本轮步骤（action 已在上面记过，这里补 observation）
+            step["observation"] = tool_result_str[:2000]
+            task.steps.append(step)
+
         return {
             "success": False,
             "error": "Max iterations reached",
@@ -331,6 +360,9 @@ class AgentService(BaseService):
             return self._handle_task_status(data)
         elif path == "/tools":
             return self._handle_tools()
+        elif path == "/memory" or path.startswith("/memory/"):
+            # 记忆与反思。Express 侧 /api/agent/memory/* 会原样代理到这里。
+            return self._handle_memory(path, method, data, query)
         else:
             raise ValueError(f"Unknown path: {path}")
 
@@ -408,13 +440,20 @@ class AgentService(BaseService):
     def _handle_chat(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """处理聊天请求"""
         message = data.get("message")
-        model = data.get("model")
         base_url = data.get("base_url")
         enabled_toolsets = data.get("enabled_toolsets", [])
         session_id = data.get("session_id")
         mode = data.get("mode", "react")
         context = data.get("context", {})
         task_id = data.get("task_id", f"task_{int(time.time() * 1000)}")
+
+        # 模型解析优先级：
+        #   1. 顶层 model（legacy 后端 / 直接调用 microservice 时使用）
+        #   2. context.model_id（前端 AgentChatPanel 走的就是这条）
+        #   3. 默认 deepseek-flash
+        # 注意：前端下拉框传的是 model_configs.json 里的内部 id（如 model_default_001），
+        # 不是 API 模型名。那种 id 会原样转给 llm_service 的兜底分支，由它选可用 provider。
+        model = data.get("model") or context.get("model_id") or "deepseek-flash"
 
         _log(f"DEBUG _handle_chat: message={message[:100] if message else None}...")
         _log(f"DEBUG _handle_chat: model={model}, base_url={base_url}, enabled_toolsets={enabled_toolsets}")
@@ -438,6 +477,7 @@ class AgentService(BaseService):
             task_id=task_id,
             message=message,
             mode=mode,
+            model=model,
             context=context,
         )
 
@@ -447,6 +487,7 @@ class AgentService(BaseService):
 
         try:
             # 执行推理
+            started_at = time.time()
             if mode == "react":
                 result = self._react_reason(task)
             else:
@@ -456,7 +497,7 @@ class AgentService(BaseService):
             task.result = result
             task.completed_at = time.time()
 
-            return {
+            payload = {
                 "success": result.get("success", False),
                 "task_id": task_id,
                 "response": result.get("response", ""),
@@ -465,11 +506,21 @@ class AgentService(BaseService):
                 "messages": result.get("messages", []),
             }
 
+            # 记录这一轮对话到记忆（失败不影响返回）
+            payload["duration_ms"] = int((time.time() - started_at) * 1000)
+            episode_id = self._record_episode(task, payload)
+            if episode_id:
+                payload["episode_id"] = episode_id
+
+            return payload
+
         except Exception as e:
             _log(f"Chat error: {e}\n{traceback.format_exc()}")
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = time.time()
+            # 失败的一轮同样记入记忆，便于前端看到失败案例
+            self._record_episode(task, {"success": False, "error": str(e)})
             return {"error": str(e), "task_id": task_id}
 
     def _handle_chat_stream(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -576,6 +627,176 @@ class AgentService(BaseService):
             "unified_tools": unified_tools,
             "unified_count": len(unified_tools),
         }
+
+    # ── 记忆与反思 (Memory & Reflection) ─────────────────────────────────────
+    #
+    # Express 侧 /api/agent/memory/* 会原样代理到下面这些路径。
+    # 数据落在 <qmclaw-server>/config/memory/，格式与 scripts/memory_store.py 完全一致。
+
+    @staticmethod
+    def _q(query: Dict[str, List[str]], key: str, default=None):
+        """从 query dict（值为 list）里取单个值"""
+        v = (query or {}).get(key)
+        if isinstance(v, (list, tuple)):
+            return v[0] if v else default
+        return v if v is not None else default
+
+    def _handle_memory(self, path: str, method: str, data: Dict[str, Any],
+                       query: Dict[str, List[str]]) -> Dict[str, Any]:
+        """处理 /memory/* 请求"""
+        data = data or {}
+
+        # /memory/episodes — 列表（Express 用 POST 传参）
+        if path == "/memory/episodes":
+            try:
+                limit = int(data.get("limit") or self._q(query, "limit", 50))
+            except (TypeError, ValueError):
+                limit = 50
+            qubit = data.get("qubit") or self._q(query, "qubit")
+            status = data.get("status") or self._q(query, "status")
+            episodes = memory_store.list_episodes(limit=limit, qubit=qubit, status=status)
+            return {"success": True, "episodes": episodes, "count": len(episodes)}
+
+        # /memory/episodes/{id} — 详情 / 归档
+        if path.startswith("/memory/episodes/"):
+            episode_id = path[len("/memory/episodes/"):].strip("/")
+            if method == "DELETE":
+                ok = memory_store.archive_episode(episode_id)
+                return {"success": ok, "episode_id": episode_id, "archived": ok}
+            episode = memory_store.get_episode(episode_id)
+            if not episode:
+                return {"success": False, "error": f"Episode not found: {episode_id}"}
+            return {"success": True, "episode": episode}
+
+        # /memory/skills — 列表
+        if path == "/memory/skills":
+            status = data.get("status") or self._q(query, "status")
+            skills = memory_store.list_skills(status=status)
+            return {"success": True, "skills": skills, "count": len(skills)}
+
+        # /memory/skills/{id} — 详情 / 删除
+        if path.startswith("/memory/skills/"):
+            skill_id = path[len("/memory/skills/"):].strip("/")
+            if method == "DELETE":
+                ok = memory_store.delete_skill(skill_id)
+                return {"success": ok, "skill_id": skill_id}
+            skill = memory_store.get_skill(skill_id)
+            if not skill:
+                return {"success": False, "error": f"Skill not found: {skill_id}"}
+            return {"success": True, "skill": skill}
+
+        # /memory/stats — 统计
+        if path == "/memory/stats":
+            stats = memory_store.get_memory_stats()
+            stats["success"] = True
+            return stats
+
+        # /memory/recall — 按任务召回相关记忆
+        if path == "/memory/recall":
+            task = data.get("task") or data.get("message") or ""
+            qubit = data.get("qubit") or self._q(query, "qubit")
+            try:
+                recalled = reflection_engine.recall_for_task(task, qubit)
+            except Exception as e:
+                _log(f"recall failed: {e}")
+                recalled = {"hasMemory": False, "context": "", "error": str(e)}
+            return {"success": True, **recalled}
+
+        # /memory/reflect — 对某次任务做反思（可选回填到 episode）
+        if path == "/memory/reflect":
+            episode_id = data.get("episode_id")
+            task = data.get("task") or data.get("message") or ""
+            result_data = data.get("result") or {}
+            try:
+                reflection = reflection_engine.reflect_after_task(
+                    task=task,
+                    status=result_data.get("status", "success"),
+                    steps=result_data.get("steps", []),
+                    metrics=result_data.get("metrics", {}),
+                    qubit=data.get("qubit") or result_data.get("qubit"),
+                    mode=result_data.get("mode", "react"),
+                )
+            except Exception as e:
+                _log(f"reflect failed: {e}")
+                return {"success": False, "error": str(e)}
+            if episode_id:
+                memory_store.update_episode_reflection(episode_id, reflection)
+            return {"success": True, "reflection": reflection, "episode_id": episode_id}
+
+        return {"success": False, "error": f"Unknown memory path: {path}"}
+
+    def _record_episode(self, task: "AgentTask", result: Dict[str, Any]) -> Optional[str]:
+        """把一轮对话写入记忆。
+
+        一轮 = 一次 /chat 调用。ReAct 的每次迭代存进该 episode 的 steps。
+        写盘失败绝不能影响对话返回，所以整体 try/except 包住。
+        """
+        try:
+            steps = getattr(task, "steps", None) or []
+            status = "success" if result.get("success") else "failed"
+
+            # 从用户消息里粗提 qubit 名，便于前端按 qubit 过滤（失败就算了）
+            qubit = None
+            try:
+                import re as _re
+                m = _re.search(r"\bq\d+[a-z]+\d+\b", task.message or "")
+                if m:
+                    qubit = m.group(0)
+            except Exception:
+                pass
+
+            episode = memory_store.create_episode(
+                task=task.message,
+                steps=steps,
+                status=status,
+                metrics={
+                    "iterations": result.get("iterations", 0),
+                    "duration_ms": result.get("duration_ms", 0),
+                },
+                qubit=qubit,
+                tags=[],
+                used_skills=[],
+                mode=task.mode,
+            )
+
+            # 回填会话信息，让"每一轮"能串成一次会话
+            episode_id = episode.get("id")
+            if episode_id:
+                self._annotate_episode(
+                    episode_id,
+                    session_id=task.context.get("session_id") or task.task_id,
+                    round_index=task.context.get("round_index"),
+                    model=getattr(task, "model", None),
+                    response=result.get("response", ""),
+                )
+            _log(f"Memory: recorded episode {episode_id} (status={status}, steps={len(steps)})")
+            return episode_id
+        except Exception as e:
+            _log(f"Memory: failed to record episode: {e}")
+            return None
+
+    @staticmethod
+    def _annotate_episode(episode_id: str, session_id=None, round_index=None,
+                          model=None, response=None) -> None:
+        """给已落盘的 episode 补写 session/round/model/response 字段。
+
+        memory_store 的原始 schema 没有这几个字段 —— 但「记录每一轮对话」
+        需要能区分"同一会话的第 N 轮"，所以在这里补上，不改动原模块。
+        """
+        try:
+            ep = memory_store.get_episode(episode_id)
+            if not ep:
+                return
+            ep["sessionId"] = session_id
+            ep["roundIndex"] = round_index
+            ep["model"] = model
+            ep["response"] = response
+            import os as _os
+            fp = _os.path.join(memory_store.EPISODES_DIR, f"{episode_id}.json")
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump(ep, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            _log(f"Memory: annotate failed: {e}")
 
     def get_health(self) -> Dict[str, Any]:
         """获取健康状态"""
