@@ -11,10 +11,8 @@ Agentic Workflow/qmclaw-server/dist/
 Agentic Workflow/qmclaw-server/data/
 Agentic Workflow/qmclaw-server/logs/
 Agentic Workflow/qmclaw-web/public/plots/
-Agentic Workflow/qmclaw-server/config/memory/episodes/
-Agentic Workflow/qmclaw-server/config/memory/skills/
+Agentic Workflow/qmclaw-server/config/memory/
 .claude/
-CLAUDE.md
 build/
 dist/
 offline_data/
