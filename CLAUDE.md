@@ -40,8 +40,16 @@ quantum_service 和 analysis_service 支持离线模式，可在 LabRAD 不可�
 9. 当前系统有后端打印日志的过滤器，只有满足特定声明逻辑的日志才能被打印到后端的终端窗口里。所以当你要增加后端日志的时候，需要检查一下后端日志过滤器(Agentic Workflow\qmclaw-server\src\index.ts)。
 10. python用这个D:\semester4\deploy\qmclaw\qmclaw\python.exe（本机实际使用的解释器，Python 3.11.16，已装 249 个包）
     - 原文档写的 `C:\Users\HUAWEI\.conda\envs\qmclaw\python.exe` 是他人机器的路径，本机不存在
-11. **每次修改后做一次 git 提交**：完成一处改动（代码 / 配置 / 文档）就立刻 `git add` 相关文件并 `git commit`，不要攒成一大堆。
+11. **按节奏提交，不是每改一个文件就提交**：累计到一定量或碰上重要节点时 `git commit`。
+    - **攒够 3~5 处改动**提交一次；一次任务 / 会话收尾前必须提交干净，不留半成品在树上
+    - **重要操作前后必须各自提交一次**（提交作为回退点）：
+      - 动约定、配置、依赖（`CLAUDE.md`、`model_configs.json`、`.env`、`requirements.txt`）之后
+      - 重构 / 批量替换之前先提交一版干净基线，之后提交一版结果
+      - 删除文件、清理数据、改数据库或 memory 之前
+      - 推送（`git push`）之前
     - 提交信息带 scope，例如 `fix(memory): 修正离线索引生成目录`、`feat(hermes): 模型接口与 agent 对齐`
     - **提交前必须确认没有把密钥加进去**：`.env` 已在 `.gitignore` 中，不要用 `git add -f` 强加；
-      提交前用 `git grep --cached -E "sk-[a-zA-Z0-9]{20,}"` 扫一遍
+      提交前和**推送前**各扫一遍（过滤掉 `.env.example.demo` 里的 `sk-xxxx...` 占位符）：
+      `git grep --cached -E "sk-[a-zA-Z0-9]{20,}" | Select-String -NotMatch "sk-x{20,}"`
+      一旦误提交并已推送，改历史无用，必须去平台吊销并轮换密钥
     - 只提交本次改动涉及的文件，不要 `git add -A` 把无关的构建产物（如 `tsconfig.tsbuildinfo`）一起带上
