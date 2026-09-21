@@ -1,13 +1,6 @@
 {
   "episodes": [
     {
-      "id": "ep_20260922_003122_470d0464",
-      "timestamp": "2026-09-22T00:31:22.757811",
-      "qubit": null,
-      "status": "success",
-      "task_preview": "你好"
-    },
-    {
       "id": "ep_20260903_200223_2b691ed4",
       "timestamp": "2026-09-03T20:02:23.057327",
       "qubit": "q25_7",
@@ -36,5 +29,5 @@
       "status": "active"
     }
   ],
-  "last_updated": "2026-09-22T00:31:22.757811"
+  "last_updated": "2026-09-22T01:29:09.278147"
 }
