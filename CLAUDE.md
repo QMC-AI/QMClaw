@@ -39,3 +39,8 @@ quantum_service 和 analysis_service 支持离线模式，可在 LabRAD 不可�
 8. 计划模式下，或者用户明确让制定计划的时候，需要多向用户提问，详细了解需求。
 9. 当前系统有后端打印日志的过滤器，只有满足特定声明逻辑的日志才能被打印到后端的终端窗口里。所以当你要增加后端日志的时候，需要检查一下后端日志过滤器(Agentic Workflow\qmclaw-server\src\index.ts)。
 10. python用这个C:\Users\HUAWEI\.conda\envs\qmclaw\python.exe
+11. **每次修改后做一次 git 提交**：完成一处改动（代码 / 配置 / 文档）就立刻 `git add` 相关文件并 `git commit`，不要攒成一大堆。
+    - 提交信息带 scope，例如 `fix(memory): 修正离线索引生成目录`、`feat(hermes): 模型接口与 agent 对齐`
+    - **提交前必须确认没有把密钥加进去**：`.env` 已在 `.gitignore` 中，不要用 `git add -f` 强加；
+      提交前用 `git grep --cached -E "sk-[a-zA-Z0-9]{20,}"` 扫一遍
+    - 只提交本次改动涉及的文件，不要 `git add -A` 把无关的构建产物（如 `tsconfig.tsbuildinfo`）一起带上
