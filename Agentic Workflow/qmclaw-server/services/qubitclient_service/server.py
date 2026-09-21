@@ -149,7 +149,11 @@ class QubitClientService(BaseService):
                 )
                 _log("QubitLLM client initialized")
             except ImportError as e:
-                raise RuntimeError(f"Failed to import QubitClient: {e}. Install with: pip install -e vendor/QubitClient")
+                raise RuntimeError(
+                    f"Failed to import QubitClient: {e}. "
+                    "Install with: pip install -e <repo>/vendor/QubitClient "
+                    "(see services/qubitclient_service/requirements.txt)"
+                )
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize QubitLLM: {e}")
 

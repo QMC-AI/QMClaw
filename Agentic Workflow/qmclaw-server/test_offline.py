@@ -62,7 +62,14 @@ for f in test_files:
     print()
 
 # Scan actual files
-data_path = Path("D:/Documents/QMClaw/Agentic Workflow/offline_data")
+# 与运行时保持一致：data_path 相对 qmclaw-server 根解析（见 config/fallback_config.json）
+data_path = Path(__file__).resolve().parent / "data" / "offline_data"
+if not data_path.exists():
+    raise SystemExit(
+        f"offline data not found: {data_path}\n"
+        r"copy deploy\offline_data there first, then run:" "\n"
+        "  python -m services.common.offline_data_provider --generate-index"
+    )
 datasets = []
 
 for date_dir in sorted(data_path.iterdir()):

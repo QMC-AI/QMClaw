@@ -136,8 +136,12 @@ class AnalysisService(BaseService):
             self._current_task_id = None
 
     def _find_qmclaw_root(self) -> Path:
-        """找到 QMClaw 根目录"""
-        current = Path(__file__).parent  # .../services/analysis_service
+        """找到 QMClaw 根目录
+
+        向上查找含 measure_scripts 的目录。找不到时直接抛错，
+        而不是回退到写死的旧路径。
+        """
+        current = Path(__file__).resolve().parent  # .../services/analysis_service
         for _ in range(10):
             if (current / "measure_scripts").exists():
                 return current
@@ -145,7 +149,11 @@ class AnalysisService(BaseService):
             if not parent or str(parent) == str(current):
                 break
             current = parent
-        return Path("D:/QMClaw")
+        raise RuntimeError(
+            f"QMClaw root not found from {Path(__file__).resolve()} — "
+            "expected an ancestor directory containing 'measure_scripts'. "
+            "Set BACKEND_DIR / MEASURE_SCRIPTS env vars if the repo layout is non-standard."
+        )
 
     def _setup_paths(self):
         """设置 Python 路径"""

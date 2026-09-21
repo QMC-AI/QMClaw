@@ -408,7 +408,7 @@ def generate_offline_index(data_path: str, output_path: Optional[str] = None) ->
 
     Args:
         data_path: 离线数据目录路径
-        output_path: 输出目录路径（默认 data/offline）
+        output_path: 输出目录路径（默认与 data_path 相同）
 
     Returns:
         索引摘要
@@ -420,8 +420,11 @@ def generate_offline_index(data_path: str, output_path: Optional[str] = None) ->
         return {"success": False, "error": "Failed to load offline data"}
 
     # 生成输出目录
+    # 读取端 OfflineDataProvider.load() 从 <data_path>/qubits.json 读取索引，
+    # 所以默认输出目录必须就是 data_path 本身；写成 data_path/../offline
+    # 会导致生成的索引永远不会被读到。
     if output_path is None:
-        output_path = Path(data_path).parent / "offline"
+        output_path = Path(data_path)
     else:
         output_path = Path(output_path)
 

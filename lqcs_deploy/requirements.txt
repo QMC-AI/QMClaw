@@ -9,7 +9,11 @@ pyvisa
 apscheduler
 h5py
 adjustText
-cryptography==36.0.0
+# cryptography==36.0.0 与 qmclaw-server/python/requirements.txt 的
+#   pyopenssl>=24.0.0  （该处注释明确写着 "older versions incompatible with cryptography>=50.0.0"）
+# 互斥，无法同时满足。实测 deploy 环境选择的是 cryptography 50.0.0 + pyopenssl 26.4.0。
+# 因此这里跟随实际可用组合，不再钉 36.0.0。（见 docs/TODO_RUNTIME.md 待办 21）
+cryptography>=50.0.0
 numpy-quaternion
 physics-tenpy
 cssselect

@@ -1,3 +1,12 @@
 # QubitClient Service dependencies
--e ../../../vendor/QubitClient
+#
+# 路径修正：本文件位于
+#   <repo>/Agentic Workflow/qmclaw-server/services/qubitclient_service/requirements.txt
+# 仓库根的 vendor/QubitClient 需要退 4 级：
+#   qubitclient_service -> services -> qmclaw-server -> Agentic Workflow -> <repo>
+# 原先是 ../../../（3 级），会解析到 <repo>/Agentic Workflow/vendor/QubitClient，指不到。
+#
+# 用法（在 qmclaw-server 目录下）：
+#   pip install -r services/qubitclient_service/requirements.txt
+-e ../../../../vendor/QubitClient
 openai>=1.0.0

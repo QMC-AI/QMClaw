@@ -14,8 +14,14 @@ from typing import Any, Optional
 from langchain_core.tools import tool
 
 # Add vendor directory to path for imports
-VENDOR_DIR = Path(r"D:\Documents\QMClaw\vendor\Quantum-Calibration-Agent-Blueprint")
+# __file__ = .../services/qca_service/tools/lab_tool.py → repo root is parents[5]
 import sys
+VENDOR_DIR = Path(__file__).resolve().parents[5] / "vendor" / "Quantum-Calibration-Agent-Blueprint"
+if not VENDOR_DIR.exists():
+    raise RuntimeError(
+        f"vendor QCA not found: {VENDOR_DIR} — "
+        r"copy deploy\vendor\Quantum-Calibration-Agent-Blueprint to QMClaw\vendor\ first"
+    )
 if str(VENDOR_DIR) not in sys.path:
     sys.path.insert(0, str(VENDOR_DIR))
 

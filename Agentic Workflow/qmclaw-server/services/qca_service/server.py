@@ -35,7 +35,14 @@ if str(_QMCLAW_SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(_QMCLAW_SERVER_DIR))
 
 # Add vendor QCA Blueprint to sys.path
-VENDOR_QCA_DIR = Path(r"D:\Documents\QMClaw\vendor\Quantum-Calibration-Agent-Blueprint")
+# _SERVICE_DIR = .../Agentic Workflow/qmclaw-server/services/qca_service
+# repo root = _SERVICE_DIR.parents[3] = D:\semester4\QMClaw
+VENDOR_QCA_DIR = _SERVICE_DIR.parents[3] / "vendor" / "Quantum-Calibration-Agent-Blueprint"
+if not VENDOR_QCA_DIR.exists():
+    raise RuntimeError(
+        f"vendor QCA not found: {VENDOR_QCA_DIR} — "
+        r"copy deploy\vendor\Quantum-Calibration-Agent-Blueprint to QMClaw\vendor\ first"
+    )
 if str(VENDOR_QCA_DIR) not in sys.path:
     sys.path.insert(0, str(VENDOR_QCA_DIR))
 

@@ -17,6 +17,16 @@ import threading
 import queue
 from pathlib import Path
 
+# Windows 控制台/管道默认可能是 GBK。本脚本会打印 ✅/⏳/⚠️ 等字符，
+# 一旦 stdout 编码不是 UTF-8，print 会抛 UnicodeEncodeError，
+# 进而让整个启动流程异常退出并连带杀掉已经起来的子服务。
+# 这里显式把两个流切到 UTF-8，避免"服务其实起得来、却被收尾逻辑干掉"。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # 加载 .env 文件
 try:
     from dotenv import load_dotenv

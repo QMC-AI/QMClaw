@@ -17,9 +17,12 @@ _labrad_lock = threading.Lock()
 
 
 def _get_qmclaw_root() -> Path:
-    """获取 QMClaw 根目录"""
-    # 从当前文件向上查找 measure_scripts
-    current = Path(__file__).parent.parent.parent  # .../services/quantum_service
+    """获取 QMClaw 根目录
+
+    从本文件向上查找含 measure_scripts 的目录。找不到时直接抛错，
+    而不是回退到某个写死的旧路径（那会让问题在更晚、更难定位的地方爆发）。
+    """
+    current = Path(__file__).resolve().parent.parent.parent  # .../qmclaw-server
     for _ in range(10):
         if (current / "measure_scripts").exists():
             return current
@@ -27,7 +30,11 @@ def _get_qmclaw_root() -> Path:
         if not parent or str(parent) == str(current):
             break
         current = parent
-    return Path("D:/QMClaw")
+    raise RuntimeError(
+        f"QMClaw root not found from {Path(__file__).resolve()} — "
+        "expected an ancestor directory containing 'measure_scripts'. "
+        "Set BACKEND_DIR / MEASURE_SCRIPTS env vars if the repo layout is non-standard."
+    )
 
 
 def _setup_paths():
