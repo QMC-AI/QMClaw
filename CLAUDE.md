@@ -15,6 +15,21 @@
 **API Key 说明**：从环境变量读取，不保存在配置文件中
 - `OPENAI_API_KEY`、`MINIMAX_API_KEY`、`ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`
 
+## 记忆数据（不纳入版本控制）
+
+agent 的长期记忆存放在 `qmclaw-server/config/memory/`，**整个目录都在 `.gitignore` 中**：
+
+| 路径 | 内容 |
+|------|------|
+| `episodes/*.json` | 每轮对话的完整记录（task / steps / status / metrics / response） |
+| `skills/*.json` | 从对话里沉淀出的可复用技能 |
+| `index.json` | 上面两者的摘要索引，每轮对话都会被重写 |
+
+- **只存在于本地**：迁移机器或交付时必须**手工拷贝整个 `config/memory/` 目录**。
+  漏拷会产生"索引里有记录、实体文件已丢失"的孤儿状态，`GET /memory/stats` 的 `orphanCount` 会暴露它
+- **不要放进 git**：`index.json` 每轮对话都变，且单独存在没有意义 —— 它引用的是未跟踪的实体文件，
+  clone 下来只会得到一份悬空目录
+
 ## 离线模式
 
 quantum_service 和 analysis_service 支持离线模式，可在 LabRAD 不可用时使用历史数据：
