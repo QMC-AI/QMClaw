@@ -275,6 +275,28 @@ class QuantumService(BaseService):
         with self._mode_lock:
             return self._mode
 
+    @staticmethod
+    def _json_safe(obj: Any) -> Any:
+        """把结果里的 numpy 类型递归转成可 JSON 序列化的原生类型。
+
+        防御性措施：一旦结果里混进 ndarray/np.float64，base_service 的
+        json.dumps 会抛 "Object of type ndarray is not JSON serializable"，
+        整个响应退化成 500 —— 而错误信息还带在响应体里，排查起来很绕。
+        """
+        try:
+            import numpy as _np
+        except ImportError:
+            return obj
+        if isinstance(obj, dict):
+            return {k: QuantumService._json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [QuantumService._json_safe(v) for v in obj]
+        if isinstance(obj, _np.ndarray):
+            return obj.ravel().tolist()
+        if isinstance(obj, _np.generic):
+            return obj.item()
+        return obj
+
     def _execute_offline_simulation(self, code: str, task_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         离线模式模拟执行
@@ -315,7 +337,7 @@ class QuantumService(BaseService):
                  f"exp_type={result.get('exp_type')}, "
                  f"qubit={result.get('qubit')}")
 
-            return result
+            return self._json_safe(result)
 
         except Exception as e:
             _log(f"[OFFLINE SIM] Error: {e}\n{traceback.format_exc()}")

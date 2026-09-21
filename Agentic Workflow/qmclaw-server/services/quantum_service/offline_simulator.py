@@ -200,6 +200,48 @@ class ExperimentSimulator:
         self._last_simulation_result = result
         return result
 
+    # 历史数据里扫描轴的原生单位 -> SI 的换算系数。
+    # 依据是对本仓库离线数据的实测抽样：
+    #   t1 0..84000 / ramsey 0..9900 / spinechocpmg 0..29800   -> 纳秒
+    #   s21 6.45..6.49 / spectroscopy 2.6..3.6（GHz 量级）      -> GHz
+    #   iqraw 0..2999、xeb 0..29（样本序号）、piamp*（无量纲）  -> 无需换算
+    # 模拟器的合成数据路径用的就是 SI，若不归一化，真实数据与合成数据
+    # 会相差 1e9 量级（例如 T1 会报成 8000 µs 这种荒谬值）。
+    X_UNIT_SCALE = {
+        "t1": 1e-9,
+        "ramsey": 1e-9,
+        "ramsey_df": 1e-9,
+        "spinechocpmg": 1e-9,
+        "s21": 1e9,
+        "s21_dis": 1e9,
+        "s21power2d": 1e9,
+        "s21zpa2d": 1e9,
+        "spectroscopy": 1e9,
+        "spectroscopyauto": 1e9,
+    }
+
+    def _load_data(self, exp_type: str, dataset: Any) -> Optional[Dict[str, Any]]:
+        """加载数据集，并把扫描轴从历史数据的原生单位换算到 SI。
+
+        必须在**计算 metrics / 生成 stdout 之前**完成换算 —— 否则 stdout 里
+        会留下未换算的原始值（例如 T1 报成 8000），而 metrics 却是换算后的值，
+        两者自相矛盾。
+        """
+        h = self._provider.load_hdf5_data(dataset.file_path)
+        if not h:
+            return h
+        scale = self.X_UNIT_SCALE.get(exp_type)
+        if not scale or scale == 1.0:
+            return h
+        d = h.get("data")
+        if isinstance(d, dict) and d.get("x") is not None:
+            try:
+                arr = np.asarray(d["x"], dtype=float).ravel()
+                d["x"] = (arr * scale).tolist()
+            except (TypeError, ValueError):
+                pass
+        return h
+
     def _simulate_frequency_sweep(
         self,
         exp_type: str,
@@ -209,7 +251,7 @@ class ExperimentSimulator:
     ) -> Dict[str, Any]:
         """模拟频率扫描实验（如 S21、spectroscopy）"""
         # 加载原始数据
-        hdf5_data = self._provider.load_hdf5_data(dataset.file_path)
+        hdf5_data = self._load_data(exp_type, dataset)
         if not hdf5_data:
             return self._generate_synthetic_data(exp_type, qubit, params)
 
@@ -276,7 +318,7 @@ Peak value: {peak_val:.6f}
     ) -> Dict[str, Any]:
         """模拟指数衰减实验（如 T1）"""
         # 加载原始数据
-        hdf5_data = self._provider.load_hdf5_data(dataset.file_path)
+        hdf5_data = self._load_data(exp_type, dataset)
         if not hdf5_data:
             return self._generate_synthetic_data(exp_type, qubit, params)
 
@@ -340,7 +382,7 @@ T1 estimate: {t1_estimate * 1e6:.2f} us
         params: Dict[str, Any]
     ) -> Dict[str, Any]:
         """模拟阻尼振荡实验（如 Ramsey）"""
-        hdf5_data = self._provider.load_hdf5_data(dataset.file_path)
+        hdf5_data = self._load_data(exp_type, dataset)
         if not hdf5_data:
             return self._generate_synthetic_data(exp_type, qubit, params)
 
@@ -396,7 +438,7 @@ T2* estimate: {t2_estimate * 1e6:.2f} us
         params: Dict[str, Any]
     ) -> Dict[str, Any]:
         """模拟 IQ 聚类实验（如 iqraw、single_shot）"""
-        hdf5_data = self._provider.load_hdf5_data(dataset.file_path)
+        hdf5_data = self._load_data(exp_type, dataset)
         if not hdf5_data:
             return self._generate_synthetic_data(exp_type, qubit, params)
 
@@ -464,7 +506,7 @@ Separation: {separation:.6f}
         params: Dict[str, Any]
     ) -> Dict[str, Any]:
         """模拟 Rabi 振荡实验（如 piamp）"""
-        hdf5_data = self._provider.load_hdf5_data(dataset.file_path)
+        hdf5_data = self._load_data(exp_type, dataset)
         if not hdf5_data:
             return self._generate_synthetic_data(exp_type, qubit, params)
 
@@ -528,7 +570,7 @@ Pi amplitude estimate: {pi_amp:.4f}
     ) -> Dict[str, Any]:
         """模拟 XEB 实验"""
         # XEB 通常需要模拟多个门的保真度
-        hdf5_data = self._provider.load_hdf5_data(dataset.file_path)
+        hdf5_data = self._load_data(exp_type, dataset)
         if not hdf5_data:
             return self._generate_synthetic_data(exp_type, qubit, params)
 
@@ -648,7 +690,7 @@ Optimal DRAG coefficient: {optimal_drag:.4f}
         params: Dict[str, Any]
     ) -> Dict[str, Any]:
         """通用模拟方法"""
-        hdf5_data = self._provider.load_hdf5_data(dataset.file_path)
+        hdf5_data = self._load_data(exp_type, dataset)
         if not hdf5_data:
             return self._generate_synthetic_data(exp_type, qubit, params)
 
@@ -757,10 +799,22 @@ Experiment: {exp_type}
             xlabel = "Time (s)"
             ylabel = "Amplitude"
 
+        # 必须转成纯 Python list：真实数据路径传进来的是 numpy 数组，
+        # 直接返回会导致服务端 JSON 序列化失败（"Object of type ndarray is not
+        # JSON serializable"），响应体退化成 500。合成路径本来就已 tolist()。
+        try:
+            x_out = np.asarray(x, dtype=float).ravel().tolist()
+        except (TypeError, ValueError):
+            x_out = list(x) if x is not None else []
+        try:
+            y_out = np.asarray(y, dtype=float).ravel().tolist()
+        except (TypeError, ValueError):
+            y_out = list(y) if y is not None else []
+
         return {
             "type": "line",
-            "x": x,
-            "y": y,
+            "x": x_out,
+            "y": y_out,
             "xlabel": xlabel,
             "ylabel": ylabel,
             "title": f"{exp_type} on {qubit or 'unknown'} (Offline Sim)",
