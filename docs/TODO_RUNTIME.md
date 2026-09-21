@@ -580,6 +580,56 @@ qca 0.1.0 has requirement rich==14.3.4, but you have rich 14.3.3.
 
 ---
 
+## 已知局限（本轮明确记录、不修，待后续处理）
+
+以下 4 条是在打通 agent「对 q10lu12 运行 t1 实验」链路时发现的，按约定只记录不改动。
+
+### L1. 离线模拟器的 T1 数值不是真拟合 ★ 优先
+
+`services/quantum_service/offline_simulator.py` 的 `_simulate_exponential_decay`：
+
+```python
+# 拟合 T1 (简化估算)
+t1_idx = len(y) // 3
+t1_estimate = float(x[t1_idx])
+```
+
+它只是**取曲线 1/3 处的 x 值当作 T1**，不是指数拟合（代码注释自己也写着"简化估算"）。
+所以即使命中真实历史数据，`metrics.t1` 在语义上也只是占位值。
+
+**建议后续**：用 `scipy.optimize.curve_fit` 拟合 `a*exp(-t/T1)+c`，并从残差给出置信区间。
+同类问题也存在于 `_simulate_damped_oscillation`（T2）。
+
+### L2. `X_UNIT_SCALE` 单位换算表是从实测推断的，需与实验室确认
+
+离线 HDF5 的扫描轴用 ns / GHz，而模拟器合成路径用 SI，量级差 1e9。
+本轮新增的换算依据是对 17 类实验的抽样实测：
+
+| 类型 | 实测范围 | 推断单位 | 换算 |
+|---|---|---|---|
+| `t1` / `ramsey` / `spinechocpmg` | 0..84000 / 9900 / 29800 | ns | 1e-9 |
+| `s21*` / `spectroscopy*` | 6.45..6.49 / 2.6..3.6 | GHz | 1e9 |
+| `iqraw` / `xeb` / `piamp*` 等 | 序号或无量纲 | — | 1 |
+
+**未覆盖**：`pipulse_df`（实测 -0.03..0.03，疑为失谐 GHz）、`pulseshape`、`timingxyz`
+暂按不换算处理。**建议向实验室确认这些量的单位后补全表**。
+
+### L3. Ramsey 的数据类型名与模拟器查询名不匹配
+
+离线索引里存的是 `ramsey df`（带空格），而模拟器查的是 `ramsey_df`
+（`offline_data_provider.EXPERIMENT_TYPE_MAP` 未收录 `ramsey df`），因此
+**Ramsey 即使有真实数据也会走合成路径**。t1 不受影响。
+修法：把 `ramsey df` 加进 `EXPERIMENT_TYPE_MAP` 映射到 `ramsey_df`。
+
+### L4. `get_qubit_params` 查不到离线数据里的 qubit
+
+实测 `get_qubit_params({"qubit_name": "q10lu12"})` 返回
+`Qubit 'q10lu12' not found`，而 `/qubits` 能列出 111 个（含 q10lu12）。
+说明该工具的参数查询走的是 LabRAD/DataVault 路径，与离线 provider 不是同一数据源。
+不影响实验执行（`run_experiment` 正常），但会让 agent 多绕一步。
+
+---
+
 ## 建议执行顺序
 
 ```
