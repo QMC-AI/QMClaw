@@ -49,12 +49,20 @@ class LLMService(BaseService):
         _log("Initializing LLM service...")
         self._init_providers()
 
+    @staticmethod
+    def _mask(secret: Optional[str]) -> str:
+        """脱敏显示密钥：只暴露长度，绝不打印内容"""
+        if not secret:
+            return "(not set)"
+        return f"SET (len={len(secret)})"
+
     def _init_providers(self):
         """初始化 Provider 客户端"""
-        # 调试：打印 config 中的值
-        _log(f"DEBUG: minimax_api_key = '{config.get('minimax_api_key')}'")
-        _log(f"DEBUG: openai_api_key = '{config.get('openai_api_key')}'")
-        _log(f"DEBUG: deepseek_api_key = '{config.get('deepseek_api_key')}'")
+        # 只报告密钥是否存在，不打印内容
+        _log(f"API keys: minimax={self._mask(config.get('minimax_api_key'))} "
+             f"openai={self._mask(config.get('openai_api_key'))} "
+             f"anthropic={self._mask(config.get('anthropic_api_key'))} "
+             f"deepseek={self._mask(config.get('deepseek_api_key'))}")
 
         # MiniMax
         if config.get("minimax_api_key"):
@@ -107,10 +115,15 @@ class LLMService(BaseService):
             elif model.startswith("gpt") or model.startswith("openai"):
                 result = self._call_openai(messages, model, temperature, max_tokens)
             elif model.startswith("deepseek"):
-                result = self._call_deepseek(messages, temperature, max_tokens)
+                result = self._call_deepseek(messages, temperature, max_tokens, model)
             else:
-                # 默认使用 MiniMax
-                result = self._call_minimax(messages, temperature, max_tokens)
+                # 未知 model：回退到唯一配置了 key 的 provider，而不是硬走 MiniMax
+                if config.get("deepseek_api_key"):
+                    _log(f"Unknown model '{model}', falling back to deepseek")
+                    result = self._call_deepseek(messages, temperature, max_tokens, "deepseek-flash")
+                else:
+                    _log(f"Unknown model '{model}', falling back to minimax")
+                    result = self._call_minimax(messages, temperature, max_tokens)
 
             # 更新统计
             with self._request_lock:
@@ -282,8 +295,13 @@ class LLMService(BaseService):
             "raw": result,
         }
 
-    def _call_deepseek(self, messages: List[Dict], temperature: float, max_tokens: int) -> Dict[str, Any]:
-        """调用 DeepSeek API"""
+    def _call_deepseek(self, messages: List[Dict], temperature: float,
+                       max_tokens: int, model: str = "deepseek-flash") -> Dict[str, Any]:
+        """调用 DeepSeek API
+
+        model 由调用方传入。旧版本这里硬编码 "deepseek-chat"，
+        导致上层选什么模型都被忽略（deepseek-chat 实际是 deepseek-flash 的别名）。
+        """
         import urllib.request
         import urllib.error
 
@@ -294,8 +312,12 @@ class LLMService(BaseService):
 
         url = "https://api.deepseek.com/chat/completions"
 
+        # 只接受 deepseek 系列，避免把别的 provider 的 model id 传过去
+        if not model or not model.startswith("deepseek"):
+            model = "deepseek-flash"
+
         payload = {
-            "model": "deepseek-chat",
+            "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,

@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { api } from "../lib/api";
+import { useModelStore } from "../store/modelStore";
 
 interface HermesMessage {
   role: "user" | "assistant";
@@ -31,7 +32,8 @@ interface HermesModel {
   provider?: string;
 }
 
-const DEFAULT_HERMES_MODEL = "minimax/MiniMax-M2.7";
+// 模型不再硬编码默认值：与 AgentChatPanel 一致，加载列表后选第一个 enabled 的 text 模型。
+// （原先的 "minimax/MiniMax-M2.7" 在 model_configs.json 里根本不存在。）
 
 const HERMES_TOOLSETS = [
   { id: "web", label: "Web", desc: "Search and browse" },
@@ -43,27 +45,29 @@ const HERMES_TOOLSETS = [
 export default function HermesChatPanel() {
   const [messages, setMessages] = useState<HermesMessage[]>([]);
   const [input, setInput] = useState("");
-  const [model, setModel] = useState(DEFAULT_HERMES_MODEL);
+  const [model, setModel] = useState("");
   const [running, setRunning] = useState(false);
   const [sessionId] = useState(() => `hermes_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
   const [enabledToolsets, setEnabledToolsets] = useState<string[]>(["web"]);
-  const [models, setModels] = useState<HermesModel[]>([]);
   const [error, setError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Fetch available models
+  // 与 AgentChatPanel 用**同一个** modelStore —— 同一份数据源、同一套默认值策略、
+  // 同一个 id 语义。这样两个面板的模型下拉框始终一致。
+  const models = useModelStore((s) => s.models);
+  const fetchModels = useModelStore((s) => s.fetchModels);
+
   useEffect(() => {
-    api.hermesGetModels()
-      .then((res: any) => setModels(res.models || []))
-      .catch(() => {
-        // Fallback to hardcoded models
-        setModels([
-          { id: "MiniMax-M2.7", name: "MiniMax M2.7", provider: "minimax" },
-          { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet", provider: "anthropic" },
-          { id: "deepseek-chat", name: "DeepSeek Chat", provider: "deepseek" },
-        ]);
-      });
-  }, []);
+    fetchModels();
+  }, [fetchModels]);
+
+  const textModels = models.filter((m) => m.enabled && m.capabilities.includes("text"));
+
+  useEffect(() => {
+    if (textModels.length > 0 && !model) {
+      setModel(textModels[0].id);
+    }
+  }, [textModels, model]);
 
   // Auto-scroll to bottom
   useEffect(() => {

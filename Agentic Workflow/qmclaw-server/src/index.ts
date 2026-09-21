@@ -2621,27 +2621,18 @@ app.post("/api/hermes/chat/stream", async (req, res) => {
 
 /** GET /api/hermes/models — Get available models for Hermes */
 app.get("/api/hermes/models", (_req, res) => {
-  const configPath = path.join(__dirname, "..", "config", "model_configs.json");
-  let models: Array<{ id: string; name: string; provider: string; base_url?: string }> = [];
-
+  // 与 GET /api/models 使用**同一个** listModels()，保证两处的模型列表、
+  // 字段结构、id 语义、排序完全一致。
+  //
+  // 旧实现是这里内联读 model_configs.json 并把 id 映射成 m.modelId，
+  // 导致 agent 与 hermes 两套模型标识符语义不同，只能靠"id 恰好等于 modelId"侥幸工作。
+  // 外层保留 { models: [...] } 包装以兼容 HermesChatPanel 的取用方式。
   try {
-    const data = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    models = (data.models || [])
-      .filter((m: any) => m.enabled)
-      .map((m: any) => ({
-        id: m.modelId || m.name,
-        name: m.name,
-        provider: m.provider,
-        base_url: m.baseUrl || undefined,
-      }));
-  } catch (e) {
-    console.error("Failed to load model configs:", e);
-    models = [
-      { id: "MiniMax-M2.7", name: "MiniMax M2.7", provider: "minimax", base_url: "https://api.minimaxi.com/" },
-    ];
+    res.json({ models: listModels() });
+  } catch (err: any) {
+    console.error("Failed to load model configs:", err);
+    res.status(500).json({ error: err.message, models: [] });
   }
-
-  res.json({ models });
 });
 
 // ── MCP Tools CRUD ─────────────────────────────────────────────────────────────

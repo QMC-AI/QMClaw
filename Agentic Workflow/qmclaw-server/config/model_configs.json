@@ -1,6 +1,22 @@
 {
   "models": [
     {
+      "id": "deepseek-flash",
+      "name": "DeepSeek Flash",
+      "provider": "deepseek",
+      "modelId": "deepseek-flash",
+      "enabled": true,
+      "capabilities": [
+        "text"
+      ],
+      "config": {
+        "temperature": 0.3,
+        "maxTokens": 4096
+      },
+      "createdAt": "2026-09-21T00:00:00.000Z",
+      "updatedAt": "2026-09-21T00:00:00.000Z"
+    },
+    {
       "id": "model_default_001",
       "name": "GPT-4o",
       "provider": "openai",
