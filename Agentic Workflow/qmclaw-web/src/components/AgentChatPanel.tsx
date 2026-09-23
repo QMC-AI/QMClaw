@@ -44,6 +44,10 @@ const AGENT_MODES = [
   { value: "reflexion", label: "Reflexion", desc: "执行后反思纠错" },
 ];
 
+// 与 page.tsx / lib/api.ts 同一取值方式。图表若以 /plots/xxx.png 相对路径返回，
+// 需要拼上后端地址才能被 <img> 加载。
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
+
 export default function AgentChatPanel() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -371,6 +375,52 @@ export default function AgentChatPanel() {
                         </div>
                       ))}
                     </div>
+                  </div>
+                )}
+
+                {/* Charts */}
+                {msg.charts && msg.charts.length > 0 && (
+                  <div style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "8px" }}>
+                    <div style={{ fontSize: "11px", color: "#38bdf8", fontWeight: 700 }}>
+                      📈 实验图表
+                    </div>
+                    {msg.charts.map((chart, ci) => {
+                      // 两种来源都要支持：
+                      //   data:image/png;base64,...  —— experiments 页同款图
+                      //   /plots/xxx.png            —— 离线模拟器自绘的图
+                      const src = /^(data:|https?:)/.test(chart) ? chart : `${API_BASE}${chart}`;
+                      return (
+                        <div key={ci} style={{
+                          background: "#0f172a",
+                          border: "1px solid #1e293b",
+                          borderRadius: "8px",
+                          padding: "8px",
+                        }}>
+                          <img
+                            src={src}
+                            alt={`chart-${ci + 1}`}
+                            style={{ maxWidth: "100%", borderRadius: "4px", display: "block" }}
+                          />
+                          <div style={{ marginTop: "6px", display: "flex", gap: "12px", fontSize: "10px" }}>
+                            <a
+                              href={src}
+                              download={`chart-${ci + 1}.png`}
+                              style={{ color: "#38bdf8", textDecoration: "none" }}
+                            >
+                              📥 下载 PNG
+                            </a>
+                            <a
+                              href={src}
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{ color: "#94a3b8", textDecoration: "none" }}
+                            >
+                              ↗ 新标签打开
+                            </a>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
 
