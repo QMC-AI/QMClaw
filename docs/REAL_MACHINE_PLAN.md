@@ -5,7 +5,8 @@
 > `services/analysis_service/server.py`、`config/system.json`、`config/fallback_config.json`
 > 的静态审阅，加上对已装 `lqcs`/`lqms`/`labrad` 包的只读探查。
 > **相关文档**：`docs/CHANGES_VS_SOURCE.md`（已完成的能力）、`docs/RUNTIME_DEPS.md`（依赖与接线）、
-> `docs/DEPLOY_DIFF.md`（deploy 包差异）、`docs/ADAPTER_GUIDE.md`（测控系统适配）。
+> `docs/DEPLOY_DIFF.md`（deploy 包差异）、`docs/ADAPTER_GUIDE.md`（测控系统适配）、
+> **`docs/BACKLOG.md`（待办总表，本方案的条目已登记为 C1–C9）**。
 
 ## 实施状态
 

@@ -1,8 +1,12 @@
 # QMClaw 本机运行 TODO List
 
+> **本文档是「本机跑起来」这一阶段的历史执行记录**（含决策与实测证据），已基本完成。
+> **尚未完成的待办请统一看 `docs/BACKLOG.md`** —— 那是唯一的待办入口；
+> 本文档里的 L1–L4 已知局限已迁入 BACKLOG 的 A 组。
+
 > 目标：让 `D:\semester4\QMClaw` 的代码在**本机**跑起来。
 > 所有"缺失"结论都在本机实测得出，不是推断。每条都带**证据**和**验收标准**。
-> 关联：`docs/RUNTIME_DEPS.md`（依赖清单）、`docs/DEPLOY_DIFF.md`（与 deploy 包的差异）。
+> 关联：`docs/RUNTIME_DEPS.md`（依赖清单）、`docs/DEPLOY_DIFF.md`（与 deploy 包的差异）、`docs/BACKLOG.md`（待办总表）。
 
 ---
 
