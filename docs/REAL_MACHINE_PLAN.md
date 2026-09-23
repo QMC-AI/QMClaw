@@ -284,6 +284,10 @@ FileNotFoundError [Errno 2] No usable temporary directory found in [...]
    从只读到可写的提权步骤、故障排查表。
 3. `CLAUDE.md` 增补约定：**写闸门默认关闭；任何打开写权限的操作必须由人显式执行并记录**。
 4. 更新 `docs/CHANGES_VS_SOURCE.md` 中 L4（`get_qubit_params` 查不到离线 qubit）—— 在线模式下自然消解。
+5. **在线时必须把 agent 的图源一并切过去**（新增，见 `docs/CHANGES_VS_SOURCE.md` §三.7）：
+   agent 现在的实验图取自 analysis_service 的**离线**接口 `/plot/offline/v2`。
+   接通真机后若不同时切到在线绘图端点，会出现"已经连上真机、agent 却仍在展示离线/合成的图"
+   —— 这正是 §五 里"数据来源混淆"那一条的具体形态，属于必须一起处理的范围。
 
 ---
 

@@ -18,7 +18,7 @@
 |------|------|------|
 | 自然语言驱动实验 | ✅ | 「对 q10lu12 运行 t1 实验」→ 自动选工具、执行、回填结果 |
 | 真实离线历史数据 | ✅ | 有历史数据的 qubit 走真实数据；没有的走合成并**明确标注** |
-| 图表生成与访问 | ✅ | 生成 PNG，前端经 `/plots/` 访问（HTTP 200） |
+| 图表生成与访问 | ✅ | 前端在聊天气泡里渲染；有真实数据集时与 experiments 页出的图**逐字节相同** |
 | 长期记忆 | ✅ | 每轮对话落 episode，`/memory/*` 8 个端点可用 |
 | 多轮会话串联 | ✅ | 同一 `sessionId` 下 `roundIndex` 递增 |
 | 模型切换 | ✅ | 10 个模型配置；agent 与 hermes 两侧接口一致 |
@@ -229,6 +229,51 @@ f1.. = 测量列
 
 - `config/memory/` **整目录**忽略。原规则只忽略了 `episodes/` 与 `skills/` 两个子目录，**漏了 `index.json`** —— 而它每轮对话都会被重写，导致工作树长期带一个 modified 文件；且它单独存在没有意义（引用的是未跟踪的实体文件，clone 下来只是一份悬空目录）
 - 删除 `CLAUDE.md` 一行：该文件已被跟踪，此规则当前无效，但一旦被 untrack 就会**静默**变成不可提交，属于埋雷
+
+---
+
+### 7. agent 实验图表与 experiments 页同源
+
+**提交**：`ff252cd` `5acc1fb` `30a156c` `69608a0`
+
+此前 agent 与 experiments 页各画一套图，版式不同、来源不同：
+
+| | agent（旧） | experiments 页 |
+|---|---|---|
+| 图源 | `quantum_service._generate_simulation_plot`（模拟器自绘） | `analysis_service /plot/offline/v2` → `OfflineQubitUpdater.fitData` |
+| x 轴（t1） | `Time (s)` | `Delay (s)` |
+| 标题 | `t1 on q10lu12 (Offline Sim)` | `q10lu12: t1 (20251103)` |
+| 返回 | `/plots/offline_sim_*.png` 路径 | `data:image/png;base64,...` |
+
+三个缺陷：
+
+1. **前端根本没渲染 `charts`** —— `AgentChatPanel` 声明了 `charts?: string[]` 并读入了值，但渲染只覆盖 `content`/`steps`/`results`/`reflectionReport`，所以后端返回了图用户也看不见。
+2. **`dataset_id` 在工具层被丢掉** —— 离线模拟器已产出 `dataset_id`（`offline_simulator.simulate`），`quantum_service` 也原样透传，但 `RunExperimentTool` 重建 `ExperimentResult` 时只拷贝固定字段，`dataset_id` 在此丢失，上层无从知道这次实验用的是哪个数据集。
+3. **`defaultPlotCommand` 从未被读取** —— experiments 页画图用的就是这个配置字段，agent 侧只读了 `defaultCommand`。
+
+改动后分两档：
+
+| 档 | 条件 | 产出 |
+|---|---|---|
+| Tier 1 | 命中真实数据集（有 `dataset_id`） | 向 `/plot/offline/v2` 取图，**与 experiments 页逐字节相同** |
+| Tier 2 | 合成数据（无 `dataset_id`） | 沿用模拟器 PNG，但版式对齐（t1 的 x 轴改 `Delay (s)`）、标题改为 `{qubit}: {类型} (合成数据)` |
+
+关键取舍：
+
+- **复用 experiments 页的同一个接口**，不新写绘图代码 —— 两边共用一个图源才能保证不漂移；`offline_data_lab.py`（experiments 页的图源）**刻意不改**。
+- **降级优先于失败**：合成数据、analysis_service 未启动、超时、HDF5 读不出、命令执行失败 —— 任一情形都退回模拟器那张图，画图失败绝不让整轮对话失败。
+- **合成数据必须可辨识**：Tier 1 与 Tier 2 的图在标题上明确区分，避免合成值被误读成真实测量。
+- 顺带补了 matplotlib CJK 字体配置 —— `services/` 下此前没有任何字体设置，标题一旦含中文会渲染成方框。
+
+**验收证据**（`q10lu8` 有真实 T1 数据，`q10lu12` 没有）：
+
+```
+Tier 1  q10lu8  : charts[0] 是 data: URL，60639 bytes
+                  SHA256 F87A67F60887FC8FD76BBC11D0209BAF6CA51B612EEC872FA0A36E8E290594A6
+                  与直接调 /plot/offline/v2 的参考图完全一致 → 逐字节相同
+Tier 2  q10lu12 : charts[0] 是 /plots/offline_sim_t1_*.png，HTTP 200 / 74261 bytes
+                  标题 q10lu12: t1 (合成数据) 正常渲染，x 轴 Delay (s)、y 轴 Amplitude
+```
 
 ---
 
