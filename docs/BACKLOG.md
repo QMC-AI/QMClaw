@@ -265,6 +265,113 @@ self._server = HTTPServer((self.config.host, self.config.port), handler)
 
 ---
 
+## F. 新功能：从历史记录点进去继续对话
+
+> **需求**（用户提出）：agent 面板 → Memory → 任务记录里能看到过去的对话，但**只能看结果，不能接着聊**。希望能点进去继续这段对话。
+>
+> 这一组是**新功能**，不是修 bug；但下面 F0 里列的是「为什么现在做不到」的四个根因，其中两个本身就是缺陷。
+
+### F0 ⬜ 现状与根因（已核实）
+
+| # | 根因 | 证据 |
+|---|---|---|
+| 1 | **agent 面板完全没有会话概念** | `AgentChatPanel.tsx` 只有 `const [messages, setMessages] = useState<ChatMessage[]>([])`；全文没有 `sessionId`，不读不写任何持久化 —— **刷新页面即丢** |
+| 2 | **前端从不发送 `session_id`** | 后端 `_handle_chat` 支持 `session_id`（`server.py:588`），`_record_episode` 用 `task.context.get("session_id") or task.task_id`。前端不传 → 每个 episode 的 `sessionId` 就是它自己的 `task_id`（实测：`task_1790158958819` / `task_1790158979904`…**各不相同**）→ **无法把多轮归成一段对话** |
+| 3 | **`roundIndex` 一直是 `null`** | 实测磁盘上 11 个 episode 全是 `"roundIndex": null` |
+| 4 | **MemoryPanel 只有「反思 / 归档」，没有「继续」入口** | `MemoryPanel.tsx` 列表项只有 🤔 / 📦 两个按钮，`DetailView` 只读 |
+
+**顺带发现的另一个死壳**（不在用户描述里，但同一类问题）：
+
+```tsx
+// page.tsx:970-973  —— 聊天页的会话侧栏
+<ChatHistorySidebar
+  currentSessionId={""}                                              // 硬编码空
+  onSelectSession={(id) => { console.log("Select session:", id); }}  // 只打日志
+  onNewSession={() => { console.log("New session"); }}               // 只打日志
+/>
+```
+
+后端 `/api/chat/sessions`（增删查）与 `chatService.ts`（消息数组落盘到 `data/chat_history/`）**都已就绪**，但这个侧栏点击什么都不做。实测 `data/chat_history/` 里 **0 个会话**。
+
+### F1 ⬜ 后端：会话（session）列表与回放接口
+
+`memory_store` + `agent_service`：
+
+1. `memory_store.list_sessions()` —— 扫 `index.json` 的 episodes，按 `sessionId` 分组，返回：`{sessionId, rounds, firstAt, lastAt, taskPreview, qubit, model, status}`
+2. `memory_store.get_session_episodes(session_id)` —— 取该会话全部 episode，按 `roundIndex`（为 null 时退回 `timestamp`）排序
+3. agent_service 新增两个端点（沿用现有 `/memory/*` 前缀路由即可，无需新机制）：
+   - `POST /memory/sessions` —— 会话列表
+   - `GET /memory/sessions/{sessionId}` —— 回放：把 episodes 映射成消息序列
+
+回放的消息形状（与前端 `ChatMessage` 对齐）：
+
+```json
+{ "messages": [
+    {"role": "user",      "content": "<episode.task>",     "timestamp": "..."},
+    {"role": "assistant", "content": "<episode.response>", "steps": [...], "results": {...}}
+] }
+```
+
+**前置**：F0-2 必须先解决（前端开始传 `session_id`），否则新产生的 episode 仍然无法分组。
+
+### F2 ⬜ 前端：agent 面板支持持久会话
+
+1. `AgentChatPanel` 增加 `sessionId` 状态（新建时生成 / 选中时载入），每次 `POST /chat` 带上 `session_id`
+   —— **后端已支持，不用改后端**（`_handle_chat` 会把它透传进 `task.context`，`_record_episode` 用它填 `sessionId`）
+2. 续聊时 `roundIndex` 递增（后端字段已有，只需前端带上当前轮次）
+3. 会话列表 UI：可复用 `ChatHistorySidebar` 的交互模式，但**数据源用 memory 的 `/memory/sessions`**（那才是 agent 的对话），不要与聊天页的 `chat_history` 混用
+4. 刷新页面后能恢复：从 `/memory/sessions/{id}` 拉回 messages
+
+### F3 ⬜ 前端：从历史记录点进去继续（用户要的那个功能）
+
+1. `MemoryPanel` 的 `DetailView` 增加「↩ 在此继续对话」按钮
+2. 点击后：
+   - 取该 episode 的 `sessionId`
+   - 拉 `/memory/sessions/{sessionId}` 得到整段对话
+   - 把 messages 填回 `AgentChatPanel`（需要 `MemoryPanel` → `AgentChatPanel` 的回调，或提到共同父组件）
+   - 切到 Chat 视图并聚焦输入框
+3. **退化分支**（重要）：老数据每个 episode 的 `sessionId` 各不相同（F0-2），所以它们都是**单轮会话**。这种情形按钮语义改为「以该任务为起点新建会话」，把该轮的 task/response 作为上下文起点，而不是假装能接上历史
+
+### F4 ⬜ 修复或移除 `page.tsx` 的死壳侧栏
+
+`onSelectSession` / `onNewSession` / `currentSessionId` 三个 prop 目前是空实现。二选一：
+
+- **接上**：`onSelectSession(id)` → `api.getChatSession(id)` → 载入 messages；`onNewSession` → `api.createChatSession(...)`
+- **或移除**：如果这个侧栏对聊天页本来就没用，就删掉，别留一个点了没反应的 UI
+
+**决定点**：这是一个「要不要保留聊天页的会话功能」的产品问题，建议先确认再做。
+
+### F5 ⬜ 数据与兼容性（回放会丢的东西）
+
+| 项 | 现状 | 影响 |
+|---|---|---|
+| **图表** | episode **不存 `charts`**（已核实 schema 无此字段），只有 `response` 文本里提到 `/plots/xxx.png` 路径 | 回放时图会丢。要么补存 charts，要么按 `dataset_id` 重新出图（见 `CHANGES_VS_SOURCE` §三.7） |
+| `roundIndex` | 一直是 `null` | 排序回退到 `timestamp`；新会话开始后应正确填充 |
+| 空 episode | 磁盘上有一条 `ep_20260923_220058_39f37c7f`，`task` 为空 | 列表里应过滤掉 |
+| 老数据的会话分组 | 每个 episode 一个 sessionId | 只能显示为单轮，见 F3 的退化分支 |
+
+### F 验收
+
+1. 新开一段对话跑 3 轮 → 会话列表里显示为**1 个会话、3 轮**（而不是 3 个单轮）
+2. 刷新页面 → 能从历史点进去，看到完整 3 轮，并能接着发第 4 轮，`roundIndex = 4`
+3. 打开一个**老的单轮 episode** → 能「以该任务为起点新建会话」并继续
+4. 回放的 assistant 消息能显示 `steps` 与 `results`（与实时对话一致）
+5. `page.tsx` 的侧栏：要么点击真能载入会话，要么已移除（不能留空壳）
+
+### F 建议实现顺序
+
+```
+F1（后端会话接口）
+  → F2（前端持久会话 + 传 session_id）   ← 这一步做完，老数据问题就不再累积
+    → F3（详情页「继续对话」入口）
+F4 独立，可与 F2/F3 并行
+F5 在 F1 之后随手处理（尤其是 charts 要不要补存）
+```
+
+**最小可用切片**：F1 + F2 只做「会话分组 + 刷新后能恢复」，就已经能回答「这段对话我聊到哪儿了」；F3 的「点进去继续」是完整体验。
+
+---
+
 ## 待确认问题（给实验室/导师）
 
 按优先级：
@@ -284,8 +391,11 @@ A1（等导师确认列语义）→ A2（真拟合）→ A3 / A4（单位与命�
 B2 → B3 → B1（先做线程安全前置，再换多线程）
 B4 + C1 → C2 → C3（真机接通；B4 必须在开写权限前完成）
 C4 / C5 / C6（验证与文档）
+F1 → F2 → F3（历史对话可续聊；F2 越早做越好，否则老数据一直无法分组）
 D1 / D2（有空再说）
 ```
+
+**注**：F 组与 A/B/C 相互独立，可以随时插队。若要尽快见效，F1+F2 是最小可用切片。
 
 **优先级判断依据**：A 组决定「数能不能信」，B 组决定「会不会挂/丢数据」，C 组决定「能不能接真机」。
 在 A1 确认之前，**不要基于当前 T1 数值做任何判断**。
