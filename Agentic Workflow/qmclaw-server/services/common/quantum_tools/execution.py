@@ -288,6 +288,14 @@ Returns experiment results including measured data and parameters."""
                     "title": result.get("exp_type", experiment_name),
                 }]
 
+            # 离线链路命中的历史数据集：模拟器已经产出（offline_simulator.simulate
+            # 里 result["dataset_id"] / result["source_data"]），quantum_service 也
+            # 原样透传了，但这里重建 ExperimentResult 时会丢，必须显式带回 ——
+            # 上层要靠它去 analysis_service 复现 experiments 页的那张图。
+            dataset_id = result.get("dataset_id")
+            source_data = result.get("source_data")
+            synthetic = bool(result.get("synthetic"))
+
             experiment_result = ExperimentResult(
                 id=exp_id,
                 experiment_name=experiment_name,
@@ -301,6 +309,9 @@ Returns experiment results including measured data and parameters."""
                 plots=plots,
                 error=result.get("error"),
                 notes=notes,
+                dataset_id=dataset_id,
+                source_data=source_data,
+                synthetic=synthetic,
             )
 
             return ToolResult.ok(
@@ -308,7 +319,9 @@ Returns experiment results including measured data and parameters."""
                 execution_time=elapsed,
                 source="offline" if result.get("simulated") else "labrad",
                 simulated=bool(result.get("simulated")),
-                synthetic=bool(result.get("synthetic")),
+                synthetic=synthetic,
+                dataset_id=dataset_id,
+                source_data=source_data,
                 stdout=result.get("stdout", ""),
                 code=code,
             )
