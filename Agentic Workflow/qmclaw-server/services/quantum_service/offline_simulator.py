@@ -474,7 +474,7 @@ T2* estimate: {t2_estimate * 1e6:.2f} us
             "y": q_sim.tolist(),
             "xlabel": "I",
             "ylabel": "Q",
-            "title": f"{exp_type} on {qubit or 'unknown'} (Offline Sim)"
+            "title": f"{qubit or 'unknown'}: {exp_type} (合成数据)"
         }
 
         stdout = f"""[OFFLINE SIMULATION] {exp_type} on {qubit or 'unknown'}
@@ -785,7 +785,13 @@ Experiment: {exp_type}
         qubit: Optional[str]
     ) -> Dict[str, Any]:
         """生成绘图数据"""
-        # 根据实验类型确定轴标签
+        # 轴标签与 config 侧保持同一套约定，权威来源是
+        # services/common/offline_data_lab.py（experiments 页那张图的画法）：
+        #   ["s21","spectroscopy","s21_dis"] -> Frequency (Hz) / S21 (dB)
+        #   ["t1"]                           -> Delay (s) / Amplitude
+        #   ["ramsey","piamp"]               -> Time (s) / Amplitude
+        #   ["iqraw"]                        -> I / Q
+        # 此前 t1 这里写的是 "Time (s)"，与 experiments 页的 "Delay (s)" 不一致。
         xlabel = "X"
         ylabel = "Y"
 
@@ -793,7 +799,7 @@ Experiment: {exp_type}
             xlabel = "Frequency (Hz)"
             ylabel = "S21 (dB)"
         elif exp_type in ["t1"]:
-            xlabel = "Time (s)"
+            xlabel = "Delay (s)"
             ylabel = "Amplitude"
         elif exp_type in ["ramsey", "ramsey_df", "piamp"]:
             xlabel = "Time (s)"
@@ -817,7 +823,10 @@ Experiment: {exp_type}
             "y": y_out,
             "xlabel": xlabel,
             "ylabel": ylabel,
-            "title": f"{exp_type} on {qubit or 'unknown'} (Offline Sim)",
+            # 沿用 experiments 页的 "{qubit}: {实验类型}" 结构，并显式标出
+            # 这是合成数据 —— 真实数据集的图会由 analysis_service 出，
+            # 两者必须让人一眼能区分，不能让合成值被误读成真实测量结果。
+            "title": f"{qubit or 'unknown'}: {exp_type} (合成数据)",
             "grid": True
         }
 

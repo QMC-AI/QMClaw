@@ -359,6 +359,12 @@ class QuantumService(BaseService):
             from io import BytesIO
             import base64
 
+            # 标题里带中文（"(合成数据)"），必须先配 CJK 字体，
+            # 否则 matplotlib 渲染成方框。与实验室自己的脚本
+            # measure_scripts/.../sq_workflow/backend.py 用的是同一组字体。
+            plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+            plt.rcParams['axes.unicode_minus'] = False
+
             plot_data = result.get("data")
             if not plot_data:
                 return None
@@ -389,7 +395,7 @@ class QuantumService(BaseService):
             # 设置标签
             ax.set_xlabel(plot_data.get("xlabel", "X"))
             ax.set_ylabel(plot_data.get("ylabel", "Y"))
-            ax.set_title(plot_data.get("title", f"{result.get('exp_type', 'Unknown')} (Offline Sim)"))
+            ax.set_title(plot_data.get("title", f"{result.get('qubit') or 'unknown'}: {result.get('exp_type', 'Unknown')} (合成数据)"))
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
 
