@@ -6,6 +6,7 @@
 > 关联文档：
 > - `docs/REAL_MACHINE_PLAN.md` —— 接通远程真机的完整设计（C 组的详细方案）
 > - `docs/CHANGES_VS_SOURCE.md` —— 已完成的能力与改动清单
+> - `docs/GIT_HISTORY.md` —— 提交历史与回滚手册（想退回某个改动时看这份）
 > - `docs/RUNTIME_DEPS.md` / `docs/DEPLOY_DIFF.md` —— 依赖与部署差异
 > - `CLAUDE.md` —— 开发约定
 
