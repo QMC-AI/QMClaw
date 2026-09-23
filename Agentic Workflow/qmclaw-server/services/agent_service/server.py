@@ -26,7 +26,7 @@ from ..common import reflection_engine
 
 # 导入统一量子工具
 from ..common.quantum_tools import ToolRegistry, ToolResult
-from .adapter import AgentServiceAdapter, setup_agent_tools
+from .adapter import AgentServiceAdapter, setup_agent_tools, fetch_experiment_plot
 
 
 def _log(msg: str):
@@ -446,9 +446,30 @@ class AgentService(BaseService):
                         metrics = d.get("results")
                         if isinstance(metrics, dict) and metrics:
                             collected_metrics.update(metrics)
+
+                        # 本次工具调用自己产出的图（离线模拟器自绘的那张）
+                        tool_plots: List[str] = []
                         for p in (d.get("plots") or []):
                             path = p.get("path") if isinstance(p, dict) else p
-                            if path and path not in collected_charts:
+                            if path:
+                                tool_plots.append(path)
+
+                        # 命中真实离线数据集时，改向 analysis_service 要
+                        # "experiments 页同款"的图 —— 同一个接口
+                        # (/plot/offline/v2)、同一套绘图代码，出来的图逐字节相同。
+                        # 合成数据没有 dataset_id，取不到；任何失败也返回 None，
+                        # 此时退回模拟器那张，保证画图失败不会让整轮对话失败。
+                        experiments_chart = None
+                        if (name == "run_experiment"
+                                and meta.get("dataset_id")
+                                and not meta.get("synthetic")):
+                            experiments_chart = fetch_experiment_plot(
+                                meta["dataset_id"],
+                                d.get("experiment_name") or "",
+                            )
+
+                        for path in ([experiments_chart] if experiments_chart else tool_plots):
+                            if path not in collected_charts:
                                 collected_charts.append(path)
                     if meta.get("synthetic"):
                         saw_synthetic = True

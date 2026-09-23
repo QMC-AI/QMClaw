@@ -29,6 +29,10 @@ from ..common.quantum_tools import (
 # quantum_service 地址
 QUANTUM_SERVICE_URL = "http://localhost:3003"
 
+# analysis_service 地址：用于复现 experiments 页那张图
+# （/plot/offline/v2 由 offline_data_lab.OfflineQubitUpdater.fitData 绘图）
+ANALYSIS_SERVICE_URL = "http://localhost:3004"
+
 # 服务根：<qmclaw-server>（本文件在 services/agent_service/ 下）
 _SERVER_ROOT = Path(__file__).resolve().parents[2]
 
@@ -60,6 +64,80 @@ def _load_experiment_templates() -> Dict[str, str]:
     except Exception:
         pass
     return _EXPERIMENT_TEMPLATES
+
+
+# experiment_configs.json 的 defaultPlotCommand 模板缓存
+_EXPERIMENT_PLOT_COMMANDS: Dict[str, str] = {}
+_EXPERIMENT_PLOT_COMMANDS_LOADED = False
+
+
+def _load_experiment_plot_commands() -> Dict[str, str]:
+    """读取 config/experiment_configs.json 的 defaultPlotCommand（带缓存）
+
+    返回 {experiment_key: "qter.fitData({exp_num})"}。
+    experiments 页画图用的就是这个字段，agent 要出"同款图"必须读同一份配置，
+    否则两边各写一套版式、迟早漂移。
+    """
+    global _EXPERIMENT_PLOT_COMMANDS_LOADED
+    if _EXPERIMENT_PLOT_COMMANDS_LOADED:
+        return _EXPERIMENT_PLOT_COMMANDS
+    _EXPERIMENT_PLOT_COMMANDS_LOADED = True
+    try:
+        cfg = _SERVER_ROOT / "config" / "experiment_configs.json"
+        with open(cfg, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for key, info in (data.get("experiments") or {}).items():
+            cmd = (info or {}).get("defaultPlotCommand")
+            if cmd:
+                _EXPERIMENT_PLOT_COMMANDS[key] = cmd
+    except Exception:
+        pass
+    return _EXPERIMENT_PLOT_COMMANDS
+
+
+def fetch_experiment_plot(
+    dataset_id: str,
+    experiment_name: str = "",
+    analysis_service_url: str = ANALYSIS_SERVICE_URL,
+) -> Optional[str]:
+    """向 analysis_service 取"experiments 页同款"的实验图。
+
+    走的就是 experiments 页那条链路的同一个接口
+    （POST /plot/offline/v2 → _handle_plot_offline_v2 → OfflineQubitUpdater.fitData），
+    因此出来的图与页面上点出来的逐字节相同。
+
+    Args:
+        dataset_id: 本次实验命中的离线数据集 id（来自模拟器，经工具层透传）
+        experiment_name: 实验 key，用于取 defaultPlotCommand
+
+    Returns:
+        Base64 data URL（"data:image/png;base64,..."）；任何失败都返回 None，
+        由调用方降级 —— 画不出图不应该让整轮对话失败。
+    """
+    if not dataset_id:
+        return None
+
+    # 命令取自已确认的配置。模板里的 {exp_num} 是 DataVault 序号，
+    # 而这里只有 dataset_id，v2 会先 loadDatasetById 再执行命令，
+    # 所以把 {exp_num} 参数整个去掉（qter.fitData({exp_num}) -> qter.fitData()）。
+    # xeb 那种命令里 {exp_num} 出现在列表参数中，去掉后会语法错误，
+    # 这种情形回退到 v2 自己的默认命令。
+    command = _load_experiment_plot_commands().get(experiment_name or "", "")
+    if "{exp_num}" in command:
+        candidate = command.replace("({exp_num})", "()").replace("({exp_num},", "(")
+        command = candidate if "{exp_num}" not in candidate else ""
+    if not command:
+        command = "qter.fitData(do_plot=True)"
+
+    result = _http_call(
+        f"{analysis_service_url}/plot/offline/v2",
+        {"dataset_id": dataset_id, "command": command},
+        "POST",
+    )
+    if not result.get("success"):
+        return None
+    image = result.get("image")
+    return image if isinstance(image, str) and image.startswith("data:image") else None
 
 
 def _http_call(url: str, data: dict = None, method: str = "GET") -> dict:
