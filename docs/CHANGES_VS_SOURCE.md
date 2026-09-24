@@ -7,7 +7,7 @@
 > **后续工作**：本文记录的改动全部围绕**离线模式**。
 > **所有尚未完成的待办（含数据正确性、服务稳定性、真机接通）统一登记在 `docs/BACKLOG.md`** —— 那是唯一入口。
 > 从离线切到**远程真机调控**的完整设计见 `docs/REAL_MACHINE_PLAN.md`；
-> 本文第五节 L4 局限会在接通在线后自然消解。
+> 本文第五节 L4 局限会在接通在线后自然消解。真机接通（只读联调）见 `docs/REAL_MACHINE.md`。
 
 ---
 
@@ -303,7 +303,7 @@ Tier 2  q10lu12 : charts[0] 是 /plots/offline_sim_t1_*.png，HTTP 200 / 74261 b
 | **L1** | 离线模拟器的 T1 数值**不是真拟合** —— 取曲线 1/3 处的 x 值当 T1（代码注释自称"简化估算"） | 数值仅供参考，建议后续改用 `curve_fit` 拟合 `a*exp(-t/T1)+c` |
 | **L2** | `X_UNIT_SCALE` 换算表是从 17 类实验的实测抽样推断的 | 需与实验室确认；`pipulse_df` / `pulseshape` / `timingxyz` 暂未覆盖 |
 | **L3** | Ramsey 的索引类型名是 `ramsey df`（**带空格**）而模拟器查 `ramsey_df` | Ramsey 即使有真实数据也走合成路径；`t1` 不受影响 |
-| **L4** | `get_qubit_params` 查不到离线数据里的 qubit（走的是 LabRAD 路径而非离线 provider） | 不影响实验执行，但会让 agent 多绕一步 |
+| **L4** | `get_qubit_params` 查不到离线数据里的 qubit（走的是 LabRAD 路径而非离线 provider） | 不影响实验执行，但会让 agent 多绕一步。**接通在线后自然消解**（见 BACKLOG E3 / C1） |
 
 ---
 

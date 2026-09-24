@@ -202,13 +202,13 @@ self._server = HTTPServer((self.config.host, self.config.port), handler)
 
 ---
 
-### B4 ⬜ 执行超时后守护线程仍在真机上继续跑（打开写权限前必须修）
+### B4 ✅ 执行超时后守护线程仍在真机上继续跑（打开写权限前必须修）
 
 **证据**：`quantum_service._handle_execute` 把 `exec` 放在守护线程里，`join(timeout)` 超时后**上报 timeout 并释放 busy 锁，但线程仍在继续执行**。此时第二条指令可以并发下发。
 
 **影响**：离线无所谓；**真机上等于两条实验指令同时打到硬件**。
 
-**日后可能的改法**：超时后标记服务为「卡死」并拒绝后续执行，而不是静默放行。
+**已修**（随 C 组落地）：超时后标记 `_exec_stuck` 并拒绝后续 `/execute`、`/qubit/set_params`；`/connect` 带 `reset_stuck=true` 可由人工确认后清除。
 
 **关联**：C3（写闸门）、C 组。
 
@@ -216,20 +216,20 @@ self._server = HTTPServer((self.config.host, self.config.port), handler)
 
 ## C. 真机接通（P1，硬件恢复后）
 
-> **完整设计见 `docs/REAL_MACHINE_PLAN.md`**，此处只登记条目与依赖顺序。
+> **完整设计见 `docs/REAL_MACHINE_PLAN.md`**，运维手册见 **`docs/REAL_MACHINE.md`**。
 > 已确认的决策：本机是**客户端**连**远程测控机**；硬件**当前不可用**；**先只读联调，禁止写**；`default_mode` 用 `auto`。
 
-| 编号 | 条目 | 对应 | 前置 |
-|---|---|---|---|
-| C1 | 连接参数外置到 `system.json`（`labrad.connect(host=,port=)`） | `REAL_MACHINE_PLAN` §四.A | 需测控机 host/IP |
-| C2 | 修复离线↔在线切换不生效与静默假成功 | §四.C | — |
-| C3 | 只读写闸门（`actuation.allow_execute` / `allow_set_params` 默认 false） | §四.B | C2 |
-| C4 | 无硬件验证（单元 / 协议 / 影子执行） | §四.E | C1 |
-| C5 | 只读自检脚本 `check_labrad_link.py` + `docs/REAL_MACHINE.md` | §四.F | C1 |
-| C6 | **在线时 agent 图源必须切到在线绘图端点** | §四.F 第 5 条 | C1 |
-| C7 | `generate_qubit` 首参待验证（实验室脚本传 `globals()`，`labrad_client` 传 `{"s": s}`） | §七.6 | 可实测 |
-| C8 | `~/.lqcs` 缺失且 schema 编译在 `.pyd` 内不可静态读取 | §二.4 | 需从测控机拷贝 |
-| C9 | 外部条件：host/IP、TLS、远程 DataVault 会话存在性、lqms/lqcs 版本对齐、防火墙放行 | §七.1/3/4/5 | 需实验室 |
+| 编号 | 条目 | 对应 | 前置 | 状态 |
+|---|---|---|---|---|
+| C1 | 连接参数外置到 `system.json`（`labrad.connect(host=,port=)`） | `REAL_MACHINE_PLAN` §四.A | 需测控机 host/IP | ✅ 代码完成（地址待填） |
+| C2 | 修复离线↔在线切换不生效与静默假成功 | §四.C | — | ✅ |
+| C3 | 只读写闸门（`actuation.allow_execute` / `allow_set_params` 默认 false） | §四.B | C2 | ✅ |
+| C4 | 无硬件验证（单元 / 协议 / 影子执行） | §四.E | C1 | ✅ 单元 14 例；协议/影子待后续 |
+| C5 | 只读自检脚本 `check_labrad_link.py` + `docs/REAL_MACHINE.md` | §四.F | C1 | ✅ |
+| C6 | **在线时 agent 图源必须切到在线绘图端点** | §四.F 第 5 条 | C1 | ✅ |
+| C7 | `generate_qubit` 首参待验证（实验室脚本传 `globals()`，`labrad_client` 传 `{"s": s}`） | §七.6 | 可实测 | ⬜ |
+| C8 | `~/.lqcs` 缺失且 schema 编译在 `.pyd` 内不可静态读取 | §二.4 | 需从测控机拷贝 | ⬜ |
+| C9 | 外部条件：host/IP、TLS、远程 DataVault 会话存在性、lqms/lqcs 版本对齐、防火墙放行 | §七.1/3/4/5 | 需实验室 | ⬜ |
 
 **特别提醒 C6**：agent 现在的图源是**离线**接口 `/plot/offline/v2`。接通真机后若不同时切到在线绘图端点，会出现「已经连上真机、agent 却仍在展示离线/合成图」—— 即该文档 §五「数据来源混淆」的具体形态。
 

@@ -30,6 +30,16 @@ agent 的长期记忆存放在 `qmclaw-server/config/memory/`，**整个目录�
 - **不要放进 git**：`index.json` 每轮对话都变，且单独存在没有意义 —— 它引用的是未跟踪的实体文件，
   clone 下来只会得到一份悬空目录
 
+## 真机写闸门（安全约定）
+
+**写闸门默认关闭**：`fallback_config.json` 的 `quantum_service.actuation` / `analysis_service.actuation`
+里 `allow_execute` 与 `allow_set_params` 默认均为 `false`。
+
+- **任何打开写权限的操作必须由人显式执行并记录**（改配置或设 `QMCLAW_ALLOW_EXECUTE` / `QMCLAW_ALLOW_SET_PARAMS`，然后重启服务）
+- 闸门只在**服务端**强制；agent 侧只是提前解释
+- 执行超时后服务标记 `stuck` 并拒绝后续下发，须人工确认现场安全后再 `reset_stuck` 或重启
+- 提权步骤与故障排查见 `docs/REAL_MACHINE.md`
+
 ## 离线模式
 
 quantum_service 和 analysis_service 支持离线模式，可在 LabRAD 不可用时使用历史数据：
