@@ -78,6 +78,9 @@ class AnalysisService(BaseService):
         self._busy_lock = threading.Lock()
         self._current_task_id: Optional[str] = None
 
+        # 执行超时后标记卡死：守护线程可能仍在跑，必须拒绝后续写操作
+        self._exec_stuck: Optional[str] = None
+
         # 绘图配置
         self._default_dpi = 150
         self._default_figsize = (10, 6)
@@ -464,6 +467,8 @@ class AnalysisService(BaseService):
             "session_path": self._session_path,
             "mode": self._get_mode(),
             "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
+            "stuck": self._exec_stuck is not None,
+            "stuck_reason": self._exec_stuck,
             **self._connection_fields(),
         }
 
@@ -1087,6 +1092,14 @@ class AnalysisService(BaseService):
                 "actuation_allowed": False,
             }
 
+        if self._exec_stuck:
+            return {
+                "task_id": data.get("task_id", f"task_{int(time.time() * 1000)}"),
+                "status": "stuck",
+                "error": self._exec_stuck,
+                "hint": "上一次执行超时后工作线程可能仍在运行，已拒绝并发下发。",
+            }
+
         # 降级模式下拒绝执行
         if self._fallback.is_degraded:
             return {
@@ -1200,8 +1213,22 @@ class AnalysisService(BaseService):
         if exec_thread.is_alive():
             result_container["status"] = "timeout"
             result_container["error"] = f"Execution timed out after {timeout}s"
+            self._exec_stuck = (
+                f"Task {task_id} timed out after {timeout}s; "
+                "worker thread may still be running"
+            )
+            _log(f"[STUCK] {self._exec_stuck}")
+            return {
+                "task_id": task_id,
+                "status": "timeout",
+                "stdout": result_container["stdout"],
+                "stderr": result_container["stderr"],
+                "error": result_container["error"],
+                "stuck": True,
+                "hint": "服务已标记卡死，后续执行将被拒绝，直到人工确认后重启服务。",
+            }
 
-        # 释放 busy 锁
+        # 释放 busy 锁（仅正常结束时）
         self._release_busy()
 
         return {

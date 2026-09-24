@@ -61,6 +61,9 @@ class QuantumService(BaseService):
         self._busy_lock = threading.Lock()
         self._current_task_id: Optional[str] = None
 
+        # 执行超时后标记卡死：守护线程可能仍在真机上跑，必须拒绝后续写操作
+        self._exec_stuck: Optional[str] = None
+
         # 执行中的任务
         self._running_tasks: Dict[str, Dict[str, Any]] = {}
 
@@ -529,6 +532,8 @@ class QuantumService(BaseService):
             "running_tasks": len(self._running_tasks),
             "mode": self._get_mode(),
             "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
+            "stuck": self._exec_stuck is not None,
+            "stuck_reason": self._exec_stuck,
             **self._connection_fields(),
         }
 
@@ -596,6 +601,13 @@ class QuantumService(BaseService):
                 session_path = json.loads(session_path)
 
         timeout = data.get("timeout", 60)
+
+        # 人工确认现场安全后，允许清除卡死标记
+        if data.get("reset_stuck"):
+            if self._exec_stuck:
+                _log(f"[STUCK] Cleared by operator request: {self._exec_stuck}")
+                self._exec_stuck = None
+            self._release_busy()
 
         with self._labrad_lock:
             # 如果已经连接且用户没有指定新路径，直接返回成功
@@ -851,6 +863,16 @@ class QuantumService(BaseService):
         if self._is_offline_mode:
             return self._execute_offline_simulation(code, task_id, data)
 
+        # 上次执行超时后守护线程可能仍在跑，拒绝后续执行
+        if self._exec_stuck:
+            return {
+                "task_id": task_id,
+                "status": "stuck",
+                "error": self._exec_stuck,
+                "hint": "上一次执行超时后工作线程可能仍在真机上运行，已拒绝并发下发。"
+                        "请人工确认现场安全后重启服务，或调用 /connect 并带 reset_stuck=true。",
+            }
+
         # 写闸门：在线执行需显式翻开 allow_execute
         if not self._actuation_flags()["allow_execute"]:
             return {
@@ -987,8 +1009,23 @@ class QuantumService(BaseService):
         if exec_thread.is_alive():
             result_container["status"] = "timeout"
             result_container["error"] = f"Execution timed out after {timeout}s"
+            # 标记卡死并保留 busy：守护线程仍在真机上跑，绝不能放行第二条指令
+            self._exec_stuck = (
+                f"Task {task_id} timed out after {timeout}s; "
+                "worker thread may still be running on hardware"
+            )
+            _log(f"[STUCK] {self._exec_stuck}")
+            return {
+                "task_id": task_id,
+                "status": "timeout",
+                "stdout": result_container["stdout"],
+                "stderr": result_container["stderr"],
+                "error": result_container["error"],
+                "stuck": True,
+                "hint": "服务已标记卡死，后续执行/改参将被拒绝，直到人工 reset_stuck 或重启。",
+            }
 
-        # 释放 busy 锁
+        # 释放 busy 锁（仅正常结束时）
         self._release_busy()
 
         # 打印执行结果摘要
@@ -1333,6 +1370,14 @@ class QuantumService(BaseService):
                 "actuation_allowed": False,
             }
 
+        if self._exec_stuck:
+            return {
+                "success": False,
+                "status": "stuck",
+                "error": self._exec_stuck,
+                "hint": "上一次执行超时后工作线程可能仍在真机上运行，已拒绝改参。",
+            }
+
         if self._fallback.is_degraded:
             return {
                 "success": False,
@@ -1410,6 +1455,8 @@ class QuantumService(BaseService):
             "session_path": self._labrad.session_path if self._labrad else None,
             "fallback_message": self._get_fallback_message(),
             "mode": self._get_mode(),
+            "stuck": self._exec_stuck is not None,
+            "stuck_reason": self._exec_stuck,
             **self._connection_fields(),
         }
 
