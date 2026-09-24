@@ -62,6 +62,7 @@ CONFIG_DIR = os.environ.get("QMCLAW_CONFIG_DIR", os.path.join(_SERVER_DIR, "conf
 BACKEND_DIR = os.environ.get("BACKEND_DIR", os.path.join(os.path.dirname(os.path.dirname(_SERVER_DIR)), "measure_scripts", "measure_scripts", "sq_workflow"))
 MEASURE_SCRIPTS = os.environ.get("MEASURE_SCRIPTS", os.path.join(os.path.dirname(os.path.dirname(_SERVER_DIR)), "measure_scripts", "measure_scripts"))
 
+sys.path.insert(0, _SERVER_DIR)
 sys.path.insert(0, MEASURE_SCRIPTS)
 sys.path.insert(0, BACKEND_DIR)
 
@@ -355,8 +356,9 @@ class QMClawToolWrapper:
     def initialize(self):
         """Initialize QMClaw backend connection."""
         try:
-            import labrad
-            cxn = labrad.connect()
+            from services.common.config import labrad_connect
+
+            cxn = labrad_connect()
             self._s = cxn.servers
             # Import sq module
             import sq

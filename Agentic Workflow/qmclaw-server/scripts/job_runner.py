@@ -620,7 +620,6 @@ def reload_qubits(session_path):
 
     # Fall back to direct lqms calls
     try:
-        import labrad
         from lqms.pyle.workflow import switchSession
         from lqms.utils.save_path import get_info_path
         from lqms.data_process import dataAnalysisCore as dc
@@ -753,7 +752,6 @@ def init_backend(max_retries=3, delay=5):
             if BACKEND_DIR not in sys.path:
                 sys.path.insert(0, BACKEND_DIR)
 
-            import labrad
             from lqms.pyle.workflow import switchSession
             from lqms.utils.save_path import get_info_path
             from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
@@ -765,7 +763,9 @@ def init_backend(max_retries=3, delay=5):
             _generate_qubit = generate_qubit
 
             # Connect to LabRAD
-            _cxn = labrad.connect()
+            from services.common.config import labrad_connect
+
+            _cxn = labrad_connect()
             util.setWiringInfo(_cxn)
 
             # Load session path from config file

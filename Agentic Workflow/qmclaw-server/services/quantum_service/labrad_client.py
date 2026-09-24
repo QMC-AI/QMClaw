@@ -19,9 +19,22 @@ _labrad_lock = threading.Lock()
 def _get_qmclaw_root() -> Path:
     """获取 QMClaw 根目录
 
-    从本文件向上查找含 measure_scripts 的目录。找不到时直接抛错，
-    而不是回退到某个写死的旧路径（那会让问题在更晚、更难定位的地方爆发）。
+    优先级：config/system.json 的 lqcs.paths.backend_dir（或 MEASURE_SCRIPTS 所在根）
+    → env BACKEND_DIR → 从本文件向上查找含 measure_scripts 的目录。
+    三者都拿不到才抛错，不回退到写死的旧路径。
     """
+    try:
+        from services.common.config import get_labrad_paths
+
+        configured = get_labrad_paths().get("backend_dir") or os.environ.get("BACKEND_DIR")
+    except ImportError:
+        configured = os.environ.get("BACKEND_DIR")
+    if configured:
+        root = Path(configured).expanduser().resolve()
+        if root.exists():
+            return root
+        raise RuntimeError(f"Configured backend_dir does not exist: {root}")
+
     current = Path(__file__).resolve().parent.parent.parent  # .../qmclaw-server
     for _ in range(10):
         if (current / "measure_scripts").exists():
@@ -33,15 +46,31 @@ def _get_qmclaw_root() -> Path:
     raise RuntimeError(
         f"QMClaw root not found from {Path(__file__).resolve()} — "
         "expected an ancestor directory containing 'measure_scripts'. "
-        "Set BACKEND_DIR / MEASURE_SCRIPTS env vars if the repo layout is non-standard."
+        "Set lqcs.paths.backend_dir in system.json (or BACKEND_DIR) if the layout is non-standard."
     )
 
 
 def _setup_paths():
-    """设置 Python 路径"""
-    root = _get_qmclaw_root()
-    sq_workflow = root / "measure_scripts" / "measure_scripts" / "sq_workflow"
-    measure_scripts = root / "measure_scripts" / "measure_scripts"
+    """设置 Python 路径
+
+    measure_scripts 目录优先取 config/system.json 的 lqcs.paths.measure_scripts，
+    否则按 QMClaw 根目录推导。
+    """
+    try:
+        from services.common.config import get_labrad_paths
+
+        configured_scripts = get_labrad_paths().get("measure_scripts") or os.environ.get(
+            "MEASURE_SCRIPTS"
+        )
+    except ImportError:
+        configured_scripts = os.environ.get("MEASURE_SCRIPTS")
+
+    if configured_scripts:
+        measure_scripts = Path(configured_scripts).expanduser().resolve()
+    else:
+        root = _get_qmclaw_root()
+        measure_scripts = root / "measure_scripts" / "measure_scripts"
+    sq_workflow = measure_scripts / "sq_workflow"
 
     for path in [str(sq_workflow), str(measure_scripts)]:
         if path not in sys.path and os.path.exists(path):
@@ -220,9 +249,6 @@ class LabRADClient:
         start_time = time.time()
 
         try:
-            print("[Quantum] Importing labrad...", flush=True)
-            import labrad
-
             print("[Quantum] Importing lqms modules...", flush=True)
             from lqms.utils.save_path import get_info_path
             from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
@@ -233,9 +259,15 @@ class LabRADClient:
             self._generate_qubit = generate_qubit
             self._generate_coupler = generate_coupler
 
-            # 连接 LabRAD
-            print("[Quantum] Connecting to LabRAD...", flush=True)
-            self._cxn = labrad.connect()
+            # 连接 LabRAD（host/port/timeout 来自 env 或 system.json，可指向远程测控机）
+            from services.common.config import get_labrad_params, labrad_connect
+
+            params = get_labrad_params()
+            print(
+                f"[Quantum] Connecting to LabRAD at {params['host']}:{params['port']}...",
+                flush=True,
+            )
+            self._cxn = labrad_connect()
             print(f"[Quantum] LabRAD connected! ID={self._cxn.ID}", flush=True)
 
             util.setWiringInfo(self._cxn)

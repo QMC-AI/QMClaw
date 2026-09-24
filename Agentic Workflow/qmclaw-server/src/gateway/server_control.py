@@ -19,9 +19,14 @@ import time
 import socket
 import subprocess
 import threading
+from pathlib import Path
 from typing import Optional, Dict, List, Callable
 from dataclasses import dataclass
 from enum import Enum
+
+_SERVER_DIR = Path(__file__).resolve().parent.parent.parent  # .../qmclaw-server
+if str(_SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVER_DIR))
 
 # Paths - can be overridden via environment variables
 import os as _os
@@ -138,8 +143,9 @@ class ServerController:
     def check_labrad_connection(self) -> bool:
         """检查是否能连接到 LabRAD"""
         try:
-            import labrad
-            cxn = labrad.connect()
+            from services.common.config import labrad_connect
+
+            cxn = labrad_connect()
             connected = cxn.connected
             cxn.disconnect()
             return connected

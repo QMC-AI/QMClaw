@@ -189,13 +189,14 @@ class AnalysisService(BaseService):
 
         # 创建 LabRAD 连接（参考 dp_config.py 第26-27行）
         try:
-            import labrad
             from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
             from lqms.utils.save_path import get_info_path
 
             self._fallback.set_state(ConnectionState.CONNECTING)
             _log("Connecting to LabRAD...")
-            self._cxn = labrad.connect()
+            from services.common.config import labrad_connect
+
+            self._cxn = labrad_connect()
             self._dv = self._cxn.data_vault
             _log("LabRAD connected")
 
@@ -252,12 +253,13 @@ class AnalysisService(BaseService):
                 return False
 
         try:
-            import labrad
             from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
             from lqms.utils.save_path import get_info_path
             from lqms.pyle import registry_wrapper2
 
-            self._cxn = labrad.connect()
+            from services.common.config import labrad_connect
+
+            self._cxn = labrad_connect()
             self._dv = self._cxn.data_vault
             self._session_path = self._load_session_config()
             self._s = registry_wrapper2.RegistryWrapper(self._cxn, self._session_path)
@@ -351,7 +353,6 @@ class AnalysisService(BaseService):
 
     def _switch_session(self, session_path: List[str]):
         """切换会话（参考 dp_config.py switch_session 函数）"""
-        import labrad
         from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
         from lqms.utils.save_path import get_info_path
         from lqms.pyle import registry_wrapper2
@@ -924,13 +925,14 @@ class AnalysisService(BaseService):
                 self._fallback.reset()
                 self._fallback.set_state(ConnectionState.CONNECTING)
 
-                import labrad
                 from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
                 from lqms.utils.save_path import get_info_path
                 from lqms.pyle import registry_wrapper2
 
                 _log("Connecting to LabRAD...")
-                self._cxn = labrad.connect()
+                from services.common.config import labrad_connect
+
+                self._cxn = labrad_connect()
                 self._dv = self._cxn.data_vault
                 _log("LabRAD connected")
 
