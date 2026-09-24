@@ -457,16 +457,18 @@ class AgentService(BaseService):
                         # 命中真实离线数据集时，改向 analysis_service 要
                         # "experiments 页同款"的图 —— 同一个接口
                         # (/plot/offline/v2)、同一套绘图代码，出来的图逐字节相同。
-                        # 合成数据没有 dataset_id，取不到；任何失败也返回 None，
-                        # 此时退回模拟器那张，保证画图失败不会让整轮对话失败。
+                        # 在线（data_source=labrad）时改走在线绘图端点，避免
+                        # "已连真机仍展示离线图"。合成数据没有 dataset_id，取不到；
+                        # 任何失败也返回 None，此时退回模拟器那张。
                         experiments_chart = None
-                        if (name == "run_experiment"
-                                and meta.get("dataset_id")
-                                and not meta.get("synthetic")):
-                            experiments_chart = fetch_experiment_plot(
-                                meta["dataset_id"],
-                                d.get("experiment_name") or "",
-                            )
+                        if name == "run_experiment":
+                            online = meta.get("source") == "labrad" or meta.get("data_source") == "labrad"
+                            offline_hit = meta.get("dataset_id") and not meta.get("synthetic")
+                            if online or offline_hit:
+                                experiments_chart = fetch_experiment_plot(
+                                    meta.get("dataset_id"),
+                                    d.get("experiment_name") or "",
+                                )
 
                         for path in ([experiments_chart] if experiments_chart else tool_plots):
                             if path not in collected_charts:

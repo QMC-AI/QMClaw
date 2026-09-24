@@ -99,21 +99,27 @@ def fetch_experiment_plot(
     dataset_id: str,
     experiment_name: str = "",
     analysis_service_url: str = ANALYSIS_SERVICE_URL,
+    quantum_service_url: str = QUANTUM_SERVICE_URL,
 ) -> Optional[str]:
     """向 analysis_service 取"experiments 页同款"的实验图。
 
-    走的就是 experiments 页那条链路的同一个接口
-    （POST /plot/offline/v2 → _handle_plot_offline_v2 → OfflineQubitUpdater.fitData），
-    因此出来的图与页面上点出来的逐字节相同。
+    数据源切换（C6）：
+    - data_source == "labrad"（已连真机）→ 走在线绘图端点 /plot 或 /plot/historical，
+      避免"已连上真机、agent 却仍在展示离线/合成图"。
+    - 其余（offline / fallback）→ 走 /plot/offline/v2，与 experiments 页逐字节同源。
 
     Args:
-        dataset_id: 本次实验命中的离线数据集 id（来自模拟器，经工具层透传）
+        dataset_id: 本次实验命中的离线数据集 id（离线链路）；在线链路可为空
         experiment_name: 实验 key，用于取 defaultPlotCommand
 
     Returns:
-        Base64 data URL（"data:image/png;base64,..."）；任何失败都返回 None，
-        由调用方降级 —— 画不出图不应该让整轮对话失败。
+        Base64 data URL 或 /plots/*.png 路径；任何失败都返回 None。
     """
+    source = _get_data_source(quantum_service_url)
+
+    if source == "labrad":
+        return _fetch_online_plot(experiment_name, analysis_service_url)
+
     if not dataset_id:
         return None
 
@@ -138,6 +144,35 @@ def fetch_experiment_plot(
         return None
     image = result.get("image")
     return image if isinstance(image, str) and image.startswith("data:image") else None
+
+
+def _get_data_source(quantum_service_url: str = QUANTUM_SERVICE_URL) -> str:
+    """查询 quantum_service 当前数据来源：labrad / offline / fallback。"""
+    result = _http_call(f"{quantum_service_url}/health")
+    return result.get("data_source") or "offline"
+
+
+def _fetch_online_plot(
+    experiment_name: str,
+    analysis_service_url: str,
+) -> Optional[str]:
+    """在线绘图：走 analysis_service 的在线端点，返回 /plots/*.png 路径。"""
+    command = _load_experiment_plot_commands().get(experiment_name or "", "")
+    if "{exp_num}" in command:
+        candidate = command.replace("({exp_num})", "()").replace("({exp_num},", "(")
+        command = candidate if "{exp_num}" not in candidate else ""
+    if not command:
+        command = "qter.fitData(do_plot=True)"
+
+    result = _http_call(
+        f"{analysis_service_url}/plot",
+        {"command": command},
+        "POST",
+    )
+    if not result.get("success") and not result.get("plotUrl"):
+        return None
+    url = result.get("plotUrl") or result.get("image")
+    return url if isinstance(url, str) and url else None
 
 
 def _http_call(url: str, data: dict = None, method: str = "GET") -> dict:
@@ -192,6 +227,12 @@ def setup_agent_tools(
         result = _http_call(f"{quantum_service_url}/health")
         return result.get("labrad_connected", False) or result.get("status") == "healthy"
 
+    def actuation_flags() -> Dict[str, bool]:
+        """读与 quantum_service 同一份写闸门配置"""
+        from ..common.config import get_actuation_flags
+
+        return get_actuation_flags("quantum_service")
+
     def get_qubits() -> List[Dict[str, Any]]:
         """获取量子比特列表"""
         result = _http_call(f"{quantum_service_url}/qubits")
@@ -224,10 +265,13 @@ def setup_agent_tools(
             {"code": code},
             "POST"
         )
+        # 透传只读/卡死等结构化拒绝，保留 status + hint，让 agent 能解释
+        if result.get("status") in ("read_only", "stuck"):
+            return result
         # 离线模式返回 offline_simulated，同样视为执行成功
         if result.get("status") in ("success", "offline_simulated"):
             return result
-        return {"error": result.get("error", "Unknown error")}
+        return {"error": result.get("error", "Unknown error"), "status": result.get("status")}
 
     def build_experiment_code(name: str, target: str, params: Dict[str, Any]) -> str:
         """按 config/experiment_configs.json 的 defaultCommand 模板生成实验代码。
@@ -265,7 +309,7 @@ def setup_agent_tools(
     registry.register_tool(GetQubitsTool(get_qubits))
     registry.register_tool(GetQubitParamsTool(get_qubit_params, get_qubits))
     registry.register_tool(ListExperimentsTool(list_experiments))
-    registry.register_tool(RunCodeTool(execute_code, is_connected))
+    registry.register_tool(RunCodeTool(execute_code, is_connected, actuation_flags))
     # 注意 RunExperimentTool 的契约是：
     #   code_builder(name, params) -> 代码字符串
     #   executor(代码字符串) -> 执行结果
@@ -279,7 +323,8 @@ def setup_agent_tools(
             name, (params or {}).get("target"), params or {}
         ),
         execute_code,
-        is_connected=is_connected
+        is_connected=is_connected,
+        actuation_flags=actuation_flags,
     ))
     registry.register_tool(ListHistoryTool(list_history))
 

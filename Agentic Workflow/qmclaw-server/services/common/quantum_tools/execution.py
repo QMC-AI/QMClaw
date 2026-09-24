@@ -37,14 +37,17 @@ class RunCodeTool(QuantumTool):
         self,
         executor: Callable[[str], Dict[str, Any]],
         is_connected: Callable[[], bool] = None,
+        actuation_flags: Callable[[], Dict[str, bool]] = None,
     ):
         """
         Args:
             executor: 代码执行函数，签名为 (code: str) -> Dict[str, Any]
             is_connected: 连接检查函数，签名为 () -> bool
+            actuation_flags: 写闸门查询，签名为 () -> {"allow_execute": bool, ...}
         """
         self._executor = executor
         self._is_connected = is_connected or (lambda: True)
+        self._actuation_flags = actuation_flags or (lambda: {"allow_execute": True, "allow_set_params": True})
 
     @property
     def name(self) -> str:
@@ -82,6 +85,16 @@ Returns the experiment result or error message."""
 
     def execute(self, code: str, timeout: int = 300, **kwargs) -> ToolResult[Dict[str, Any]]:
         """执行代码"""
+        if not self._actuation_flags().get("allow_execute", True):
+            return ToolResult.err(
+                "当前为只读联调，禁止向真机下发实验",
+                error_code=ErrorCode.FORBIDDEN.value,
+                hint="服务端写闸门 actuation.allow_execute 已关闭。只读阶段仅允许查询；"
+                     "如需执行请人工翻开闸门并记录。",
+                status="read_only",
+                actuation_allowed=False,
+            )
+
         if not self._is_connected():
             return ToolResult.err(
                 "Not connected to LabRAD",
@@ -100,6 +113,17 @@ Returns the experiment result or error message."""
         try:
             result = self._executor(code)
             elapsed = time.time() - start_time
+
+            # 服务端结构化拒绝（只读/卡死）原样透传，保留 hint 供 agent 解释
+            if isinstance(result, dict) and result.get("status") in ("read_only", "stuck"):
+                return ToolResult.err(
+                    result.get("error") or result.get("status"),
+                    error_code=ErrorCode.VALIDATION_ERROR.value,
+                    hint=result.get("hint"),
+                    status=result.get("status"),
+                    actuation_allowed=result.get("actuation_allowed"),
+                    stuck=result.get("stuck"),
+                )
 
             return ToolResult.ok(
                 data={
@@ -154,6 +178,7 @@ class RunExperimentTool(QuantumTool):
         executor: Callable[[str], Dict[str, Any]],
         schema_getter: Callable[[str], Optional[Dict[str, Any]]] = None,
         is_connected: Callable[[], bool] = None,
+        actuation_flags: Callable[[], Dict[str, bool]] = None,
     ):
         """
         Args:
@@ -161,11 +186,13 @@ class RunExperimentTool(QuantumTool):
             executor: 代码执行函数，签名为 (code: str) -> Dict[str, Any]
             schema_getter: 实验 schema 获取函数，签名为 (name: str) -> Optional[Dict]
             is_connected: 连接检查函数，签名为 () -> bool
+            actuation_flags: 写闸门查询，签名为 () -> {"allow_execute": bool, ...}
         """
         self._code_builder = code_builder
         self._executor = executor
         self._schema_getter = schema_getter
         self._is_connected = is_connected or (lambda: True)
+        self._actuation_flags = actuation_flags or (lambda: {"allow_execute": True, "allow_set_params": True})
 
     @property
     def name(self) -> str:
@@ -237,6 +264,16 @@ Returns experiment results including measured data and parameters."""
                 error_code=ErrorCode.VALIDATION_ERROR.value,
             )
 
+        if not self._actuation_flags().get("allow_execute", True):
+            return ToolResult.err(
+                "当前为只读联调，禁止向真机下发实验",
+                error_code=ErrorCode.FORBIDDEN.value,
+                hint="服务端写闸门 actuation.allow_execute 已关闭。只读阶段仅允许查询；"
+                     "如需执行请人工翻开闸门并记录。",
+                status="read_only",
+                actuation_allowed=False,
+            )
+
         if not self._is_connected():
             return ToolResult.err(
                 "Not connected to LabRAD",
@@ -260,6 +297,17 @@ Returns experiment results including measured data and parameters."""
             # 执行
             result = self._executor(code)
             elapsed = time.time() - start_time
+
+            # 服务端结构化拒绝（只读/卡死）原样透传
+            if isinstance(result, dict) and result.get("status") in ("read_only", "stuck"):
+                return ToolResult.err(
+                    result.get("error") or result.get("status"),
+                    error_code=ErrorCode.FORBIDDEN.value,
+                    hint=result.get("hint"),
+                    status=result.get("status"),
+                    actuation_allowed=result.get("actuation_allowed"),
+                    stuck=result.get("stuck"),
+                )
 
             # 解析结果
             # 离线模式返回 status="offline_simulated"，与在线 "success" 一样视为执行成功。
