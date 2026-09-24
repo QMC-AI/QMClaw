@@ -416,13 +416,22 @@ class QuantumService(BaseService):
     def _ensure_connected(self) -> bool:
         """确保 LabRAD 已连接
 
-        在降级模式下直接返回 False。
+        离线模式或永久降级时返回 False；客户端未创建时懒创建后再连。
         """
+        if self._mode == self.Mode.OFFLINE:
+            return False
+
         if self._fallback.is_permanently_degraded:
             return False
 
         if self._labrad is None:
-            return False
+            try:
+                from .labrad_client import LabRADClient
+                self._labrad = LabRADClient()
+            except Exception as e:
+                _log(f"Failed to create LabRAD client: {e}")
+                self._fallback.on_connection_failed(str(e))
+                return False
 
         if self._labrad.connected:
             return True
@@ -432,6 +441,7 @@ class QuantumService(BaseService):
         success = self._labrad.initialize()
         if success:
             _log("LabRAD connected successfully")
+            self._init_started = True
             self._fallback.on_connection_success()
         else:
             _log(f"LabRAD connection failed: {self._labrad._init_error}")
@@ -493,12 +503,17 @@ class QuantumService(BaseService):
         }
 
     def _handle_mode(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理模式切换请求"""
+        """处理模式切换请求
+
+        切到 online/auto 时清掉永久降级并实际尝试连接，响应带 connected 与失败原因，
+        不再静默假成功。
+        """
         # GET 请求（无 mode 参数）返回当前状态
         if "mode" not in data:
             return {
                 "success": True,
                 "mode": self._get_mode(),
+                "connected": self._labrad is not None and self._labrad.connected,
                 "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
             }
 
@@ -510,11 +525,28 @@ class QuantumService(BaseService):
                 "current_mode": self._get_mode(),
             }
 
-        return {
+        result: Dict[str, Any] = {
             "success": True,
             "mode": self._get_mode(),
             "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
         }
+
+        if mode == self.Mode.OFFLINE:
+            result["connected"] = False
+            return result
+
+        # 清掉 DEGRADED_PERMANENT，否则 _ensure_connected 第一行就 return False
+        if self._fallback.is_degraded:
+            self._fallback.reset()
+
+        connected = self._ensure_connected()
+        result["connected"] = connected
+        if not connected:
+            result["success"] = False
+            result["error"] = self._labrad._init_error if self._labrad and self._labrad._init_error else (
+                self._fallback.last_error or "LabRAD connection failed"
+            )
+        return result
 
     def _get_fallback_message(self) -> str:
         """获取降级模式提示信息"""

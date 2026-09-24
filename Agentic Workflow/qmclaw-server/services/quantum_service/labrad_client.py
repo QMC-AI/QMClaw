@@ -97,6 +97,7 @@ class LabRADClient:
         self._current_session_path: List[str] = []
         self._initialized = False
         self._init_error: Optional[str] = None
+        self._ray_ready = False
 
     @property
     def connected(self) -> bool:
@@ -142,6 +143,11 @@ class LabRADClient:
     def session_path(self) -> List[str]:
         """获取当前会话路径"""
         return self._current_session_path
+
+    @property
+    def ray_ready(self) -> bool:
+        """Ray / DeviceManager 是否就绪（只读能力不依赖它）"""
+        return self._ray_ready
 
     @property
     def name(self) -> str:
@@ -273,8 +279,8 @@ class LabRADClient:
             util.setWiringInfo(self._cxn)
             print("[Quantum] Wiring info set", flush=True)
 
-            # 初始化 Ray（必须在实验执行前）
-            self._setup_ray()
+            # 初始化 Ray（失败不阻断只读能力，状态记入 ray_ready）
+            self._ray_ready = self._setup_ray()
 
             # 加载会话配置
             if session_path is None:

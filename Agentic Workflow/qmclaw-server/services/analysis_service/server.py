@@ -446,12 +446,16 @@ class AnalysisService(BaseService):
         }
 
     def _handle_mode(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理模式切换请求"""
+        """处理模式切换请求
+
+        切到 online/auto 时清掉永久降级并实际尝试连接，响应带 connected 与失败原因。
+        """
         # GET 请求（无 mode 参数）返回当前状态
         if "mode" not in data:
             return {
                 "success": True,
                 "mode": self._get_mode(),
+                "connected": self._data is not None and self._fallback.is_connected,
                 "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
             }
 
@@ -463,11 +467,58 @@ class AnalysisService(BaseService):
                 "current_mode": self._get_mode(),
             }
 
-        return {
+        result: Dict[str, Any] = {
             "success": True,
             "mode": self._get_mode(),
             "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
         }
+
+        if mode == self.Mode.OFFLINE:
+            result["connected"] = False
+            return result
+
+        if self._fallback.is_degraded:
+            self._fallback.reset()
+
+        connected = self._try_connect()
+        result["connected"] = connected
+        if not connected:
+            result["success"] = False
+            result["error"] = self._fallback.last_error or "LabRAD connection failed"
+        return result
+
+    def _try_connect(self) -> bool:
+        """懒创建并连接 LabRAD（供模式切换使用）"""
+        if self._data is not None and self._fallback.is_connected:
+            return True
+
+        with self._labrad_lock:
+            try:
+                self._fallback.reset()
+                self._fallback.set_state(ConnectionState.CONNECTING)
+
+                from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
+                from lqms.utils.save_path import get_info_path
+                from lqms.pyle import registry_wrapper2
+
+                from services.common.config import labrad_connect
+
+                _log("Connecting to LabRAD...")
+                self._cxn = labrad_connect()
+                self._dv = self._cxn.data_vault
+                self._session_path = self._load_session_config()
+                self._s = registry_wrapper2.RegistryWrapper(self._cxn, self._session_path)
+                self._data = dc.DataLab(self._session_path, self._dv, dv_type="data_vault")
+                info_path = get_info_path(self._s)
+                self._info = dc.InfoBase(info_path)
+                self._qter = QubitUpdater(self._data, self._info)
+                self._load_fallback_data()
+                self._fallback.on_connection_success()
+                return True
+            except Exception as e:
+                _log(f"Failed to connect to LabRAD: {e}")
+                self._fallback.on_connection_failed(str(e))
+                return False
 
     def _handle_datasets_offline(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
         """获取离线数据集列表"""
