@@ -60,6 +60,39 @@ def get_labrad_paths() -> Dict[str, Optional[str]]:
     }
 
 
+def _load_fallback_service_config(service_name: str) -> Dict[str, Any]:
+    config_file = _server_dir() / "config" / "fallback_config.json"
+    if not config_file.exists():
+        return {}
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            return json.load(f).get(service_name, {})
+    except Exception as e:
+        print(f"[Config] Failed to load {config_file}: {e}")
+        return {}
+
+
+def get_actuation_flags(service_name: str = "quantum_service") -> Dict[str, bool]:
+    """写闸门：是否允许执行实验 / 改 qubit 参数。
+
+    优先级：环境变量 QMCLAW_ALLOW_EXECUTE / QMCLAW_ALLOW_SET_PARAMS
+           → fallback_config.json 的 {service}.actuation
+           → 默认全部 false（只读联调）
+    """
+    actuation = _load_fallback_service_config(service_name).get("actuation") or {}
+
+    def _flag(env_key: str, config_key: str) -> bool:
+        env_val = os.environ.get(env_key)
+        if env_val is not None:
+            return env_val.strip().lower() in ("1", "true", "yes", "on")
+        return bool(actuation.get(config_key, False))
+
+    return {
+        "allow_execute": _flag("QMCLAW_ALLOW_EXECUTE", "allow_execute"),
+        "allow_set_params": _flag("QMCLAW_ALLOW_SET_PARAMS", "allow_set_params"),
+    }
+
+
 class Config:
     """配置管理类"""
 

@@ -334,6 +334,27 @@ class AnalysisService(BaseService):
         with self._mode_lock:
             return self._mode
 
+    def _connection_fields(self) -> Dict[str, Any]:
+        """健康接口共用的连接与闸门字段"""
+        from services.common.config import get_actuation_flags, get_labrad_params
+
+        params = get_labrad_params()
+        flags = get_actuation_flags("analysis_service")
+        if self._data is not None and self._fallback.is_connected:
+            data_source = "labrad"
+        elif self._is_offline_mode:
+            data_source = "offline"
+        else:
+            data_source = "fallback"
+        return {
+            "data_source": data_source,
+            "actuation_allowed": flags["allow_execute"] or flags["allow_set_params"],
+            "allow_execute": flags["allow_execute"],
+            "allow_set_params": flags["allow_set_params"],
+            "labrad_host": params["host"],
+            "labrad_port": params["port"],
+        }
+
     def _load_session_config(self) -> List[str]:
         """加载会话配置"""
         config_path = Path(__file__).parent.parent.parent / "config" / "session.json"
@@ -443,6 +464,7 @@ class AnalysisService(BaseService):
             "session_path": self._session_path,
             "mode": self._get_mode(),
             "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
+            **self._connection_fields(),
         }
 
     def _handle_mode(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1050,6 +1072,19 @@ class AnalysisService(BaseService):
                 "status": "offline",
                 "error": "离线模式下无法执行代码。请使用在线模式。",
                 "mode": self._get_mode(),
+            }
+
+        # 写闸门：只读联调期间禁止在线执行
+        from services.common.config import get_actuation_flags
+
+        if not get_actuation_flags("analysis_service")["allow_execute"]:
+            return {
+                "task_id": data.get("task_id", f"task_{int(time.time() * 1000)}"),
+                "status": "read_only",
+                "error": "当前为只读联调，禁止执行分析代码",
+                "hint": "如需执行请将 fallback_config.json 的 analysis_service.actuation.allow_execute 设为 true，"
+                        "或设置环境变量 QMCLAW_ALLOW_EXECUTE=1（须人工确认并记录）",
+                "actuation_allowed": False,
             }
 
         # 降级模式下拒绝执行
@@ -1687,6 +1722,7 @@ class AnalysisService(BaseService):
             "session_path": self._session_path,
             "fallback_message": self._get_fallback_message(),
             "mode": self._get_mode(),
+            **self._connection_fields(),
         }
 
     def shutdown(self):

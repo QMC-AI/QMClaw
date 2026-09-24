@@ -275,6 +275,35 @@ class QuantumService(BaseService):
         with self._mode_lock:
             return self._mode
 
+    def _actuation_flags(self) -> Dict[str, bool]:
+        """写闸门状态（allow_execute / allow_set_params）"""
+        from services.common.config import get_actuation_flags
+
+        return get_actuation_flags("quantum_service")
+
+    def _data_source(self) -> str:
+        """当前数据来源：labrad / offline / fallback"""
+        if self._labrad is not None and self._labrad.connected:
+            return "labrad"
+        if self._is_offline_mode:
+            return "offline"
+        return "fallback"
+
+    def _connection_fields(self) -> Dict[str, Any]:
+        """健康/状态接口共用的连接与闸门字段"""
+        from services.common.config import get_labrad_params
+
+        params = get_labrad_params()
+        flags = self._actuation_flags()
+        return {
+            "data_source": self._data_source(),
+            "actuation_allowed": flags["allow_execute"] or flags["allow_set_params"],
+            "allow_execute": flags["allow_execute"],
+            "allow_set_params": flags["allow_set_params"],
+            "labrad_host": params["host"],
+            "labrad_port": params["port"],
+        }
+
     @staticmethod
     def _json_safe(obj: Any) -> Any:
         """把结果里的 numpy 类型递归转成可 JSON 序列化的原生类型。
@@ -500,6 +529,7 @@ class QuantumService(BaseService):
             "running_tasks": len(self._running_tasks),
             "mode": self._get_mode(),
             "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
+            **self._connection_fields(),
         }
 
     def _handle_mode(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -615,6 +645,7 @@ class QuantumService(BaseService):
     def _handle_status(self) -> Dict[str, Any]:
         """获取连接状态"""
         fallback_info = self._fallback.get_status_info()
+        extra = self._connection_fields()
         if self._labrad is None:
             return {
                 "connected": False,
@@ -624,6 +655,7 @@ class QuantumService(BaseService):
                 "fallback_mode": self._fallback.is_degraded,
                 "fallback_state": fallback_info["state"],
                 "last_error": self._fallback.last_error,
+                **extra,
             }
 
         return {
@@ -635,6 +667,8 @@ class QuantumService(BaseService):
             "fallback_mode": self._fallback.is_degraded,
             "fallback_state": fallback_info["state"],
             "last_error": self._fallback.last_error,
+            "ray_ready": self._labrad.ray_ready,
+            **extra,
         }
 
     def _handle_qubits(self) -> Dict[str, Any]:
@@ -804,8 +838,7 @@ class QuantumService(BaseService):
         """执行实验代码
 
         带 busy 锁，防止并发执行。
-        如果正在执行，返回 busy 状态（降级服务）。
-        离线模式下执行模拟实验。
+        离线模拟不碰硬件、不受写闸门限制；在线执行受 actuation.allow_execute 约束。
         """
         code = data.get("code")
         task_id = data.get("task_id", f"task_{int(time.time() * 1000)}")
@@ -814,9 +847,20 @@ class QuantumService(BaseService):
         if not code:
             return {"error": "code is required"}
 
-        # 离线模式下执行模拟实验
+        # 离线模式下执行模拟实验（不碰硬件，不受闸门限制）
         if self._is_offline_mode:
             return self._execute_offline_simulation(code, task_id, data)
+
+        # 写闸门：在线执行需显式翻开 allow_execute
+        if not self._actuation_flags()["allow_execute"]:
+            return {
+                "task_id": task_id,
+                "status": "read_only",
+                "error": "当前为只读联调，禁止向真机下发实验",
+                "hint": "如需执行请将 fallback_config.json 的 quantum_service.actuation.allow_execute 设为 true，"
+                        "或设置环境变量 QMCLAW_ALLOW_EXECUTE=1（须人工确认并记录）",
+                "actuation_allowed": False,
+            }
 
         # 降级模式下拒绝执行实验
         if self._fallback.is_degraded:
@@ -1278,6 +1322,17 @@ class QuantumService(BaseService):
         if not qname:
             return {"success": False, "error": "Qubit name required"}
 
+        # 写闸门：只读联调期间禁止改参
+        if not self._actuation_flags()["allow_set_params"]:
+            return {
+                "success": False,
+                "status": "read_only",
+                "error": "当前为只读联调，禁止修改 qubit 参数",
+                "hint": "如需改参请将 fallback_config.json 的 quantum_service.actuation.allow_set_params 设为 true，"
+                        "或设置环境变量 QMCLAW_ALLOW_SET_PARAMS=1（须人工确认并记录）",
+                "actuation_allowed": False,
+            }
+
         if self._fallback.is_degraded:
             return {
                 "success": False,
@@ -1355,6 +1410,7 @@ class QuantumService(BaseService):
             "session_path": self._labrad.session_path if self._labrad else None,
             "fallback_message": self._get_fallback_message(),
             "mode": self._get_mode(),
+            **self._connection_fields(),
         }
 
     def shutdown(self):
