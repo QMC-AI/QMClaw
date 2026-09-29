@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 from ..base import BaseService, ServiceConfig, run_service, _safe_print
 from ..common import setup_logging, config, FallbackManager, ConnectionState
 from ..common.offline_data_provider import OfflineDataProvider
+from ..common.plotting import serialized_plot
 from .offline_simulator import ExperimentSimulator
 
 
@@ -382,6 +383,7 @@ class QuantumService(BaseService):
                 "simulated": True,
             }
 
+    @serialized_plot
     def _generate_simulation_plot(self, result: Dict[str, Any]) -> Optional[str]:
         """生成模拟实验的绘图"""
         try:

@@ -24,6 +24,7 @@ from ..common import setup_logging, config, FallbackManager, ConnectionState
 from ..common.offline_data_provider import OfflineDataProvider
 from ..common.offline_data_lab import OfflineDataLab, OfflineQubitUpdater
 from ..common.offline_variant_generator import VariantGenerator
+from ..common.plotting import serialized_plot
 
 
 def _log(msg: str):
@@ -581,6 +582,7 @@ class AnalysisService(BaseService):
             "source": "offline",
         }
 
+    @serialized_plot
     def _handle_plot_offline(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """从离线数据绘制图表"""
         job_id = data.get("job_id", f"offline_{int(time.time() * 1000)}")
@@ -661,6 +663,7 @@ class AnalysisService(BaseService):
             _log(f"Offline plot error: {e}\n{traceback.format_exc()}")
             return {"error": str(e), "plotPath": None}
 
+    @serialized_plot
     def _handle_plot_offline_v2(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         新版离线绘图接口
@@ -901,6 +904,7 @@ class AnalysisService(BaseService):
         except Exception as e:
             return {"error": str(e), "success": False}
 
+    @serialized_plot
     def _handle_plot_variant(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """绘制变体数据"""
         variant_id = data.get("variant_id")
@@ -1240,6 +1244,7 @@ class AnalysisService(BaseService):
             "result": result_container.get("result"),
         }
 
+    @serialized_plot
     def _handle_plot(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """绘制最新数据集"""
         job_id = data.get("job_id", f"plot_{int(time.time() * 1000)}")
@@ -1299,6 +1304,7 @@ class AnalysisService(BaseService):
             _log(f"Plot error: {e}\n{traceback.format_exc()}")
             return {"error": str(e), "plotPath": None}
 
+    @serialized_plot
     def _handle_plot_historical(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """绘制历史数据集"""
         job_id = data.get("job_id", f"hist_{int(time.time() * 1000)}")
@@ -1412,6 +1418,7 @@ class AnalysisService(BaseService):
             .replace("{exp_num}", str(exp_num)) \
             .replace("{qubit}", qubit)
 
+    @serialized_plot
     def _handle_plot_experiments(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """根据实验类型绘图（新版）
 

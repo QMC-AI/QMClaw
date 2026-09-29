@@ -882,3 +882,24 @@ Browser → Express (:3002) → Python subprocess → Hermes AIAgent
   - qca 自有 `tools/lab_tool.py` 被 vendor 同名包遮蔽（含悬空 `from .runner import`），当前不可达
   - `config/qubitclient.json` 是否需要由人工配置
 - **提交**：本条 progress 记录
+
+---
+## 2026-09-29  B 组线程安全落地（B2→B3→B1）+ 服务重启验收
+- **范围**：fix（分支 `feat/c-real-machine`）
+- **改动**：
+  1. B2：新增 `services/common/plotting.py`（PLOT_LOCK / @serialized_plot / plot_lock()）；analysis 6 个绘图入口 + quantum `_generate_simulation_plot` 全部串行化
+  2. B3：`memory_store` 加 `_INDEX_LOCK` + `_update_index()`；create/archive/create_skill/delete 四处索引写路径原子化
+  3. B1：`base_service` `HTTPServer` → `ThreadingHTTPServer`；慢请求（默认 5s）打 `SLOW` 日志；`request_count` 改为只计真实请求
+  4. 修复：`services/common/config.py` 启动时 `load_dotenv(qmclaw-server/.env)`——原先 Python 侧只读 os.environ，.env 里的 LLM Key 读不到
+- **施工**：dsh 派单 T11（沙箱不能写 D 盘，产出 T11.patch）→ MiMo 应用 patch 并逐条复核
+- **验收**：
+  - `check_services.py` 10/10，exit 0
+  - 绘图锁/索引锁/ThreadingHTTPServer 源码与 import 实测通过
+  - dsh 并发实测：memory 索引孤儿 316→0；快请求被堵 1.2s→0.02s
+  - 服务重启后：3002/3003/3004/8005/3006/8081 全监听；memory/stats 经 Express 返回正常
+  - llm_service 读到 DEEPSEEK_API_KEY（SET）
+- **遗留**：
+  - `analysis_service._handle_execute` 注入 plt 未加 PLOT_LOCK（刻意，避免卡死拖死绘图）
+  - image :3007 / qubitclient 等可选服务仍未启；OPENAI/ANTHROPIC/MINIMAX Key 未配
+  - BACKLOG A 组（信号列/T1 拟合）仍待导师确认
+- **提交**：本条记录 + B 组代码

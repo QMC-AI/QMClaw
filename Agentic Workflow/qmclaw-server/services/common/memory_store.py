@@ -18,8 +18,9 @@ monolithic job_runner.py 的遗留物，现无任何活跃路径引用）。
 import os
 import json
 import uuid
+import threading
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any
 from pathlib import Path
 
 # 记忆存储根目录
@@ -37,30 +38,50 @@ INDEX_FILE = os.path.join(MEMORY_BASE, "index.json")
 os.makedirs(EPISODES_DIR, exist_ok=True)
 os.makedirs(SKILLS_DIR, exist_ok=True)
 
+# config/memory 下索引与实体文件的读写都在这一把锁内完成（可重入）。
+# index.json 是无锁的 load→modify→save：并发写会互相覆盖，导致"实体文件在、
+# 索引条目没了"的孤儿。多线程 HTTP 服务器下这个竞态是必现的。
+_INDEX_LOCK = threading.RLock()
+
 
 def _load_index() -> Dict:
-    """加载索引文件"""
-    try:
-        if os.path.exists(INDEX_FILE):
-            with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception as e:
-        print(f"MemoryStore: Failed to load index: {e}")
-    return {
-        "episodes": [],      # [{id, timestamp, qubit, status}]
-        "skills": [],        # [{id, name, status}]
-        "last_updated": None
-    }
+    """加载索引文件（持锁读，保证读到的是完整 JSON，而不是别人写了一半的文件）"""
+    with _INDEX_LOCK:
+        try:
+            if os.path.exists(INDEX_FILE):
+                with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"MemoryStore: Failed to load index: {e}")
+        return {
+            "episodes": [],      # [{id, timestamp, qubit, status}]
+            "skills": [],        # [{id, name, status}]
+            "last_updated": None
+        }
 
 
 def _save_index(index: Dict):
-    """保存索引文件"""
-    index["last_updated"] = datetime.now().isoformat()
-    try:
-        with open(INDEX_FILE, 'w', encoding='utf-8') as f:
-            json.dump(index, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"MemoryStore: Failed to save index: {e}")
+    """保存索引文件（持锁写）"""
+    with _INDEX_LOCK:
+        index["last_updated"] = datetime.now().isoformat()
+        try:
+            with open(INDEX_FILE, 'w', encoding='utf-8') as f:
+                json.dump(index, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"MemoryStore: Failed to save index: {e}")
+
+
+def _update_index(mutator: Callable[[Dict], None]) -> Dict:
+    """索引的原子读-改-写。
+
+    mutator 直接原地修改传进来的 index（返回值被忽略）；整个
+    load → mutate → save 在一次加锁内完成，并发调用不会互相覆盖。
+    """
+    with _INDEX_LOCK:
+        index = _load_index()
+        mutator(index)
+        _save_index(index)
+        return index
 
 
 # ── Episode 管理 ──────────────────────────────────────────────────────────────
@@ -101,21 +122,22 @@ def create_episode(
         "archived": False
     }
 
-    # 保存到文件
+    # 实体文件与索引在同一次加锁内写完，避免出现"有文件、无索引"的孤儿
     episode_file = os.path.join(EPISODES_DIR, f"{episode_id}.json")
-    with open(episode_file, 'w', encoding='utf-8') as f:
-        json.dump(episode, f, indent=2, ensure_ascii=False)
 
-    # 更新索引
-    index = _load_index()
-    index["episodes"].insert(0, {
-        "id": episode_id,
-        "timestamp": episode["timestamp"],
-        "qubit": qubit,
-        "status": status,
-        "task_preview": task[:50] if len(task) > 50 else task
-    })
-    _save_index(index)
+    def _append_to_index(index: Dict):
+        index["episodes"].insert(0, {
+            "id": episode_id,
+            "timestamp": episode["timestamp"],
+            "qubit": qubit,
+            "status": status,
+            "task_preview": task[:50] if len(task) > 50 else task
+        })
+
+    with _INDEX_LOCK:
+        with open(episode_file, 'w', encoding='utf-8') as f:
+            json.dump(episode, f, indent=2, ensure_ascii=False)
+        _update_index(_append_to_index)
 
     print(f"MemoryStore: Created episode {episode_id}", flush=True)
     return episode
@@ -136,15 +158,18 @@ def get_episode(episode_id: str) -> Optional[Dict]:
 
 def update_episode_reflection(episode_id: str, reflection: Dict):
     """更新 Episode 的反思报告"""
-    episode = get_episode(episode_id)
-    if not episode:
-        return False
-
-    episode["reflection"] = reflection
-
     episode_file = os.path.join(EPISODES_DIR, f"{episode_id}.json")
-    with open(episode_file, 'w', encoding='utf-8') as f:
-        json.dump(episode, f, indent=2, ensure_ascii=False)
+
+    # 与 archive_episode 同为实体文件的读-改-写，放在同一把锁内避免丢更新
+    with _INDEX_LOCK:
+        episode = get_episode(episode_id)
+        if not episode:
+            return False
+
+        episode["reflection"] = reflection
+
+        with open(episode_file, 'w', encoding='utf-8') as f:
+            json.dump(episode, f, indent=2, ensure_ascii=False)
 
     return True
 
@@ -180,21 +205,24 @@ def list_episodes(
 
 def archive_episode(episode_id: str) -> bool:
     """归档 Episode（软删除）"""
-    episode = get_episode(episode_id)
-    if not episode:
-        return False
-
-    episode["archived"] = True
-    episode["archivedAt"] = datetime.now().isoformat()
-
     episode_file = os.path.join(EPISODES_DIR, f"{episode_id}.json")
-    with open(episode_file, 'w', encoding='utf-8') as f:
-        json.dump(episode, f, indent=2, ensure_ascii=False)
 
-    # 从索引移除
-    index = _load_index()
-    index["episodes"] = [e for e in index["episodes"] if e["id"] != episode_id]
-    _save_index(index)
+    with _INDEX_LOCK:
+        episode = get_episode(episode_id)
+        if not episode:
+            return False
+
+        episode["archived"] = True
+        episode["archivedAt"] = datetime.now().isoformat()
+
+        with open(episode_file, 'w', encoding='utf-8') as f:
+            json.dump(episode, f, indent=2, ensure_ascii=False)
+
+        # 从索引移除
+        def _drop_from_index(index: Dict):
+            index["episodes"] = [e for e in index["episodes"] if e["id"] != episode_id]
+
+        _update_index(_drop_from_index)
 
     return True
 
@@ -250,19 +278,20 @@ def create_skill(
         "lastSuccessAt": datetime.now().isoformat()
     }
 
-    # 保存到文件
+    # 实体文件与索引在同一次加锁内写完，避免出现"有文件、无索引"的孤儿
     skill_file = os.path.join(SKILLS_DIR, f"{skill_id}.json")
-    with open(skill_file, 'w', encoding='utf-8') as f:
-        json.dump(skill, f, indent=2, ensure_ascii=False)
 
-    # 更新索引
-    index = _load_index()
-    index["skills"].insert(0, {
-        "id": skill_id,
-        "name": name,
-        "status": "active"
-    })
-    _save_index(index)
+    def _append_to_index(index: Dict):
+        index["skills"].insert(0, {
+            "id": skill_id,
+            "name": name,
+            "status": "active"
+        })
+
+    with _INDEX_LOCK:
+        with open(skill_file, 'w', encoding='utf-8') as f:
+            json.dump(skill, f, indent=2, ensure_ascii=False)
+        _update_index(_append_to_index)
 
     print(f"MemoryStore: Created skill {skill_id}: {name}", flush=True)
     return skill
@@ -325,35 +354,41 @@ def match_skills(task: str) -> List[Dict]:
 
 def update_skill_usage(skill_id: str, success: bool):
     """更新技能使用统计"""
-    skill = get_skill(skill_id)
-    if not skill:
-        return
-
-    if success:
-        skill["successCount"] = skill.get("successCount", 0) + 1
-        skill["lastSuccessAt"] = datetime.now().isoformat()
-    else:
-        skill["failureCount"] = skill.get("failureCount", 0) + 1
-
-    skill["lastUsed"] = datetime.now().isoformat()
-
     skill_file = os.path.join(SKILLS_DIR, f"{skill_id}.json")
-    with open(skill_file, 'w', encoding='utf-8') as f:
-        json.dump(skill, f, indent=2, ensure_ascii=False)
+
+    # 实体文件的读-改-写需要互斥，否则并发调用会丢掉计数
+    with _INDEX_LOCK:
+        skill = get_skill(skill_id)
+        if not skill:
+            return
+
+        if success:
+            skill["successCount"] = skill.get("successCount", 0) + 1
+            skill["lastSuccessAt"] = datetime.now().isoformat()
+        else:
+            skill["failureCount"] = skill.get("failureCount", 0) + 1
+
+        skill["lastUsed"] = datetime.now().isoformat()
+
+        with open(skill_file, 'w', encoding='utf-8') as f:
+            json.dump(skill, f, indent=2, ensure_ascii=False)
 
 
 def delete_skill(skill_id: str) -> bool:
     """删除技能"""
     skill_file = os.path.join(SKILLS_DIR, f"{skill_id}.json")
-    if not os.path.exists(skill_file):
-        return False
 
-    os.remove(skill_file)
+    with _INDEX_LOCK:
+        if not os.path.exists(skill_file):
+            return False
 
-    # 从索引移除
-    index = _load_index()
-    index["skills"] = [s for s in index["skills"] if s["id"] != skill_id]
-    _save_index(index)
+        os.remove(skill_file)
+
+        # 从索引移除
+        def _drop_from_index(index: Dict):
+            index["skills"] = [s for s in index["skills"] if s["id"] != skill_id]
+
+        _update_index(_drop_from_index)
 
     return True
 

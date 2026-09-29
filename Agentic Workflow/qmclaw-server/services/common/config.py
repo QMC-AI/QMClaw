@@ -110,6 +110,15 @@ class Config:
 
     def _load_config(self):
         """加载配置"""
+        # 先加载 qmclaw-server/.env（与 Express / hermes_service 同一文件），
+        # 否则 Python 子进程只看得到系统环境变量，.env 里的 Key 会读不到。
+        server_dir = Path(__file__).parent.parent.parent
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(server_dir / ".env")
+        except Exception as e:
+            print(f"[Config] load_dotenv failed: {e}")
+
         # 从环境变量加载
         self._config = {
             # LLM API Keys
