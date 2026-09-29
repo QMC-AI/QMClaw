@@ -861,3 +861,24 @@ Browser → Express (:3002) → Python subprocess → Hermes AIAgent
 - **范围**：docs（约定）
 - **改动**：用户要求「以后每次修改都要记录进日志」。本文件为开发日志入口，**每次修改后追加一条**
 - **文件**：`CLAUDE.md` 约定 5、`.claude/progress.md`
+
+---
+## 2026-09-29  P0 本机接线闭环 + 服务验收（前端用户已确认）
+- **范围**：chore / fix（分支 `feat/c-real-machine`）
+- **改动**：
+  1. vendor 三模块落位 `QMClaw\\vendor\\`（hermes-agent / QubitClient 0.6.22 / QCA）
+  2. qca_service 两处 `D:\\Documents\\QMClaw` 硬编码改为相对 `__file__` 推导（server.py / tools/lab_tool.py）
+  3. 离线数据 5011 hdf5 拷入 `qmclaw-server\\data\\offline_data` 并生成索引（qubits 111 / datasets 5008 / experiments 13）
+  4. `.env` 落位（PYTHON_BIN 指 deploy 环境、PORT=3002；密钥不入库）
+  5. qmclaw-web / qmclaw-server `npm install`；4 个包 `pip install -e` 指向新路径
+- **验收**：
+  - `check_services.py` 10/10 可导入（qca 由 FAIL → OK）
+  - 服务实启：quantum:3003 / analysis:3004 / Express:3002 / Next.js:8081
+  - `GET /health` → express ok + 微服务清单；前端 HTTP 200
+  - **用户浏览器验证前端页面通过**
+  - 无 LabRAD 时 quantum 自动降级离线（auto 模式），加载 5008 datasets
+- **遗留（待决策）**：
+  - pip check：`openai 2.54.0` / `rich 14.3.4` vs hermes-agent pin
+  - qca 自有 `tools/lab_tool.py` 被 vendor 同名包遮蔽（含悬空 `from .runner import`），当前不可达
+  - `config/qubitclient.json` 是否需要由人工配置
+- **提交**：本条 progress 记录
