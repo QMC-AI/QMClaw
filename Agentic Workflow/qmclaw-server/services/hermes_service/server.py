@@ -170,9 +170,20 @@ try:
 except ImportError:
     _log("WARNING: python-dotenv not installed, API keys may not be loaded")
 
+# Set HERMES_HOME from .env (must be before importing AIAgent)
+# This tells Hermes to use the project's skills directory
+_hermes_home_from_env = os.environ.get("HERMES_HOME")
+if _hermes_home_from_env:
+    _log(f"HERMES_HOME from .env: {_hermes_home_from_env}")
+else:
+    # Default to QMClaw root, making skills/ available to Hermes
+    os.environ["HERMES_HOME"] = _QMCLAW_ROOT
+    _log(f"Set HERMES_HOME to QMClaw root: {_QMCLAW_ROOT}")
+
 _log(f"Hermes paths initialized:")
 _log(f"  _QMCLAW_ROOT: {_QMCLAW_ROOT}")
 _log(f"  _HERMES_AGENT_PATH: {_HERMES_AGENT_PATH}")
+_log(f"  get_skills_dir() target: {os.path.join(os.environ.get('HERMES_HOME', _QMCLAW_ROOT), 'skills')}")
 
 # Debug: Check environment variables
 _log(f"Environment check at startup:")

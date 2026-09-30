@@ -191,7 +191,7 @@ class MCPBridgeManager:
     def _setup_analysis_bridge(self) -> None:
         """设置 Analysis 工具集"""
         from ..common.quantum_tools import ToolRegistry
-        from .analysis_tools import setup_analysis_tools
+        from ..common.quantum_tools.analysis_tools import setup_analysis_tools
 
         registry = ToolRegistry()
         setup_analysis_tools(registry, self._analysis_service_url)
@@ -205,7 +205,7 @@ class MCPBridgeManager:
     def _setup_workflow_bridge(self) -> None:
         """设置 Workflow 工具集"""
         from ..common.quantum_tools import ToolRegistry
-        from .workflow_tools import setup_workflow_tools
+        from ..common.quantum_tools.workflow_tools import setup_workflow_tools
 
         registry = ToolRegistry()
         setup_workflow_tools(registry, self._workflow_service_url)

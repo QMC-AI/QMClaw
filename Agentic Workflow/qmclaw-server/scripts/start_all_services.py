@@ -153,6 +153,9 @@ def start_service(name: str, config: dict, output_queue: queue.Queue) -> subproc
         print(f"[start_all]   MINIMAX_API_KEY: {'***' if env.get('MINIMAX_API_KEY') else '(not set)'}")
         print(f"[start_all]   DEEPSEEK_API_KEY: {'***' if env.get('DEEPSEEK_API_KEY') else '(not set)'}")
         print(f"[start_all]   OPENAI_API_KEY: {'***' if env.get('OPENAI_API_KEY') else '(not set)'}")
+    if name == "hermes":
+        print(f"[start_all]   HERMES_HOME: {env.get('HERMES_HOME', '(not set)')}")
+        print(f"[start_all]   MINIMAX_API_KEY: {'***' if env.get('MINIMAX_API_KEY') else '(not set)'}")
 
     print(f"[start_all] Starting {name} ({config['description']})...")
     print(f"[start_all]   Module: {module_path}")

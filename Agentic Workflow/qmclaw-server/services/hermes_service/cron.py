@@ -110,6 +110,44 @@ def _log(msg: str):
         print(f"[cron] {msg}")
 
 
+def _get_local_timezone():
+    """获取本地时区（兼容 Windows）"""
+    try:
+        # 尝试使用 tzlocal 获取本地时区
+        from tzlocal import get_localzone
+        return str(get_localzone())
+    except Exception:
+        pass
+
+    # 回退方案：尝试常见的中美时区
+    import time
+    import os
+
+    # 检查环境变量
+    for env_name in ['TZ', 'TIMEZONE']:
+        tz = os.environ.get(env_name)
+        if tz:
+            return tz
+
+    # Windows 上尝试从注册表获取
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           r'SYSTEM\CurrentControlSet\Control\TimeZoneInformation',
+                           0, winreg.KEY_READ) as key:
+            bias = winreg.QueryValueEx(key, 'ActiveTimeBias')[0]
+            # UTC+8 (China) 或 UTC-5 (US EST) 的偏置（分钟）
+            if bias == -480:  # UTC+8
+                return 'Asia/Shanghai'
+            elif bias == 300:  # UTC-5
+                return 'America/New_York'
+    except Exception:
+        pass
+
+    # 最终回退：使用 UTC
+    return 'UTC'
+
+
 def _init_scheduler() -> Optional[BackgroundScheduler]:
     """初始化 APScheduler 调度器"""
     global _scheduler
@@ -121,8 +159,12 @@ def _init_scheduler() -> Optional[BackgroundScheduler]:
     if _scheduler is None:
         with _scheduler_lock:
             if _scheduler is None:
+                # 获取本地时区（兼容 Windows）
+                local_tz = _get_local_timezone()
+                _log(f"Using timezone: {local_tz}")
+
                 _scheduler = BackgroundScheduler(
-                    timezone="local",
+                    timezone=local_tz,
                     job_defaults={
                         "coalesce": True,       # 合并错过的执行
                         "max_instances": 1,      # 同一任务最多一个实例
