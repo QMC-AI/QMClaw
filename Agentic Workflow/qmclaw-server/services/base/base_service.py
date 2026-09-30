@@ -83,6 +83,11 @@ class BaseHTTPRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        # 检查是否需要 SSE 流式响应
+        if path == "/chat/stream" and self.service.support_streaming():
+            self.handle_streaming_request(path)
+            return
+
         # 读取请求体
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
@@ -98,6 +103,40 @@ class BaseHTTPRequestHandler(BaseHTTPRequestHandler):
             self.send_json_response(200, result)
         except Exception as e:
             self.send_json_response(500, {"error": str(e)})
+
+    def handle_streaming_request(self, path: str):
+        """处理 SSE 流式请求"""
+        # 读取请求体
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self.send_json_response(400, {"error": "Invalid JSON"})
+            return
+
+        # 发送 SSE 头
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        # 定义写入函数
+        def write_fn(sse_data: str):
+            try:
+                self.wfile.write(sse_data.encode("utf-8"))
+                self.wfile.flush()
+            except Exception:
+                pass
+
+        # 调用流式处理
+        try:
+            self.service.handle_stream_request(path, data, write_fn)
+        except Exception as e:
+            write_fn(f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n")
 
     def do_DELETE(self):
         """处理 DELETE 请求"""
@@ -174,6 +213,20 @@ class BaseService(ABC):
 
         Returns:
             响应数据
+        """
+        pass
+
+    def support_streaming(self) -> bool:
+        """是否支持 SSE 流式响应 - 子类可覆盖"""
+        return False
+
+    def handle_stream_request(self, path: str, data: Dict[str, Any], write_fn: Callable[[str], None]):
+        """处理 SSE 流式请求 - 子类可覆盖
+
+        Args:
+            path: 请求路径
+            data: 请求体数据
+            write_fn: SSE 写入回调函数
         """
         pass
 

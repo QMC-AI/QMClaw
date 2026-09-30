@@ -1121,6 +1121,142 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
+  // ── Hermes Sessions ──────────────────────────────────────────────────────────
+
+  hermesGetSessions: async () => {
+    const res = await fetch(`${API_BASE}/api/hermes/sessions`);
+    return res.json();
+  },
+
+  hermesGetSession: async (sessionId: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/sessions/${encodeURIComponent(sessionId)}`);
+    return res.json();
+  },
+
+  hermesGetSessionMessages: async (sessionId: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/sessions/${encodeURIComponent(sessionId)}/messages`);
+    return res.json();
+  },
+
+  hermesDeleteSession: async (sessionId: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    });
+    return res.json();
+  },
+
+  // ── Hermes Memory ────────────────────────────────────────────────────────────
+
+  hermesGetMemory: async () => {
+    const res = await fetch(`${API_BASE}/api/hermes/memory`);
+    return res.json();
+  },
+
+  hermesAddMemory: async (target: 'memory' | 'user', content: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/memory/add`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target, content }),
+    });
+    return res.json();
+  },
+
+  hermesEditMemory: async (target: 'memory' | 'user', old_text: string, content: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/memory/edit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target, old_text, content }),
+    });
+    return res.json();
+  },
+
+  hermesDeleteMemory: async (target: 'memory' | 'user', old_text: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/memory/delete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target, old_text }),
+    });
+    return res.json();
+  },
+
+  // ── Hermes Skills ────────────────────────────────────────────────────────────
+
+  hermesGetSkills: async () => {
+    const res = await fetch(`${API_BASE}/api/hermes/skills`);
+    return res.json();
+  },
+
+  hermesGetSkill: async (name: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/skills/${encodeURIComponent(name)}`);
+    return res.json();
+  },
+
+  hermesToggleSkill: async (name: string, enabled: boolean) => {
+    const action = enabled ? 'enable' : 'disable';
+    const res = await fetch(`${API_BASE}/api/hermes/skills/${encodeURIComponent(name)}/${action}`, {
+      method: "POST",
+    });
+    return res.json();
+  },
+
+  exportSkills: async () => {
+    // 获取所有 skills
+    const data = await api.hermesGetSkills();
+    return data.skills || [];
+  },
+
+  // ── Hermes Cron ─────────────────────────────────────────────────────────────
+
+  hermesGetCronJobs: async () => {
+    const res = await fetch(`${API_BASE}/api/hermes/cron`);
+    return res.json();
+  },
+
+  hermesCreateCronJob: async (data: {
+    name: string;
+    schedule: string;
+    task_type: 'quantum' | 'hermes' | 'script';
+    prompt?: string;
+    model?: string;
+    skills?: string[];
+    qubit?: string;
+  }) => {
+    const res = await fetch(`${API_BASE}/api/hermes/cron`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    return res.json();
+  },
+
+  hermesDeleteCronJob: async (jobId: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/cron/${encodeURIComponent(jobId)}`, {
+      method: "DELETE",
+    });
+    return res.json();
+  },
+
+  hermesPauseCronJob: async (jobId: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/cron/${encodeURIComponent(jobId)}/pause`, {
+      method: "POST",
+    });
+    return res.json();
+  },
+
+  hermesResumeCronJob: async (jobId: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/cron/${encodeURIComponent(jobId)}/resume`, {
+      method: "POST",
+    });
+    return res.json();
+  },
+
+  hermesRunCronJob: async (jobId: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/cron/${encodeURIComponent(jobId)}/run`, {
+      method: "POST",
+    });
+    return res.json();
+  },
+
   // ── Memory & Reflection ──────────────────────────────────────────────────
 
   memoryListEpisodes: async (limit = 50, qubit?: string, status?: string) => {

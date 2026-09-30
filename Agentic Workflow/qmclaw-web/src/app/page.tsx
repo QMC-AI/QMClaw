@@ -17,6 +17,8 @@ import { CompactSessionManager } from "../components/SessionManager";
 import ImageClassificationPanel from "../components/ImageClassificationPanel";
 import AgentChatPanel from "../components/AgentChatPanel";
 import HermesChatPanel from "../components/HermesChatPanel";
+import HermesSessionsSidebar from "../components/HermesSessionsSidebar";
+import HermesExtensionsPanel from "../components/HermesExtensionsPanel";
 import QubitParamsPanel from "../components/QubitParamsPanel";
 import ModelRegistry from "../components/ModelRegistry";
 import ExperimentConfigs from "../components/ExperimentConfigs";
@@ -556,8 +558,9 @@ export default function Dashboard() {
         }
 
         // Show plot if available
-        if (result.plotPath) {
-          setPlotUrl(normalizePlotUrl(result.plotPath));
+        const actualResult = result.result as { plotPath?: string } | undefined;
+        if (actualResult?.plotPath) {
+          setPlotUrl(normalizePlotUrl(actualResult.plotPath));
           addLog("📊 Plot generated from historical data");
         }
 
@@ -981,8 +984,14 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* Compact Qubit selector (bottom, fixed height) - not for images tab */}
-          {activeTab !== "images" && activeTab !== "experiments" && (
+          {activeTab === "hermes" && (
+            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", padding: "0.5rem" }}>
+              <HermesSessionsSidebar />
+            </div>
+          )}
+
+          {/* Compact Qubit selector (bottom, fixed height) - not for images/experiments/hermes tabs */}
+          {activeTab !== "images" && activeTab !== "experiments" && activeTab !== "hermes" && (
           <div style={{
             borderTop: "1px solid #1e293b",
             padding: "0.5rem",
@@ -1297,18 +1306,7 @@ export default function Dashboard() {
                 <button
                   onClick={() => {
                     if (running) return;
-                    setIsRunningPlot(true);
-                    const cmd = currentPlotCommand || `qter.fitData({exp_num})`;
-                    api.runPlot(cmd, selectedExp).then((result) => {
-                      if (result.success) {
-                        setPlotUrl(result.image || null);
-                        addLog("✅ Plot completed");
-                      } else {
-                        addLog("❌ Plot failed: " + result.error, true);
-                      }
-                    }).finally(() => {
-                      setIsRunningPlot(false);
-                    });
+                    handlePlot(currentPlotCommand || `qter.fitData({exp_num})`);
                   }}
                   disabled={running || isRunningPlot}
                   style={{
@@ -1455,7 +1453,10 @@ export default function Dashboard() {
 
           {/* HERMES TAB */}
           {activeTab === "hermes" && (
-            <HermesChatPanel />
+            <div style={{ display: "flex", flexDirection: "column", gap: "1rem", height: "100%" }}>
+              <HermesChatPanel />
+              <HermesExtensionsPanel />
+            </div>
           )}
 
           {/* QCA TAB */}

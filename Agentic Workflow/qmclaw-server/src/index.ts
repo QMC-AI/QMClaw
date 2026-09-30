@@ -52,6 +52,8 @@ console.log("[Debug] __dirname:", __dirname);
 
 import express from "express";
 import { createServer } from "http";
+import { Server as SocketIOServer } from "socket.io";
+import { WebSocketServer, WebSocket } from "ws";
 import cors from "cors";
 import { generateJobId } from "./queue/job-types";
 import { loadExperimentConfigs, saveExperimentConfigs, getExperimentConfig, updateExperimentConfig, ExperimentConfig } from "./services/experimentConfigService";
@@ -2644,6 +2646,198 @@ app.get("/api/hermes/models", (_req, res) => {
   res.json({ models });
 });
 
+/** GET /api/hermes/sessions — List all sessions */
+app.get("/api/hermes/sessions", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', '/sessions', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Sessions not available in legacy mode" });
+  }
+});
+
+/** GET /api/hermes/sessions/:id — Get session details */
+app.get("/api/hermes/sessions/:id", async (req, res) => {
+  const { id } = req.params;
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', `/sessions/${encodeURIComponent(id)}`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Sessions not available in legacy mode" });
+  }
+});
+
+/** GET /api/hermes/sessions/:id/messages — Get session messages */
+app.get("/api/hermes/sessions/:id/messages", async (req, res) => {
+  const { id } = req.params;
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', `/sessions/${encodeURIComponent(id)}/messages`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Sessions not available in legacy mode" });
+  }
+});
+
+/** DELETE /api/hermes/sessions/:id — Delete a session */
+app.delete("/api/hermes/sessions/:id", async (req, res) => {
+  const { id } = req.params;
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', `/sessions/${encodeURIComponent(id)}`, 'DELETE');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Sessions not available in legacy mode" });
+  }
+});
+
+// ── Hermes Memory ─────────────────────────────────────────────────────────────────
+
+/** GET /api/hermes/memory — Get memory state */
+app.get("/api/hermes/memory", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', '/memory', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Memory not available in legacy mode" });
+  }
+});
+
+/** POST /api/hermes/memory/add — Add memory entry */
+app.post("/api/hermes/memory/add", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', '/memory/add', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Memory not available in legacy mode" });
+  }
+});
+
+/** POST /api/hermes/memory/edit — Edit memory entry */
+app.post("/api/hermes/memory/edit", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', '/memory/edit', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Memory not available in legacy mode" });
+  }
+});
+
+/** POST /api/hermes/memory/delete — Delete memory entry */
+app.post("/api/hermes/memory/delete", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', '/memory/delete', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Memory not available in legacy mode" });
+  }
+});
+
+// ── Hermes Skills ─────────────────────────────────────────────────────────────────
+
+/** GET /api/hermes/skills — Get skills list */
+app.get("/api/hermes/skills", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', '/skills', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Skills not available in legacy mode" });
+  }
+});
+
+/** GET /api/hermes/skills/:name — Get skill content */
+app.get("/api/hermes/skills/:name+", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const skillPath = req.params.name;
+    const result = await proxyToService('hermes', `/skills/${skillPath}`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Skills not available in legacy mode" });
+  }
+});
+
+/** POST /api/hermes/skills/:name/enable — Enable skill */
+app.post("/api/hermes/skills/:name/enable", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const skillPath = req.params.name;
+    const result = await proxyToService('hermes', `/skills/${skillPath}/enable`, 'POST');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Skills not available in legacy mode" });
+  }
+});
+
+/** POST /api/hermes/skills/:name/disable — Disable skill */
+app.post("/api/hermes/skills/:name/disable", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const skillPath = req.params.name;
+    const result = await proxyToService('hermes', `/skills/${skillPath}/disable`, 'POST');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Skills not available in legacy mode" });
+  }
+});
+
+// ── Hermes Cron ───────────────────────────────────────────────────────────────────
+
+/** GET /api/hermes/cron — Get cron jobs */
+app.get("/api/hermes/cron", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', '/cron', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Cron not available in legacy mode" });
+  }
+});
+
+/** POST /api/hermes/cron — Create cron job */
+app.post("/api/hermes/cron", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', '/cron', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Cron not available in legacy mode" });
+  }
+});
+
+/** POST /api/hermes/cron/:id/pause — Pause cron job */
+app.post("/api/hermes/cron/:id/pause", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', `/cron/${req.params.id}/pause`, 'POST');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Cron not available in legacy mode" });
+  }
+});
+
+/** POST /api/hermes/cron/:id/resume — Resume cron job */
+app.post("/api/hermes/cron/:id/resume", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', `/cron/${req.params.id}/resume`, 'POST');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Cron not available in legacy mode" });
+  }
+});
+
+/** POST /api/hermes/cron/:id/run — Run cron job immediately */
+app.post("/api/hermes/cron/:id/run", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', `/cron/${req.params.id}/run`, 'POST');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Cron not available in legacy mode" });
+  }
+});
+
+/** DELETE /api/hermes/cron/:id — Delete cron job */
+app.delete("/api/hermes/cron/:id", async (req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', `/cron/${req.params.id}`, 'DELETE');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Cron not available in legacy mode" });
+  }
+});
+
 // ── MCP Tools CRUD ─────────────────────────────────────────────────────────────
 
 const MCP_TOOLS_FILE = path.join(__dirname, "..", "config", "mcp_tools.json");
@@ -3385,10 +3579,75 @@ app.get("/plot/:jobId", (req, res) => {
   res.sendFile(publicPath);
 });
 
+// ── WebSocket Server for Hermes Approval ───────────────────────────────────────
+
+// Track WebSocket connections for Hermes approval
+const hermesWsConnections = new Map<string, WebSocket>();
+
+// Create WebSocket server
+const wss = new WebSocketServer({ noServer: true });
+
+wss.on('connection', (ws: WebSocket, request: any) => {
+  const url = new URL(request.url, `http://localhost:${PORT}`);
+  const sessionId = url.searchParams.get('session_id');
+
+  if (!sessionId) {
+    console.log('[Hermes WS] Connection rejected: no session_id');
+    ws.close(4000, 'session_id required');
+    return;
+  }
+
+  console.log(`[Hermes WS] Client connected: session=${sessionId}`);
+  hermesWsConnections.set(sessionId, ws);
+
+  ws.on('message', (data: Buffer) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      console.log(`[Hermes WS] Message from ${sessionId}:`, msg.type);
+
+      if (msg.type === 'approval_response') {
+        // Forward approval response to hermes_service via HTTP
+        // The hermes_service will handle the response via its own WebSocket manager
+        // For now, we just log it
+        console.log(`[Hermes WS] Approval response: ${msg.response}`);
+      }
+    } catch (e) {
+      console.error('[Hermes WS] Failed to parse message:', e);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log(`[Hermes WS] Client disconnected: session=${sessionId}`);
+    hermesWsConnections.delete(sessionId);
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[Hermes WS] Error for ${sessionId}:`, err.message);
+    hermesWsConnections.delete(sessionId);
+  });
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────
 
-createServer(app).listen(PORT, () => {
+const server = createServer(app);
+
+// Handle WebSocket upgrade requests
+server.on('upgrade', (request, socket, head) => {
+  const url = new URL(request.url, `http://localhost:${PORT}`);
+
+  // Only handle /api/hermes/ws upgrades
+  if (url.pathname === '/api/hermes/ws' || url.pathname === '/hermes/ws') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+server.listen(PORT, () => {
   console.log(`[Server] Listening on http://localhost:${PORT}`);
+  console.log(`[Server] WebSocket available at ws://localhost:${PORT}/api/hermes/ws`);
   console.log(`[Server] Integrated: experiments, sessions, datasets, plots (no backend needed)`);
 
   // Debug: list all registered routes

@@ -649,7 +649,7 @@ class AnalysisService(BaseService):
             except Exception as plot_err:
                 _log(f"Plot command error: {plot_err}")
                 # 使用默认绘图作为 fallback
-                qter.fitData(do_plot=True)
+                qter.fitData(collect=True, do_plot=True)
 
             # 获取所有打开的 figures
             fig_nums = plt.get_fignums()
@@ -670,20 +670,38 @@ class AnalysisService(BaseService):
             fig = plt.figure(fig_nums[-1] if fig_nums else 1)
             plt.tight_layout()
 
-            # 6. 返回 Base64 编码的图像
+            # 6. 同时保存图像到临时文件和生成 base64
+            import uuid
+            import os
+
+            # 生成 base64
             buffer = BytesIO()
             fig.savefig(buffer, format='png', dpi=self._default_dpi, bbox_inches='tight')
-            plt.close(fig)
             buffer.seek(0)
-
             base64_image = base64.b64encode(buffer.read()).decode('utf-8')
-            image_data_url = f"data:image/png;base64,{base64_image}"
 
-            _log(f"Offline v2 plot generated successfully for {dataset_id}")
+            # 保存到 qmclaw-web/public/plots 目录
+            plots_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+                                      "qmclaw-web", "public", "plots")
+            os.makedirs(plots_dir, exist_ok=True)
+
+            # 生成唯一文件名
+            filename = f"temp_{uuid.uuid4().hex[:8]}.png"
+            filepath = os.path.join(plots_dir, filename)
+
+            # 保存文件
+            fig.savefig(filepath, format='png', dpi=self._default_dpi, bbox_inches='tight')
+            plt.close(fig)
+
+            # 返回短 URL (相对路径，供前端使用)
+            image_url = f"/plots/{filename}"
+
+            _log(f"Offline v2 plot saved to {filepath}")
 
             return {
                 "success": True,
-                "image": image_data_url,
+                "image_url": image_url,
+                "image": f"data:image/png;base64,{base64_image}",
                 "dataset_id": dataset_id,
                 "dataset_name": ds_info.get("name", ""),
                 "qubit": ds_info.get("qubit", ""),

@@ -1,5 +1,312 @@
 # QMClaw 开发进度
 
+## 2026-09-23: Hermes 扩展功能 (Memory + Skills + Cron)
+
+### 目标
+借鉴 hermes-hudui 项目的记忆管理、Skills 动态管理和 Cron 定时任务功能，集成到 QMClaw Hermes 微服务。
+
+### 需求确认
+- 存储方式：QMClaw 独立存储（不与 Hermes 共用文件）
+- Skills 来源：QMClaw 独立管理
+- Cron 执行：两者都支持（quantum/hermes/script）
+- 现有代码：仅新增，不修改
+- WebSocket 通知：广播给所有客户端（单用户系统）
+- 量子比特参数：支持指定 qubit 字段
+
+### 架构
+```
+qmclaw-web (前端)
+    ↓ API
+qmclaw-server Express (:3002)
+    ↓ proxy
+hermes_service (:3012)
+    ├── memory.py      - 记忆管理
+    ├── skills.py     - Skills 管理
+    └── cron.py        - Cron 定时任务
+    ↓ 存储
+data/
+    ├── memories/     - MEMORY.md, USER.md
+    ├── skills/       - *.md 文件
+    └── cron/         - jobs.json
+```
+
+### Phase 1: Cron 定时任务（已完成）
+
+#### 后端 APScheduler 集成
+- [x] `services/hermes_service/cron.py` - APScheduler 集成
+  - `_init_scheduler()` - BackgroundScheduler 初始化
+  - `_schedule_job()` - 将任务添加到调度器
+  - `_unschedule_job()` - 从调度器移除任务
+  - `_execute_job_async()` - 异步执行任务（调度器回调）
+  - `_execute_quantum_job()` - 调用 quantum_service
+  - `_execute_hermes_job()` - 调用 hermes_service /chat
+  - `_execute_script_job()` - 执行 shell 命令
+  - `_notify_job_result()` - WebSocket 广播任务结果
+  - `_restore_scheduled_jobs()` - 启动时恢复任务
+  - `shutdown_scheduler()` - 关闭调度器
+  - `init_cron()` - 初始化入口
+  - qubit 字段支持（用于量子测控任务）
+  - `_on_job_executed()` - 任务执行事件回调
+
+- [x] `services/hermes_service/approval_ws.py` - 添加 `broadcast()` 方法
+
+- [x] `services/hermes_service/server.py` - 调度器初始化
+  - `before_start()` 中调用 `cron_module.init_cron()`
+  - `_handle_cron()` 支持 qubit 参数
+
+#### 前端 WebSocket 监听
+- [x] `src/components/HermesExtensionsPanel.tsx` - CronSection
+  - WebSocket 连接监听 `cron_job_result` 事件
+  - 任务执行结果通知横幅（5秒自动消失）
+  - qubit 字段显示
+  - prompt 字段输入（textarea）
+  - 删除任务按钮
+  - CronJobResult 接口定义
+
+#### Gateway 路由
+- [x] `src/index.ts` - 添加 DELETE /api/hermes/cron/:id
+
+#### API 端点
+- [x] `src/lib/api.ts` - 添加 `hermesDeleteCronJob`
+
+### 待测试
+- [ ] 启动后端服务测试 APScheduler 集成
+- [ ] 创建 Cron 任务测试定时调度
+- [ ] WebSocket 任务结果通知测试
+- [ ] 量子测控任务执行测试
+- [ ] Hermes Agent 任务执行测试
+
+### Phase 2: Skills CRUD（待开发）
+- [ ] 后端创建/编辑/删除 API
+- [ ] 前端表单和操作按钮
+
+### Phase 3: Memory 管理完善（待开发）
+- [ ] 分类筛选
+- [ ] 搜索功能
+
+### API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | /api/hermes/memory | 获取记忆状态 |
+| POST | /api/hermes/memory/add | 添加记忆 |
+| POST | /api/hermes/memory/edit | 编辑记忆 |
+| POST | /api/hermes/memory/delete | 删除记忆 |
+| GET | /api/hermes/skills | 获取 Skills 列表 |
+| GET | /api/hermes/skills/:name | 获取 Skill 内容 |
+| POST | /api/hermes/skills/:name/enable | 启用 Skill |
+| POST | /api/hermes/skills/:name/disable | 禁用 Skill |
+| GET | /api/hermes/cron | 获取 Cron 任务 |
+| POST | /api/hermes/cron | 创建任务 |
+| DELETE | /api/hermes/cron/:id | 删除任务 |
+| POST | /api/hermes/cron/:id/pause | 暂停任务 |
+| POST | /api/hermes/cron/:id/resume | 恢复任务 |
+| POST | /api/hermes/cron/:id/run | 立即运行 |
+
+---
+
+## 2026-09-22: Hermes 聊天界面增强（Markdown 渲染 + 工具调用卡片）
+
+### 目标
+借鉴 hermes-hudui 项目设计，增强 QMClaw Hermes 聊天界面的 Markdown 渲染、代码高亮、思考过程折叠和工具调用卡片功能。
+
+### 修改文件
+
+#### 新建文件
+- `qmclaw-web/src/lib/markdown.tsx`
+  - MarkdownContent 组件 - ReactMarkdown 渲染
+  - CopyButton 组件 - 代码复制按钮
+  - 支持: 代码高亮、复制、引用、链接、表格、列表、标题样式
+  
+- `qmclaw-web/src/lib/reasoning-block.tsx`
+  - ReasoningBlock 组件 - 可折叠思考过程卡片
+  - 左侧黄色边框 + 🧠 图标
+  - 默认收起，点击展开
+
+- `qmclaw-web/src/lib/tool-call-card.tsx`
+  - ToolCallCard 组件 - 可折叠工具调用卡片
+  - 状态指示: 运行中(黄) / 完成(绿) / 错误(红)
+  - ToolCallsList 组件 - 工具调用列表包装器
+
+#### 修改文件
+- `qmclaw-web/package.json`
+  - 添加依赖: react-markdown, remark-gfm, rehype-highlight, highlight.js
+
+- `qmclaw-web/src/components/HermesChatPanel.tsx`
+  - 导入新组件: MarkdownContent, ReasoningBlock, ToolCallsList
+  - 重构消息渲染逻辑，使用新组件替代原有简陋实现
+
+### 依赖安装
+```bash
+npm install react-markdown remark-gfm rehype-highlight highlight.js
+```
+
+### 状态
+- [x] Markdown 渲染组件创建
+- [x] 思考过程折叠组件创建
+- [x] 工具调用卡片组件创建
+- [x] HermesChatPanel 重构
+- [x] npm install 完成（使用 npmmirror 镜像）
+- [x] 构建验证通过（仅 page.tsx 有预先存在的类型错误）
+
+### 验证
+代码已编译成功。page.tsx 的类型错误是预先存在的，与本次修改无关。
+
+### 待测试
+启动前端服务后测试：
+- [ ] 消息 Markdown 渲染（代码高亮、表格、引用）
+- [ ] 代码块复制按钮
+- [ ] 思考过程折叠/展开
+- [ ] 工具调用卡片状态和展开
+
+---
+
+## 2026-09-22: Hermes 消息图片显示
+
+### 目标
+在 Hermes 聊天界面中显示工具调用返回的图片，并支持下载和全屏查看。
+
+### 修改文件
+
+#### 前端
+- `src/components/HermesChatPanel.tsx`
+  - 新增 `images` 字段到 `HermesMessage` 接口
+  - 在 `tool_complete` 事件处理中添加图片提取逻辑
+  - 新增 `downloadImage()` 函数
+  - 新增图片渲染组件（显示、下载、全屏按钮）
+
+#### 后端
+- `services/common/quantum_tools/analysis_tools.py`
+  - 新增 `GetLatestDatasetTool` - 获取最新数据集工具
+  - 新增 `analysis_get_latest_dataset` 工具
+
+#### 核心修复
+- `services/hermes_service/server.py`
+  - 修复 `tool_complete_callback` 参数（4个参数而非2个）
+  - 现在可以正确获取工具的 result 数据
+
+### 图片提取格式
+支持从工具结果中提取多种图片格式：
+- `image` - base64 data URL (Analysis Service 返回格式)
+- `plotPath` - HTTP URL 或 base64
+- `plotUrl` - HTTP URL
+- `data.image` - ToolResult 嵌套格式
+
+### 新增工具
+- `qmclaw_analysis_get_latest_dataset` - 获取最新的数据集信息（ID, name, qubit, experiment_type）
+
+### 状态
+- [x] 实现完成
+- [ ] 重启 Hermes Service 测试
+
+---
+
+## 2026-09-22: Hermes MCP 工具集成（Analysis + Workflow）
+
+### 目标
+让 Hermes 智能体能调用测控系统的 Analysis 和 Workflow API，实现自然语言驱动的实验数据分析和自动化工作流控制。
+
+### 修改文件
+
+#### 新建文件
+- `services/common/quantum_tools/analysis_tools.py` - Analysis 工具（5个工具）
+  - `analysis_plot_offline` - 绘制离线数据
+  - `analysis_get_stats` - 获取统计信息
+  - `analysis_generate_variant` - 生成数据变体
+  - `analysis_execute` - 执行分析代码
+  - `analysis_list_variants` - 列出数据变体
+
+- `services/common/quantum_tools/workflow_tools.py` - Workflow 工具（6个工具）
+  - `workflow_list` - 列出工作流
+  - `workflow_create` - 创建工作流
+  - `workflow_run` - 运行工作流
+  - `workflow_status` - 获取状态
+  - `workflow_cancel` - 取消工作流
+  - `workflow_stats` - 获取统计
+
+- `services/hermes_service/mcp_toolsets.py` - 统一的 MCP 工具集管理
+  - `ToolsetBridge` - 工具集桥接器
+  - `MCPBridgeManager` - MCP 桥接管理器
+
+#### 修改文件
+- `services/hermes_service/server.py`
+  - 新增 MCP 桥接器初始化
+  - 新增工具注册逻辑（在 AIAgent 创建前）
+  - 更新 `_handle_quantum_tools` 支持多命名空间
+
+### 工具命名规范
+- Quantum: `qmclaw_{name}` (如 `qmclaw_get_qubits`)
+- Analysis: `qmclaw_analysis_{name}` (如 `qmclaw_analysis_plot_offline`)
+- Workflow: `qmclaw_workflow_{name}` (如 `qmclaw_workflow_run`)
+
+### 状态
+- [x] 分析探索
+- [x] 实现 Analysis 工具
+- [x] 实现 Workflow 工具
+- [x] 创建 MCP 桥接管理器
+- [x] 集成到 server.py
+- [x] 修复工具注册和解析问题
+- [ ] E2E 测试验证
+
+---
+
+## 2026-09-22: Hermes Web 会话历史管理
+
+### 目标
+为 Hermes Web UI 添加会话列表侧边栏，支持会话切换、创建和删除功能。
+
+### 需求确认
+- 会话列表 UI：侧边栏（左侧），默认展开
+- 会话切换：单会话模式（不支持多会话并发）
+- 会话列表：仅显示列表，无需搜索/过滤
+- 在线状态：需要显示 WebSocket 连接状态
+
+### 修改文件
+
+#### 后端
+- `services/hermes_service/server.py`
+  - 新增 DELETE /sessions/:id 端点
+  - 新增 `_handle_delete_session()` 方法
+
+#### 前端
+- `src/lib/api.ts`
+  - 新增 `hermesGetSessions()` - 获取会话列表
+  - 新增 `hermesGetSessionMessages(sessionId)` - 获取会话消息
+  - 新增 `hermesDeleteSession(sessionId)` - 删除会话
+
+- `src/components/HermesChatPanel.tsx`
+  - 新增 `Session` 接口
+  - 新增会话状态：`sessions`, `showSessionList`, `loadingSessions`, `deletingSessionId`
+  - `sessionId` 改为可变状态（支持切换）
+  - 新增函数：`loadSessions()`, `switchSession()`, `createNewSession()`, `deleteSession()`
+  - 新增会话列表侧边栏 UI
+  - 新增在线状态指示器（绿色=在线，红色=离线）
+  - 新增头部会话切换按钮
+
+### UI 布局
+```
+┌────────────────────────────────────────────────────────────┐
+│ [☰] Model:[▼] [Web] [Vision] [Terminal]     ● Online     │  ← 头部
+├──────────────┬─────────────────────────────────────────────┤
+│   Sessions   │                                             │
+│  ──────────  │           Chat Area                        │
+│  ○ S1 (3)   │                                             │
+│  ● S2 (7)   │                                             │
+│  ○ S3 (12)  │                                             │
+│  ──────────  │                                             │
+│  [+ New]    │                                             │
+├──────────────┴─────────────────────────────────────────────┤
+│ [输入框...]                                      [Send]    │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 待完成
+- [ ] 测试会话切换功能
+- [ ] 测试会话删除功能
+- [ ] 测试历史消息加载
+
+---
+
 ## 2026-09-20: 统一量子测控工具集和 API
 
 ### 背景
