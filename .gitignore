@@ -5,6 +5,8 @@ __pycache__/
 *.egg-info/
 .eggs/
 
+cache/
+*.db*
 # Build output
 Agentic Workflow/qmclaw-web/.next/
 Agentic Workflow/qmclaw-server/dist/
