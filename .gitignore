@@ -45,3 +45,9 @@ Thumbs.db
 *.bak
 *.tmp
 .pytest_cache/
+
+# local-only upstream merge artifacts (mirror is a reusable cache - keep it)
+.upstream-mirror/
+.merge-scratch/
+.analysis/
+
