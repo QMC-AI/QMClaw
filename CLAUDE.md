@@ -1,19 +1,27 @@
 # CLAUDE.md — QmClaw 开发约定
 
-## 导师上游融合（进行中，**方案已就绪、尚未执行**）
+## 导师上游融合（✅ **已合并完成** 2026-10-08）
 
-把导师上游 `Secsix/QMClaw`（main `03d838d`）合进 `feat/c-real-machine` 的方案已完成并实测验证。
-入口：
+导师上游 `Secsix/QMClaw`（main `03d838d`）已合入 `feat/c-real-machine`。
 
-| 文件 | 内容 |
-|------|------|
-| `docs/UPSTREAM_MERGE_PLAN.md` | 合并方案（14 节）：冲突预判、6 处冲突的解法、执行步骤、23 项验证清单、风险 |
-| `docs/merge_verify_tools/MERGED_CONTENT_PREVIEW.md` | **执行前先看**：4 个冲突文件会被解成什么样 |
-| `docs/merge_verify_tools/run-merge.ps1` | 一条命令执行第 0~9 步（**必须在沙箱外运行**；`-DryRun` 可先演练） |
-| `docs/BACKLOG.md` G 组 | 融合后 10 条收尾项（记忆三处收敛 / skills 修法 / 依赖未声明 …） |
+| 项 | 值 |
+|----|-----|
+| 合并提交 | `bf725e9`（父1 = 我方 `3d646c9`，父2 = 上游 `03d838d`） |
+| 当前 HEAD | `e8aaa85`（合并 + 收尾 + 文档提交） |
+| 冲突 | 4 个文件 / 6 处，全部按方案第五节解掉（`model_configs` / `base_service` / `HermesChatPanel` / `CLAUDE.md`） |
+| 我方提交 | **36 个全部保留**，历史未被改写 |
+| 回退点 | `git reset --hard backup/pre-upstream-merge-20261008-202936` |
+| 自动验证 | `probe-verify` **12 PASS / 0 FAIL**（4 项需起服务、3 项 WARN 已处置） |
 
-**执行前必须确认 3 项**：技能目录修法、`memory/MEMORY.md` 与 `auth.lock` 去留、`.env` 的 `HERMES_HOME` 语义。
-详见方案第十节与「十·补」。
+**收尾后必看**：
+
+- `docs/UPSTREAM_MERGE_PLAN.md` — 方案全文（14 节：冲突解法、执行步骤、23 项验证清单、下次同步流程）
+- **`docs/BACKLOG.md` G 组** — 融合后 10 条待办（记忆三处收敛 / skills / 依赖未声明 / …），**下一步从这儿挑**
+- `docs/merge_verify_tools/` — 13 个验证脚本 + `run-merge.ps1`（再同步上游时复用，见方案第十四节）
+
+**仍待人工（约定 3：服务启停由人控制）**：验证清单第 7 项（`npm install` 装 4 个新前端依赖 + 构建）、
+第 8/9/10 项（起服务跑接口与端到端 t1、并肉眼比图 —— `offline_data_lab.py` 被上游整份重写）、
+第 11/23 项（`GET /api/hermes/skills` 应非空；目录联接已建好，实测可扫到 7 个技能）。
 
 
 ## 配置文件
