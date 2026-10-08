@@ -32,16 +32,38 @@ def check(label, measured, expect, ok=None):
     print("[%s] %-46s 实测=%s  期望=%s" % ("PASS" if ok else "FAIL", label, measured, expect))
 
 
+def report_says(snippet):
+    """断言交付报告里确实写了这句话（而不是把状态写死在脚本里）。"""
+    try:
+        txt = io.open(os.path.join(ROOT, "docs/UPSTREAM_MERGE_DELIVERY.md"), encoding="utf-8").read()
+    except OSError:
+        return False
+    return snippet in txt
+
+
 print("=" * 100)
 print("核验 docs/UPSTREAM_MERGE_DELIVERY.md 的事实主张")
 print("=" * 100)
+print("注：HEAD 后续会继续增长，所以 HEAD/提交数不写死 —— 改为核验【报告里写的那个 HEAD】")
+print("    在当前仓库里真实存在（用 -1 参数可核验到某个历史快照）。")
+
+# 报告里声称的 HEAD 必须真实存在（而不是断言它等于当前 HEAD）
+head_in_report = os.environ.get("REPORT_HEAD", "c1bfd44")
+rc, _ = git("cat-file", "-e", head_in_report + "^{commit}")
+check("报告所述 HEAD 在仓库中存在", "是" if rc == 0 else "否", "是")
+
+# 归档脚本数：用「至少」而不是「等于」，因为后续会继续加脚本
+n_scripts_now = len([f for f in os.listdir(os.path.join(ROOT, "docs/merge_verify_tools"))
+                     if f.endswith((".py", ".ps1"))])
+check("归档脚本数 >= 报告所述 13", n_scripts_now, ">=13",
+      ok=n_scripts_now >= 13)
 
 # 锚点
 check("fork 点", git("rev-parse", "--short", "f2d83b5")[1], "f2d83b5")
 check("上游 HEAD", git("rev-parse", "--short", "03d838d")[1], "03d838d")
 check("合并提交", git("rev-parse", "--short", "bf725e9")[1], "bf725e9")
 check("合并前 HEAD", git("rev-parse", "--short", "3d646c9")[1], "3d646c9")
-check("当前 HEAD", git("rev-parse", "--short", "HEAD")[1], "68340d3")
+check("当前 HEAD 是报告所述 HEAD 的后代", "是" if git("merge-base", "--is-ancestor", head_in_report, "HEAD")[0] == 0 else "否", "是")
 
 # 合并提交的两个父
 parents = git("log", "-1", "--pretty=%P", "bf725e9")[1].split()
@@ -74,9 +96,9 @@ _, u = git("diff", "--name-only", "3d646c9", "bf725e9", "--",
            "Agentic Workflow/qmclaw-web/src/components/HermesChatPanel.tsx", "CLAUDE.md")
 check("4 个冲突文件确在合并 diff 中", len([x for x in u.split("\n") if x.strip()]), 4)
 
-# 本会话提交数（3d646c9 之后，不含上游）
-_, n = git("rev-list", "--count", "bf725e9..HEAD")
-check("合并之后的提交数（不含合并本身）", n, "8")
+# 本会话提交数（3d646c9 之后）：报告写的是 8 个，但后续提交会继续增加 —— 用「至少」
+rc, n = git("rev-list", "--count", "bf725e9..HEAD")
+check("合并之后的提交数 >= 报告所述 8", n, ">=8", ok=int(n) >= 8)
 
 # 关键文件实测
 root = ROOT
@@ -124,12 +146,10 @@ sk = pathlib.Path(root) / "Agentic Workflow/qmclaw-server/data/skills"
 n_skill = len(list(sk.rglob("SKILL.md"))) if sk.exists() else 0
 check("技能目录联接可扫到 SKILL.md 数", n_skill, 7)
 
-# 归档脚本数
+# 归档说明文档数：同样用「至少」
 tools = os.path.join(root, "docs/merge_verify_tools")
-n_scripts = len([f for f in os.listdir(tools) if f.endswith((".py", ".ps1"))])
 n_md = len([f for f in os.listdir(tools) if f.endswith(".md")])
-check("归档脚本数", n_scripts, 13)
-check("归档说明文档数", n_md, 3)
+check("归档说明文档数 >= 报告所述 3", n_md, ">=3", ok=n_md >= 3)
 
 # 回退分支存在
 _, br = git("branch", "--list", "backup/pre-upstream-merge-20261008-202936")
