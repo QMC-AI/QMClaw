@@ -1,0 +1,138 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""核验交付报告里的事实主张，对着 git 数据逐条检查。"""
+import io
+import json
+import os
+import subprocess
+import sys
+
+sys.stdout.reconfigure(encoding="utf-8")
+
+
+def git(*a):
+    p = subprocess.run(["git", "-C", r"D:\semester4\QMClaw"] + list(a), capture_output=True)
+    return p.returncode, p.stdout.decode("utf-8", "replace").strip()
+
+
+results = []
+
+
+def check(label, measured, expect, ok=None):
+    if ok is None:
+        ok = str(measured) == str(expect)
+    results.append((label, ok))
+    print("[%s] %-46s 实测=%s  期望=%s" % ("PASS" if ok else "FAIL", label, measured, expect))
+
+
+print("=" * 100)
+print("核验 docs/UPSTREAM_MERGE_DELIVERY.md 的事实主张")
+print("=" * 100)
+
+# 锚点
+check("fork 点", git("rev-parse", "--short", "f2d83b5")[1], "f2d83b5")
+check("上游 HEAD", git("rev-parse", "--short", "03d838d")[1], "03d838d")
+check("合并提交", git("rev-parse", "--short", "bf725e9")[1], "bf725e9")
+check("合并前 HEAD", git("rev-parse", "--short", "3d646c9")[1], "3d646c9")
+check("当前 HEAD", git("rev-parse", "--short", "HEAD")[1], "68340d3")
+
+# 合并提交的两个父
+parents = git("log", "-1", "--pretty=%P", "bf725e9")[1].split()
+check("合并第一父", parents[0][:7], "3d646c9")
+check("合并第二父", parents[1][:7], "03d838d")
+
+# 我方提交零改写
+rc, _ = git("merge-base", "--is-ancestor", "3d646c9", "HEAD")
+check("3d646c9 仍是 HEAD 祖先（历史未改写）", "是" if rc == 0 else "否", "是")
+
+# 规模
+_, s1 = git("diff", "--shortstat", "f2d83b5", "3d646c9")
+check("我方 62 文件 +7726 -347", s1, "62 files changed, 7726 insertions(+), 347 deletions(-)")
+
+_, s2 = git("diff", "--shortstat", "3d646c9", "bf725e9")
+check("合并 41 文件 +12400 -357", s2, "41 files changed, 12400 insertions(+), 357 deletions(-)")
+
+# 合并文件分类
+_, ns = git("diff", "--name-status", "3d646c9", "bf725e9")
+cnt = {"A": 0, "M": 0, "R": 0}
+for line in ns.split("\n"):
+    if line.strip():
+        cnt[line[0]] = cnt.get(line[0], 0) + 1
+check("合并分类 A/M/R", "A=%d M=%d R=%d" % (cnt["A"], cnt["M"], cnt["R"]), "A=18 M=19 R=4")
+
+# 4 个冲突文件
+_, u = git("diff", "--name-only", "3d646c9", "bf725e9", "--",
+           "Agentic Workflow/qmclaw-server/config/model_configs.json",
+           "Agentic Workflow/qmclaw-server/services/base/base_service.py",
+           "Agentic Workflow/qmclaw-web/src/components/HermesChatPanel.tsx", "CLAUDE.md")
+check("4 个冲突文件确在合并 diff 中", len([x for x in u.split("\n") if x.strip()]), 4)
+
+# 本会话提交数（3d646c9 之后，不含上游）
+_, n = git("rev-list", "--count", "bf725e9..HEAD")
+check("合并之后的提交数（不含合并本身）", n, "8")
+
+# 关键文件实测
+root = r"D:\semester4\QMClaw"
+
+# 模型配置
+d = json.loads(io.open(os.path.join(root, "Agentic Workflow/qmclaw-server/config/model_configs.json"),
+                       encoding="utf-8").read())
+ms = d["models"]
+srt = sorted(ms, key=lambda m: m.get("updatedAt", ""), reverse=True)
+et = [m for m in srt if m.get("enabled") and "text" in (m.get("capabilities") or [])]
+check("模型条数", len(ms), 10)
+check("按 updatedAt 倒序首条", et[0]["id"], "deepseek-flash")
+mini = [m for m in ms if m.get("modelId") == "MiniMax-M2.7"][0]
+check("MiniMax-M2.7 baseUrl 保留导师改动", mini.get("baseUrl"), "https://api.minimaxi.com/anthropic")
+
+# 装饰器
+import ast
+bs = io.open(os.path.join(root, "Agentic Workflow/qmclaw-server/services/base/base_service.py"),
+             encoding="utf-8").read()
+binds = {}
+for node in ast.walk(ast.parse(bs)):
+    if isinstance(node, ast.FunctionDef):
+        for dec in node.decorator_list:
+            s = ast.unparse(dec)
+            if "_timed_request" in s:
+                binds.setdefault(s, []).append(node.name)
+check("装饰器 DELETE 绑定", binds.get("_timed_request('DELETE')"), ["do_DELETE"])
+check("导师 SSE 方法在位", "handle_streaming_request" in bs, True)
+
+# 前端面板
+hp = io.open(os.path.join(root, "Agentic Workflow/qmclaw-web/src/components/HermesChatPanel.tsx"),
+             encoding="utf-8").read()
+check("HermesChatPanel 花括号平衡", hp.count("{") == hp.count("}"), True)
+check("DEFAULT_HERMES_MODEL 已无残留", "DEFAULT_HERMES_MODEL" in hp, False)
+check("useModelStore 保留", "useModelStore" in hp, True)
+
+# CLAUDE.md
+cd = io.open(os.path.join(root, "CLAUDE.md"), encoding="utf-8").read()
+check("CLAUDE.md 含导师 Compaction 段", "Compaction" in cd, True)
+check("CLAUDE.md 含我方本机 python 路径", r"D:\semester4\deploy\qmclaw\qmclaw\python.exe" in cd, True)
+
+# 技能联接
+import pathlib
+sk = pathlib.Path(root) / "Agentic Workflow/qmclaw-server/data/skills"
+n_skill = len(list(sk.rglob("SKILL.md"))) if sk.exists() else 0
+check("技能目录联接可扫到 SKILL.md 数", n_skill, 7)
+
+# 归档脚本数
+tools = os.path.join(root, "docs/merge_verify_tools")
+n_scripts = len([f for f in os.listdir(tools) if f.endswith((".py", ".ps1"))])
+n_md = len([f for f in os.listdir(tools) if f.endswith(".md")])
+check("归档脚本数", n_scripts, 13)
+check("归档说明文档数", n_md, 3)
+
+# 回退分支存在
+_, br = git("branch", "--list", "backup/pre-upstream-merge-20261008-202936")
+check("回退分支存在", "backup/pre-upstream-merge-20261008-202936" in br, True)
+
+print("=" * 100)
+fails = [l for l, ok in results if not ok]
+print("核验 %d 条，失败 %d 条" % (len(results), len(fails)))
+if fails:
+    print("失败项:")
+    for f in fails:
+        print("   -", f)
+sys.exit(1 if fails else 0)
