@@ -55,3 +55,6 @@ Thumbs.db
 # 运行时残留（上游误提交的空文件，2026-10-08 融合时出库）
 auth.lock
 
+# 服务运行日志（start-services-quiet.ps1 写到这里；含 services-status.json 里的 PID）
+.runtime-logs/
+
