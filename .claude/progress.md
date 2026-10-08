@@ -1251,3 +1251,42 @@ Browser → Express (:3002) → Python subprocess → Hermes AIAgent
 - **验收**：32 条事实主张复核 0 失败；端到端流水线 `4 冲突 → resolve → verify` 全绿；13 个归档脚本哈希一致
 - **遗留**：同上一节（3 项待拍板）；第 0 步现在会自动适配文件数变化，无需再手工核对清单
 - **提交**：本条记录（**仍无合并提交** —— 执行需用户在沙箱外授权运行 `run-merge.ps1`）
+
+---
+## 2026-10-08  ★ 导师上游融合【已执行完成】
+- **范围**：用户把会话切到完全权限后执行（此前 11 轮受沙箱禁写 `.git` 阻塞）
+- **执行方式**：`docs/merge_verify_tools/run-merge.ps1` 第 0~9 步
+- **提交序列**：
+  | 提交 | 内容 |
+  |------|------|
+  | `3d646c9` | 第 0 步：提交 5 个已修改文件（`.gitignore` 先还原成 HEAD 版） |
+  | `bf725e9` | **合并提交**（父1=`3d646c9` 我方，父2=`03d838d` 导师上游） |
+  | `547a0d0` | 停止跟踪构建产物 `tsconfig.tsbuildinfo` |
+  | `7e09c8e` | 停止跟踪运行时残留 `auth.lock` |
+  | `72cf997` | 忽略上游融合临时目录（第 8 步） |
+  | `bdafd81` | 融入方案 / 复核 / 校对报告 + 13 个验证脚本归档 |
+- **执行中的实况与偏差**：
+  1. **冲突 4 个文件、与预判逐项一致**：`model_configs.json`(1) / `base_service.py`(1) / `HermesChatPanel.tsx`(3) / `CLAUDE.md`(1) = 6 处
+  2. 合并改动面 `41 files changed, +12400 −357` —— 与 `MERGED_CONTENT_PREVIEW.md` 的预测**逐字吻合**
+  3. 我方 36 个提交全部保留（`f2d83b5..bf725e9` = 40 个提交，历史未被改写）
+  4. **执行中修掉 `run-merge.ps1` 的两个 bug**（当初演练覆盖不到的分支）：
+     - git 把 CRLF 警告写到 stderr，`$ErrorActionPreference='Stop'` 下被当成终止错误 → 脚本中途退出。
+       已在 `GitEx` 内局部设为 `Continue` 并按退出码判定；其它 6 处内联 `& git` 也统一走 `GitEx`
+     - `git fetch` 递归抓子模块失败（`vendor/` 三个是无 `.git` 的普通目录）→ 退出码 1 但**上游 ref 其实已取到**。
+       已改为 `--no-recurse-submodules`，并以 **ref 是否存在**判定成功，而非只看退出码
+- **验收（合并后真实仓库）**：`probe-verify` **12 PASS / 0 FAIL**（4 SKIP 需人起服务、3 WARN 为待决/误报）
+  - `#14 .gitignore 规则齐备` 由 FAIL → PASS；`#19 tsbuildinfo 出库` PASS
+  - `#4` 装饰器 AST 绑定正确（`DELETE → do_DELETE`）；`#2` 模型 10 条、首条 `deepseek-flash`
+  - `#18` 报的 8 处"旧引用"经核实是**误报**（全在 `CHANGES_VS_SOURCE.md` / `GIT_HISTORY.md` / `TODO_RUNTIME.md` 的历史日志里）
+- **3 项决策的处置**：
+  1. 技能目录 → **已建目录联接** `Agentic Workflow\qmclaw-server\data\skills` ⇄ `<repo>\skills`；
+     实测 `rglob('SKILL.md')` 扫到**全部 7 个技能**（此前该目录不存在 → `/api/hermes/skills` 必然为空）
+  2. `auth.lock` → 已出库 + 加 `.gitignore` 精确规则（`*.lock` 会误伤 `package-lock.json`，故不用通配）；
+     `memory/MEMORY.md` → **保留入库**（内容是与图表方案一致的 `/plots/` URL 规范）
+  3. `.env` 的 `HERMES_HOME` → **保持现状**（核实：`skills.py` 根本不读该变量，改它修不了技能列表）
+- **仍待人工（约定 3：服务启停由人控制）**：验证清单第 7 项（`npm install` + 前端构建）、
+  第 8/9/10 项（起服务跑接口与端到端 t1、肉眼比图）、第 11/23 项（`/api/hermes/skills` 非空）
+- **回退点**：`backup/pre-upstream-merge-20261008-202936`（合并前状态）
+  ```powershell
+  git reset --hard backup/pre-upstream-merge-20261008-202936
+  ```
