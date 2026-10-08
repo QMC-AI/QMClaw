@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""核验交付报告里的事实主张，对着 git 数据逐条检查。"""
+"""核验交付报告里的事实主张，对着 git 数据逐条检查。
+
+用法:
+    python verify-delivery-report.py [仓库路径]     # 默认当前目录
+"""
 import io
 import json
 import os
@@ -9,9 +13,12 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.getcwd()
+print("被核验仓库: %s" % ROOT)
+
 
 def git(*a):
-    p = subprocess.run(["git", "-C", r"D:\semester4\QMClaw"] + list(a), capture_output=True)
+    p = subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True)
     return p.returncode, p.stdout.decode("utf-8", "replace").strip()
 
 
@@ -72,7 +79,7 @@ _, n = git("rev-list", "--count", "bf725e9..HEAD")
 check("合并之后的提交数（不含合并本身）", n, "8")
 
 # 关键文件实测
-root = r"D:\semester4\QMClaw"
+root = ROOT
 
 # 模型配置
 d = json.loads(io.open(os.path.join(root, "Agentic Workflow/qmclaw-server/config/model_configs.json"),
