@@ -903,3 +903,44 @@ Browser → Express (:3002) → Python subprocess → Hermes AIAgent
   - image :3007 / qubitclient 等可选服务仍未启；OPENAI/ANTHROPIC/MINIMAX Key 未配
   - BACKLOG A 组（信号列/T1 拟合）仍待导师确认
 - **提交**：本条记录 + B 组代码
+
+---
+## 2026-10-08  导师上游融合方案（方案已就绪，**合并尚未执行**）
+- **范围**：docs（方案 + 复核 + 校对）；**未改动任何源码**
+- **改动**：
+  1. 定源：导师上游是 `Secsix/QMClaw`（main=`03d838d`）；`f2d83b5` 是**本仓库 PR #2 的合并提交**、不在上游历史里。fork 点靠**内容相同**确认（上游 `c3fd6e6` 的 tree 与 `f2d83b5` 的 tree 哈希相同）
+  2. 量化：我方 36 提交 / 62 文件；导师 2 提交 / 41 文件；**重叠 11 文件 = 7 自动合并 + 4 冲突（共 6 处）**
+  3. 冲突解法做成可运行脚本 `docs/merge_verify_tools/resolve-conflicts.py`（默认试算，`--write` 才写回），规则见方案第五节
+  4. 归档 12 个验证脚本 + `README.md`（含 8 个实测过的坑）+ `ARCHIVE_CHECK.md`（哈希校验）
+  5. BACKLOG 新增 **G 组 10 条**（记忆三处收敛 / skills 修法 / 依赖未声明 / 状态文件入库 / 前端 4 依赖 / offline_data_lab 回归 / qca 死代码 / tsbuildinfo / SSE）
+  6. `.gitignore` 加了 3 条临时目录规则（**未提交**；第 0 步会先还原成 HEAD 版再提交）
+- **验收**：
+  - 真实 `git merge` 重放：冲突 4 文件 / 6 块，与预判**逐项一致**
+  - 端到端流水线：`merge exit=1` → `resolve exit=0` → 后处理 3 提交 → **13 PASS / 0 FAIL**
+  - 方案 32 条事实主张机器复核：**0 失败**
+  - 独立对抗式复核 + 逐字校对共修复 **13 处必改 / 3 处建议改**（含 2 条"照抄会失败"的真问题）
+- **遗留（合并时办）**：
+  - 3 个待用户拍板：技能目录修法（建议 `mklink /J`）、`memory/MEMORY.md` 与 `auth.lock` 入库决定、`.env` 的 `HERMES_HOME` 语义
+  - 第 0 步必须**同时提交 3 个已修改文件**（漏 `docs/BACKLOG.md` 会被 0.1 的断言卡住）
+  - 第 9 步**保留 `.upstream-mirror/`**（12 个归档脚本里 5 个依赖它）
+- **提交**：本条记录（**尚无合并提交** —— 方案见 `docs/UPSTREAM_MERGE_PLAN.md`）
+
+---
+## 2026-10-08（续）  融合方案收尾：一键执行脚本 + 结果预览 + 第 0 步 bug 修复
+- **范围**：docs / `.claude` 仅文档；**未改动任何源码**
+- **改动**：
+  1. 新增 `docs/merge_verify_tools/run-merge.ps1`（纯 ASCII、15.4 KB）：把第六节第 0~9 步做成一条命令，含**人工闸门**；`-DryRun` 可在探针仓库上演练，`-Continue` 做快进合回
+  2. 新增 `MERGED_CONTENT_PREVIEW.md`：把 4 个冲突文件**会被解成什么样**从探针合并提交导出（模型 10 条 + 默认模型、装饰器 AST 绑定、并集结果、整体改动面）
+  3. `CLAUDE.md` 顶部加入口小节（指向方案 / 预览 / 一键脚本 / BACKLOG G 组 + 待确认 3 项）
+  4. 归档 README 的坑清单补到 **10 条**（新增 `.gitignore` 忽略规则、`cmd` 吃 `^`/`--` 两条实测教训）
+  5. 第 0 步改为**动态**：不再写死"已修改文件清单"，改为 `git status --short --untracked-files=no` + `git add -u`
+- **修掉的 bug（本轮实测发现）**：
+  - `run-merge.ps1` 第 0 步原用 `git add <路径>`，在"工作树脏"路径上会被拒绝：
+    `.gitignore` 含 `.claude/`，对**尚未入索引**的路径 `git add <path>` 会判 "ignored"。
+    真实仓库"恰好"能过只因 `progress.md` 本就已跟踪（`git check-ignore` 对它退出码 1）。
+  - 改为 `git add -u` 后实测：`.gitignore` 还原 603 字节 → `add -u`/`commit` exit=0 → 提交后脏文件 0 →
+    随后真实 merge `CONFLICT ×4`（与预期一致，未 Aborting）
+  - 之所以一直没发现：`-DryRun` 每次都从干净状态起步，**第 0 步的"脏"分支从未被走到**
+- **验收**：32 条事实主张复核 0 失败；端到端流水线 `4 冲突 → resolve → verify` 全绿；13 个归档脚本哈希一致
+- **遗留**：同上一节（3 项待拍板）；第 0 步现在会自动适配文件数变化，无需再手工核对清单
+- **提交**：本条记录（**仍无合并提交** —— 执行需用户在沙箱外授权运行 `run-merge.ps1`）

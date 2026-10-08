@@ -372,6 +372,115 @@ F5 在 F1 之后随手处理（尤其是 charts 要不要补存）
 
 ---
 
+## G. 融合导师上游之后的收尾（登记日期：2026-10-08）
+
+> 背景：把上游 `Secsix/QMClaw` 的 2 个提交（`ea773be` / `03d838d`，Hermes 扩展 + SSE 基础设施）合进 `feat/c-real-machine`。
+> 完整方案见 `docs/UPSTREAM_MERGE_PLAN.md`，独立复核见 `docs/UPSTREAM_MERGE_PLAN_REVIEW.md`。
+> **本组条目都不是合并的阻塞项**，是合并完成后要接着处理的。
+
+### G1 ⬜ 记忆存储收敛：现在是**三处**路径，不是两套
+
+融合后同时存在：
+
+| 位置 | 谁读写 |
+|---|---|
+| `<qmclaw-server>/config/memory/`（episodes / skills / index.json） | 你的 `common/memory_store.py` + `/api/agent/memory/*` |
+| `<qmclaw-server>/data/memories/{MEMORY,USER}.md` | 导师 python 侧 `hermes_service/memory.py` |
+| `<repo>/memory/MEMORY.md` | 导师**网关**侧（`src/index.ts` 的 `getHermesMemoryDir()`，4 个 handler 直接读写文件） |
+
+**注意导师自己两侧也不互通**（python 写 `data/memories`，UI 读 `<repo>/memory`），所以收敛比"统一两套"更麻烦。
+**收敛方向待定**：先决定"记忆的权威位置是哪个"，再谈迁移。
+**顺带**：`memory/MEMORY.md` 入库后会被网关运行时改写 → 每次同步上游必冲突，处置见 G5。
+
+### G2 ⬜ 融合后 `/api/hermes/skills` 会返回空 —— 修法与判据已实测
+
+**现象**：导师新增的 Hermes 技能管理界面看不到任何技能。
+
+**根因（已逐层查证）**：`services/hermes_service/skills.py:63` 的 `_get_data_dir()` 读 `<qmclaw-server>/data/skills`，然后 `skills.py:137` 用 `skills_dir.rglob("SKILL.md")` 收集 —— 而该目录**在当前仓库里不存在**，上游自己也没带技能文件。项目真正的技能在 `<repo>/skills/<name>/SKILL.md`（**7 个**）。
+
+> ⚠️ **`skills.py` 不读 `HERMES_HOME`**（全上游对它的引用只有 hermes_runner / server.py 的取值逻辑 + 一行日志；`server.py:186` 那行也说明它服务的是 Hermes agent 自己的 `get_skills_dir()`）。
+> 所以"把 `.env` 的 `HERMES_HOME` 改成项目根"**修不了技能列表** —— 这是最容易踩的误区。
+
+**修法（三选一，推荐 A）**：
+
+| | 做法 | 代价 |
+|---|---|---|
+| **A（推荐）** | `mklink /J "<qmclaw-server>\data\skills" "<repo>\skills"` | **已实测可行**：junction 建得成，Python `rglob('SKILL.md')` 能穿过它扫到文件。`data/` 已在 `.gitignore`，联接不会进版本库，**换机需重建** |
+| B | 改 `skills.py` 的 `_get_data_dir`：优先 `HERMES_HOME/skills`，否则回落 `<repo>/skills` | 改上游文件，下次同步必冲突；但语义最正确 |
+| C | 手工拷贝 `<repo>/skills/*` 到 `data/skills/` | 变成两份技能，改一份另一份不同步 —— 不推荐 |
+
+**验收判据**：起服务后 `GET /api/hermes/skills` **非空**且能看到 7 个技能名。
+
+**另**：你自己的 agent 侧技能功能**不受影响**（走 `config/skills.json` + `memory_store` 的 `/api/agent/memory/skills`），本项只影响导师新加的界面。
+`HERMES_HOME` 语义（本机 `.env` 指向 `data\hermes`，导师假设项目根）本身仍待你决策 —— 详见 `UPSTREAM_MERGE_PLAN.md` 第十·补.1。
+
+### G3 ⬜ `scripts/memory_store.py` 与 `services/common/memory_store.py` 双份
+
+后者是从前者移植的（磁盘格式不变），移植后脚本版仍在库里。当前无引用冲突，但改存储格式时容易只改一份 → 建议择机删一份。
+
+### G4 ⬜ 新模块的第三方依赖未声明（**上游原来的漏项**）
+
+导师新增模块用到 `apscheduler`（cron）、`tzlocal`（cron）、`portalocker`（memory 文件锁）、`websockets`（approval_ws），但：
+
+- `tzlocal` / `portalocker` / `websockets` 在**你与上游的 requirements 里都没有**；
+- `apscheduler` 只在 `lqcs_deploy/requirements.txt` 第 9 行有。
+
+而 `hermes_service/server.py` 是**顶层** import 这些模块 → 缺包会让**整个 hermes 服务起不来**。
+本机解释器 4 个包恰好都已装，所以现在不会炸；**换机 / 重建环境必炸**。
+→ 补进 `Agentic Workflow/qmclaw-server/python/requirements.txt`。
+
+### G5 ⬜ 决定两个运行时/无引用文件是否入库（证据已补齐）
+
+**`auth.lock` —— 建议不入库（运行时残留，证据齐全）**
+
+- 上游提交的内容 = **1 字节，一个空格**（`b' '`）；
+- 你本机 `qmclaw-server\data\hermes\auth.lock` = **同样 1 字节空格**；
+- **全上游零代码引用**（`git grep 'auth\.lock' main` 为空）。
+
+→ 基本可确定是导师从 hermes 运行目录误提交的。处置：`git rm --cached auth.lock` + 加 `.gitignore`。
+
+**`memory/MEMORY.md` —— 内容有用，但会被运行时改写**
+
+合并后它就是**网关读写的那个文件**（`src/index.ts` 的 `getHermesMemoryDir()` → `<repo>/memory`，4 个 handler 直接拼 `MEMORY.md`）→ 工作树被常驻改写，违反约定 11，且**下次同步上游必冲突**。
+
+内容本身与你的图表方案一致（4 行，要求图片用 `/plots/xxx.png` URL 格式、**不要 base64 内联或直接文件路径**），所以值得保留 → **二选一**：
+- 保留入库，接受"每次同步都冲突"；
+- 移出索引 + 加 `.gitignore`，改在部署时手工放置。
+
+**同族第三处（别漏）**：`%LOCALAPPDATA%\hermes`（存在则优先）或 `~/.hermes`，以及 `hermes_runner.py` 的 `~/.qmclaw_hermes` → **cron / config 状态落在仓库外**，备份与交付容易漏。
+
+### G6 ⬜ 前端新增 4 个依赖需要安装
+
+导师 `package.json` 新增 `highlight.js` / `react-markdown` / `rehype-highlight` / `remark-gfm`；本机 `require.resolve` **四个全部失败**。
+合并后跑前端前先 `npm install`。注意 `package-lock.json` 也被上游那版覆盖。
+
+### G7 ⬜ `offline_data_lab.py` 被上游整份重写，出图口径需回归
+
+`+359/−39`：`fitData()` 签名从 `(exp_num, collect, do_plot)` 变成
+`(datasets, fit_func, qname, update, collect, config_name, des, **kwargs)`，新增 `_fit_iqraw` / `_auto_detect_fit_func` / `_default_plot` / `_plot_fit_result` 整条流水线。
+
+**API 兼容已核实**（位置参数与 `do_plot` 仍生效，仓库里没有 `exp_num=` 关键字调用点），**但你的 Tier1/Tier2 出图走的就是这个类** → 出图口径/样式会变，而现有检查（`charts=1`、子串存在）**全都抓不到**。
+→ 需要与合并前的图**肉眼比对**做一次回归。
+另有【推断】风险：旧用法 `fitData(-1, collect=True, do_plot=False)[1][-2][0]`（`python/workflow/model.py:189`）依赖旧的返回结构，别把离线 updater 接到那条调用上。
+
+### G8 ⬜ `qca_service/core/` 与 `qca_service/scripts/` 是死代码（清理候选）
+
+`qca_service` 自带 `core/{discovery,models,runner,storage,__init__}.py`，与 vendor `core/` 同名；但 `server.py` 先把 vendor 插进 `sys.path` 再 import，同名模块解析到 vendor 那份。服务侧版本明显更旧（如 `runner.py` 4264 vs vendor 17796 字节），且 `server.py:86` import 了服务侧**不存在**的 `core.workflow_validation` → 反证运行时用的是 vendor 的 core。
+
+**删之前必须确认无其它调用方**（复核未启动服务验证实际导入结果）。详见 `.analysis/deploy-vendor-report.md` §3.2。
+
+### G9 ⬜ `tsconfig.tsbuildinfo` 不该进版本库
+
+`qmclaw-web/tsconfig.json` 开着 `incremental: true`，而这个**构建产物被跟踪**且被上游改过 → 合并后工作树里躺着的是**导师机器上的增量构建状态**，可能"跳检"或让工作树反复变脏（与约定 11 打架）。
+→ 跑前端构建前先删掉，再统一"移出索引 + 加 `.gitignore`"（独立提交，别混进合并提交）。
+
+### G10 ⬜ SSE 基础设施已经就位（原 README TODO 可推进）
+
+导师这两个提交把 `handle_streaming_request()`（`services/base/base_service.py`）+ `approval_ws.py` 带进来了，README 里那条「SSE 流式处理支持 —— 当前使用轮询模式」现在有基础设施了。
+**注意**：`base_service.py` 的这处合并在顺序上敏感 —— 导师的新方法必须插在 `@_timed_request("DELETE")` **之上**，否则装饰器会挂到 SSE 方法上（详见 `UPSTREAM_MERGE_PLAN.md` 5.2）。
+
+---
+
 ## 待确认问题（给实验室/导师）
 
 按优先级：

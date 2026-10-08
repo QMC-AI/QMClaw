@@ -1,5 +1,20 @@
 # CLAUDE.md — QmClaw 开发约定
 
+## 导师上游融合（进行中，**方案已就绪、尚未执行**）
+
+把导师上游 `Secsix/QMClaw`（main `03d838d`）合进 `feat/c-real-machine` 的方案已完成并实测验证。
+入口：
+
+| 文件 | 内容 |
+|------|------|
+| `docs/UPSTREAM_MERGE_PLAN.md` | 合并方案（14 节）：冲突预判、6 处冲突的解法、执行步骤、23 项验证清单、风险 |
+| `docs/merge_verify_tools/MERGED_CONTENT_PREVIEW.md` | **执行前先看**：4 个冲突文件会被解成什么样 |
+| `docs/merge_verify_tools/run-merge.ps1` | 一条命令执行第 0~9 步（**必须在沙箱外运行**；`-DryRun` 可先演练） |
+| `docs/BACKLOG.md` G 组 | 融合后 10 条收尾项（记忆三处收敛 / skills 修法 / 依赖未声明 …） |
+
+**执行前必须确认 3 项**：技能目录修法、`memory/MEMORY.md` 与 `auth.lock` 去留、`.env` 的 `HERMES_HOME` 语义。
+详见方案第十节与「十·补」。
+
 
 ## 配置文件
 

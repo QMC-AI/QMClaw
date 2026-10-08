@@ -1,11 +1,13 @@
 # 相对源代码的改动与已实现功能
 
 > **基线**：`f2d83b5`（Merge pull request #2 from Secsix/main）—— 本次工作开始前的仓库状态
-> **范围**：`f2d83b5..HEAD`，14 个提交，41 个文件，+4469 / −285
+> **范围**：`f2d83b5..HEAD`
 > **本文档回答两个问题**：改了源代码的什么、现在能实现什么
 >
+> **给导师的摘要版**（进度 + 待确认问题）见 `docs/导师对齐-进度与待确认.md`。
+>
 > **后续工作**：本文记录的改动全部围绕**离线模式**。
-> **所有尚未完成的待办（含数据正确性、服务稳定性、真机接通）统一登记在 `docs/BACKLOG.md`** —— 那是唯一入口。
+> **所有尚未完成的待办（含数据正确性、真机接通、新功能）统一登记在 `docs/BACKLOG.md`** —— 那是唯一入口。
 > 从离线切到**远程真机调控**的完整设计见 `docs/REAL_MACHINE_PLAN.md`；
 > 本文第五节 L4 局限会在接通在线后自然消解。真机接通（只读联调）见 `docs/REAL_MACHINE.md`。
 
@@ -307,43 +309,39 @@ Tier 2  q10lu12 : charts[0] 是 /plots/offline_sim_t1_*.png，HTTP 200 / 74261 b
 
 ---
 
-## 六、待办（本轮识别、未执行）
+## 六、服务稳定性改造（已于 2026-09-29 完成）
 
-### 服务卡死的根因未修
+> 此前列为「待办」的服务卡死 / 并发绘图 / 索引竞态问题，已随提交 `af90c1c` 落地。
 
-**现象**：agent 服务 `:3005` 出现"进程活着、端口 `LISTENING`、但连不上"，连接僵在 `CLOSE_WAIT`，后续请求全部进不来。已发生**两次**（另一次表现为 agent 对话 300s 超时），本轮只是重启止血。
+### 6.1 原问题（已完成）
 
-**根因**：`services/base/base_service.py:217`
+**现象**：agent 服务 `:3005` 出现"进程活着、端口 `LISTENING`、但连不上"，连接僵在 `CLOSE_WAIT`。已发生**两次**。
 
-```python
-self._server = HTTPServer((self.config.host, self.config.port), handler)
-```
+**根因**：`base_service.py` 使用单线程 `HTTPServer`，`while self._running: self._server.handle_request()` 一次只处理一个连接，任何卡住的请求都会堵死整个服务。`ServiceConfig` 的 `max_workers` / `request_timeout` 原先只有声明、无引用点。
 
-`HTTPServer` 就是 `socketserver.TCPServer` —— **单线程、不并发**。`run()` 里是：
+### 6.2 改动（提交 `af90c1c`，dsh 工单 T11 + MiMo 复核）
 
-```python
-while self._running:
-    self._server.handle_request()   # 一次只处理一个连接
-```
+1. **B2 绘图线程安全**：新增 `services/common/plotting.py`（`PLOT_LOCK` / `@serialized_plot` / `plot_lock()`）；analysis 6 个绘图入口 + quantum `_generate_simulation_plot` 全部串行化
+2. **B3 记忆索引原子化**：`memory_store` 增加 `_INDEX_LOCK` + `_update_index()`，`create_episode` / `archive_episode` / `create_skill` / `delete_skill` 四处写路径收敛进锁
+3. **B1 多线程服务**：`HTTPServer` → `ThreadingHTTPServer`；慢请求（默认 5s）打印 `SLOW <method> <path> <elapsed>s`；`request_count` 改为只计真实请求（原先把空闲超时也计成一次）
+4. **密钥加载修复**：`services/common/config.py` 启动时 `load_dotenv(qmclaw-server/.env)`，与 Express / hermes 对齐（原先 Python 侧只读 `os.environ`）
 
-因此**任何一个卡住的请求都会堵死整个服务**：唯一的处理线程陷在里面，后续连接只能在 accept 队列排队，队列满（`request_queue_size` 默认 5）之后内核直接拒绝。
+### 6.3 实测证据
 
-另外，`ServiceConfig` 里的 `max_workers = 4` 与 `request_timeout = 60` 全项目**只有声明、没有任何引用点**，即这两个字段从未生效。
+| 项 | 改前 | 改后 |
+|----|------|------|
+| 记忆索引并发（8 线程） | 丢 316 条索引 | 0 孤儿 |
+| 快请求被慢请求堵住 | 1.203s | 0.017s |
+| `check_services.py` | 10/10 | 10/10 |
+| LLM Key | `.env` 读不到 | DeepSeek 已识别 |
 
-**拟修方案**（改动小，但影响全部 10 个服务，需重启才生效）：
+**残留（已知、刻意不做）**：`analysis_service._handle_execute` 把 `plt` 注入用户 exec 上下文，未加 PLOT_LOCK——若加锁，卡死的 exec 会拖死所有绘图请求；建议后续单独处理。
 
-1. `HTTPServer` → `ThreadingHTTPServer`（import + 构造各一行）
-2. 加**慢请求日志**：记录每个请求的 path 与耗时，超阈值打印 —— 下次再堵能直接定位（按 CLAUDE.md 约定 6，同一问题出现两次以上应加 debug 信息而非直接重试）
-3. 把 `request_timeout` 真正接进 LLM 调用链
+### 6.4 仍未做的待办
 
-**注意 —— 直接换多线程会引入新问题，必须先处理线程安全**：
+统一登记在 **`docs/BACKLOG.md`**（唯一入口）：
 
-`matplotlib.pyplot` 使用**进程级全局状态**，不是线程安全的。而本仓库大量使用 `plt.close('all')`、`plt.get_fignums()`、`plt.figure(fig_nums[-1])` 这类全局操作：
-
-- `services/quantum_service/server.py`（`_generate_simulation_plot`）
-- `services/analysis_service/server.py`（`_handle_plot_offline`、`_handle_plot_offline_v2`、`_handle_plot_variant`、`_handle_plot`、`_handle_plot_historical`、`_handle_plot_experiments` 共 6 处）
-
-并发时会互相 `close('all')` 掉对方正在渲染的 figure，或取到对方的 figure 号 —— 会把"卡死"变成**静默的图表错乱**。因此需要：
-
-- 新增 `services/common/plotting.py` 提供进程内 `PLOT_LOCK` 与 `@serialized_plot` 装饰器，只串行化 pyplot 区段（**不必锁整个请求**，长耗时的 LLM / 实验请求仍可并发）
-- `memory_store` 的索引读-改-写加锁：`create_episode` / `create_skill` / `archive_episode` / `delete_skill` 目前是 `load → modify → save`，并发下会丢更新（丢的是索引条目，实体文件会变成新的孤儿）
+- **A 组（P0，数据正确性）**：信号列语义、T1 拟合、单位表、Ramsey 命名 —— **待导师确认**，见 `docs/导师对齐-进度与待确认.md`
+- **C 组**：真机接通收尾（C7–C9，待硬件/实验室）
+- **F 组**：从历史记录继续对话（可并行）
+- **D 组**：工程质量（TS 类型错误、measure_scripts 不完整）
