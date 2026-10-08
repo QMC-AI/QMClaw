@@ -4,9 +4,14 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .eggs/
-
+Agentic Workflow/images/train/bad/*.png
+*.pth
+Agentic Workflow/images/train/bad/*.png
+Agentic Workflow/images/train/good/*.png
+*.bat
 # Build output
 Agentic Workflow/qmclaw-web/.next/
+
 Agentic Workflow/qmclaw-server/dist/
 Agentic Workflow/qmclaw-server/data/
 Agentic Workflow/qmclaw-server/logs/

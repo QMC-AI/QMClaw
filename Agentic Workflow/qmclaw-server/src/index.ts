@@ -1428,6 +1428,58 @@ app.post("/api/run-node", async (req, res) => {
       return;
     }
 
+    // 微服务模式：包装为单节点工作流，走 workflow 服务（避免 subprocess 不可用）
+    if (USE_MICROSERVICES) {
+      try {
+        const nodeId = node.id;
+        const nodeType = node.type || node.data?.type;
+        const config = node.config || node.data?.config || {};
+        const ctx = context || {};
+        // 解析 {{变量}} 引用
+        const qubitVal = String(config.qubit || "");
+        if (qubitVal.startsWith("{{") && qubitVal.endsWith("}}") && qubitVal.length > 4) {
+          config.qubit = String(ctx[qubitVal.slice(2, -2).trim()] ?? "");
+        }
+        const wfBase = `http://localhost:${SERVICE_PORTS.workflow}`;
+        const post = async (path: string, body: unknown) => {
+          const r = await fetch(`${wfBase}${path}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          return r.json();
+        };
+        const created = await post("/workflows/create", {
+          name: `Run ${nodeId}`,
+          nodes: [{ id: nodeId, type: nodeType, depends: [], config }],
+        });
+        if (!created.workflow_id) {
+          res.json({ status: "failed", stdout: "", error: created.error || "Failed to create workflow" });
+          return;
+        }
+        await post("/workflows/run", { workflow_id: created.workflow_id, context: ctx });
+        let st: any;
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          st = await post("/workflows/status", { workflowId: created.workflow_id });
+          if (st && (st.status === "completed" || st.status === "failed" || st.status === "error")) break;
+        }
+        const n = (st?.nodes || [])[0] || {};
+        const rr = n.result || n;
+        res.json({
+          status: st?.status === "completed" && n.status !== "failed" ? "completed" : "failed",
+          stdout: rr.stdout || n.stdout || "",
+          metrics: rr.metrics || n.metrics,
+          error: n.error || rr.error || null,
+          plotPath: rr.plotPath || n.plotPath || null,
+        });
+        return;
+      } catch (err: any) {
+        res.status(500).json({ error: err.message });
+        return;
+      }
+    }
+
     await ensureSubprocess();
     if (!pyProc || !pyProc.stdin) {
       res.status(503).json({ error: "Worker not running" });

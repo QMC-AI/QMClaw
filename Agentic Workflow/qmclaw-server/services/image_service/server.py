@@ -135,17 +135,16 @@ class ImageService(BaseService):
 
         try:
             from PIL import Image
+            import numpy as np
             import torch
-            from torchvision import transforms
 
-            # 加载并预处理图像
-            img = Image.open(image_path).convert('RGB')
-            transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-            img_tensor = transform(img).unsqueeze(0)
+            # 加载并预处理图像（无 torchvision 依赖，手动归一化）
+            img = Image.open(image_path).convert('RGB').resize((224, 224))
+            arr = np.array(img, dtype=np.float32) / 255.0
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            arr = (arr - mean) / std
+            img_tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
 
             # 推理
             with torch.no_grad():
@@ -225,23 +224,38 @@ class ImageService(BaseService):
             try:
                 import torch
                 import torch.nn as nn
-                from torch.utils.data import DataLoader, ImageFolder
-                from torchvision import transforms
+                from torch.utils.data import Dataset, DataLoader
+                import numpy as np
+                from PIL import Image
 
                 _log(f"Starting training: epochs={epochs}, batch_size={batch_size}")
 
-                # 数据增强
-                transform = transforms.Compose([
-                    transforms.Resize((224, 224)),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.RandomRotation(10),
-                    transforms.ColorJitter(brightness=0.2, contrast=0.2),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ])
+                class ImageFolderManual(Dataset):
+                    """torchvision 不可用时的本地图像文件夹数据集（类别固定 good/bad 顺序）"""
+                    def __init__(self, root):
+                        self.samples = []
+                        dirs = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+                        # 固定 good, bad 顺序，与默认 self._class_names 保持一致
+                        self.classes = [c for c in ("good", "bad") if c in dirs] + [d for d in sorted(dirs) if d not in ("good", "bad")]
+                        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+                        for cls in self.classes:
+                            cls_dir = os.path.join(root, cls)
+                            for fname in sorted(os.listdir(cls_dir)):
+                                if fname.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
+                                    self.samples.append((os.path.join(cls_dir, fname), self.class_to_idx[cls]))
+                    def __len__(self):
+                        return len(self.samples)
+                    def __getitem__(self, idx):
+                        path, label = self.samples[idx]
+                        img = Image.open(path).convert('RGB').resize((224, 224))
+                        arr = np.array(img, dtype=np.float32) / 255.0
+                        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+                        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+                        arr = (arr - mean) / std
+                        return torch.from_numpy(arr).permute(2, 0, 1), label
 
                 # 加载数据
-                dataset = ImageFolder(str(train_dir), transform=transform)
+                dataset = ImageFolderManual(str(train_dir))
                 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
                 num_classes = len(dataset.classes)

@@ -136,14 +136,28 @@ export default function WorkflowCanvas({ onLog }: Props) {
         res.workflowId,
         (status) => {
           // Update each node's status and log progress
-          Object.entries(status.nodes || {}).forEach(([nodeId, nodeStatus]) => {
-            const typedStatus = nodeStatus as {
-              status: string;
-              type: string;
-              stdout?: string;
-              metrics?: Record<string, number>;
-              error?: string;
-              plotPath?: string;
+          // 兼容后端两种返回结构：对象 {nodeId: node} 或 数组 [{nodeId, nodeType, status, output}]
+          const rawNodes: any = status.nodes || {};
+          const nodeMap: Record<string, any> = Array.isArray(rawNodes)
+            ? rawNodes.reduce((acc: Record<string, any>, n: any) => {
+                const key = n.nodeId || n.id || `node_${Object.keys(acc).length}`;
+                acc[key] = n;
+                return acc;
+              }, {})
+            : rawNodes;
+          Object.entries(nodeMap).forEach(([nodeId, nodeStatus]) => {
+            const raw = nodeStatus as any;
+            const nested = raw.output && typeof raw.output === 'object' && !Array.isArray(raw.output)
+              ? raw.output
+              : (raw.result && typeof raw.result === 'object' && !Array.isArray(raw.result) ? raw.result : null);
+            const output = nested || raw;
+            const typedStatus = {
+              status: raw.status,
+              type: raw.type || raw.nodeType || '',
+              stdout: output.stdout ?? raw.stdout ?? '',
+              metrics: output.metrics ?? raw.metrics,
+              error: output.error ?? raw.error,
+              plotPath: output.plotPath ?? raw.plotPath,
             };
             if (typedStatus.status) {
               setNodeResult(nodeId, {
@@ -260,12 +274,12 @@ export default function WorkflowCanvas({ onLog }: Props) {
         conversation: result.conversation,
       });
 
-      if (result.status === 'completed') {
+      if (result.status === 'completed' || result.status === 'passed') {
+        setExecutionComplete('completed');
         onLog("✅ Node " + nodeId + " completed");
       } else if (result.status === 'failed') {
+        setExecutionComplete('failed');
         onLog("❌ Node " + nodeId + " failed: " + (result.error || 'unknown'), true);
-      } else if (result.status === 'passed') {
-        onLog("✅ Node " + nodeId + " passed");
       }
     } catch (e: any) {
       setNodeResult(nodeId, {
@@ -273,9 +287,10 @@ export default function WorkflowCanvas({ onLog }: Props) {
         stdout: '',
         error: e.message,
       });
+      setExecutionComplete('failed');
       onLog("❌ Error: " + e.message, true);
     }
-  }, [nodes, setExecuting, setNodeResult, onLog, getContextFromNodes]);
+  }, [nodes, setExecuting, setNodeResult, setExecutionComplete, onLog, getContextFromNodes]);
 
   // ── Stop execution ──────────────────────────────────────────────────────────
 

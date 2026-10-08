@@ -1185,9 +1185,9 @@ export default function Dashboard() {
                 {/* Run Command */}
                 <CollapsibleCommand
                   type="command"
-                  command={currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)"}
+                  command={(currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)").replaceAll("{qubit}", selectedQubit)}
                   onCommandChange={setCurrentRunCommand}
-                  onRun={() => runCustom(currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)")}
+                  onRun={() => runCustom((currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)").replaceAll("{qubit}", selectedQubit))}
                   onSave={() => handleSaveRunCommand(selectedExp, currentRunCommand)}
                   disabled={running}
                   isRunning={isRunningCommand}

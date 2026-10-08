@@ -4,7 +4,7 @@
     "fallback_data_path": "data/fallback/quantum",
     "offline_mode": {
       "enabled": true,
-      "data_path": "data/offline_data",
+      "data_path": "D:/bishe/deploy/offline_data",
       "auto_switch_on_disconnect": true,
       "default_mode": "offline"
     },
@@ -19,7 +19,7 @@
     "fallback_data_path": "data/fallback/analysis",
     "offline_mode": {
       "enabled": true,
-      "data_path": "data/offline_data",
+      "data_path": "D:/bishe/deploy/offline_data",
       "auto_switch_on_disconnect": true,
       "default_mode": "offline"
     },

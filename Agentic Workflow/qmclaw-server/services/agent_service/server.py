@@ -13,6 +13,7 @@ import time
 import threading
 import sys
 import traceback
+import re
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
@@ -169,6 +170,17 @@ class AgentService(BaseService):
 - get_qubits: 获取可用量子比特列表
 - list_experiments: 列出可用的量子实验
 
+【必须遵守的工具调用格式】
+当你需要调用工具时，必须单独输出一行严格格式：
+Action: 工具名 {"参数名": 值}    # 参数必须用 JSON 对象格式
+例如：
+Action: get_qubits()
+Action: list_experiments()
+Action: run_experiment {"code": "sq.s21(qubit='q10lu1')"}
+
+调用工具后，系统会执行工具并返回 Observation 结果给你。
+当你不需要再调用工具、可以直接回答用户时，直接输出最终的自然语言回复（回复中不要再出现 Action: 这行）。
+
 执行实验时，你需要:
 1. 理解用户的实验需求
 2. 确定要使用的量子比特
@@ -196,7 +208,7 @@ class AgentService(BaseService):
         self._tools[tool.name] = tool
         _log(f"Registered tool: {tool.name}")
 
-    def _call_llm(self, messages: List[Dict], model: str = "minimax", temperature: float = 0.7) -> Dict[str, Any]:
+    def _call_llm(self, messages: List[Dict], model: str = "deepseek-chat", temperature: float = 0.7) -> Dict[str, Any]:
         """调用 LLM 服务"""
         import urllib.request
         import urllib.error
@@ -270,31 +282,38 @@ class AgentService(BaseService):
 
             # 解析工具和参数
             try:
-                # 简单解析: tool_name(arg1=value1, arg2=value2)
-                if "(" in action_text:
+                args = {}
+                tool_name = ""
+                # 优先 JSON 格式: Action: tool_name {"key": "value"}
+                m = re.match(r"^(\w+)\s*(\{.*\})\s*$", action_text, re.DOTALL)
+                if m:
+                    tool_name = m.group(1).strip()
+                    try:
+                        args = json.loads(m.group(2))
+                    except Exception:
+                        args = {}
+                elif "(" in action_text:
                     tool_name = action_text.split("(")[0].strip()
                     args_str = action_text.split("(")[1].rstrip(")").strip()
-                    args = {}
-
-                    # 解析参数
                     if args_str:
                         for arg in args_str.split(","):
                             if "=" in arg:
                                 key, value = arg.split("=", 1)
-                                args[key.strip()] = eval(value.strip())
-
-                    # 执行工具
-                    if tool_name in self._tools:
-                        tool_result = self._tools[tool_name].execute(**args)
-                    else:
-                        tool_result = {"error": f"Unknown tool: {tool_name}"}
-
+                                try:
+                                    args[key.strip()] = eval(value.strip())
+                                except Exception:
+                                    args[key.strip()] = value.strip()
                 else:
                     tool_name = action_text.strip()
-                    if tool_name in self._tools:
-                        tool_result = self._tools[tool_name].execute()
-                    else:
-                        tool_result = {"error": f"Unknown tool: {tool_name}"}
+
+                if not tool_name:
+                    continue
+
+                try:
+                    tr = self._adapter.execute_tool(tool_name, args)
+                    tool_result = tr.to_dict() if hasattr(tr, "to_dict") else tr
+                except Exception as e:
+                    tool_result = {"error": f"Tool execution error: {e}"}
 
             except Exception as e:
                 tool_result = {"error": f"Tool execution error: {e}"}

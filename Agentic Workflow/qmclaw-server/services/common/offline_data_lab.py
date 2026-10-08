@@ -278,14 +278,10 @@ class OfflineQubitUpdater:
 
     def fitData(self, exp_num: int = None, collect: bool = False, do_plot: bool = True):
         """
-        拟合数据（模拟 qter.fitData）
-
-        Args:
-            exp_num: 实验编号
-            collect: 是否收集结果
-            do_plot: 是否绘图
+        拟合数据：对 t1 做 A*exp(-t/T1)+c 最小二乘统计拟合
         """
         import matplotlib.pyplot as plt
+        from scipy.optimize import curve_fit
 
         if exp_num is not None:
             self._data.loadDataset(exp_num)
@@ -293,30 +289,63 @@ class OfflineQubitUpdater:
         data = self._data.data
         if data is None:
             print("Warning: No data loaded")
-            return
+            return {"success": False, "error": "No data loaded"}
 
-        # 根据数据形状和实验类型决定绘图方式
         info = self._data.get_current_info()
         exp_type = info.get("experiment_type", "")
 
+        if data.ndim == 2 and data.shape[1] >= 2:
+            x = data[:, 0]
+            y = data[:, 1]
+        else:
+            x = np.arange(len(data.flatten()))
+            y = data.flatten()
+
+        # ---- 统计拟合：t1 指数衰减 A*exp(-t/T1)+c ----
+        fit_metrics = {}
+        fit_params = None
+        if exp_type == "t1" and len(x) > 3:
+            try:
+                def _exp_decay(t, A, tau, c):
+                    return A * np.exp(-t / tau) + c
+                A0 = float(np.max(y) - np.min(y))
+                c0 = float(np.min(y))
+                tau0 = float((np.max(x) - np.min(x)) / 3.0)
+                popt, _ = curve_fit(_exp_decay, x, y, p0=[A0, tau0, c0], maxfev=20000)
+                A_fit, tau_fit, c_fit = [float(v) for v in popt]
+                if tau_fit > 0:
+                    fit_params = (A_fit, tau_fit, c_fit)
+                    if tau_fit > 1000:
+                        fit_metrics["T1_ns"] = tau_fit
+                        fit_metrics["T1_us"] = tau_fit / 1000.0
+                    elif tau_fit > 1:
+                        fit_metrics["T1_us"] = tau_fit
+                    else:
+                        fit_metrics["T1_s"] = tau_fit
+                    y_pred = _exp_decay(x, *popt)
+                    ss_res = float(np.sum((y - y_pred) ** 2))
+                    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+                    if ss_tot > 0:
+                        fit_metrics["R_squared"] = 1.0 - ss_res / ss_tot
+            except Exception as e:
+                print(f"[fitData] exponential fit failed: {e}")
+
         if do_plot:
             fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+            ax.plot(x, y, 'b.-', markersize=3, label='Data')
+            if fit_params is not None:
+                A_fit, tau_fit, c_fit = fit_params
+                x_fit = np.linspace(float(np.min(x)), float(np.max(x)), 300)
+                y_fit = A_fit * np.exp(-x_fit / tau_fit) + c_fit
+                t1_us = fit_metrics.get("T1_us", tau_fit)
+                ax.plot(x_fit, y_fit, 'r--', linewidth=2, label=f'Fit: T1 = {t1_us:.2f} us')
+                ax.legend(fontsize=10)
 
-            if data.ndim == 2 and data.shape[1] >= 2:
-                x = data[:, 0]
-                y = data[:, 1]
-            else:
-                x = np.arange(len(data.flatten()))
-                y = data.flatten()
-
-            ax.plot(x, y, 'b.-', markersize=3)
-
-            # 根据实验类型设置标签
             if exp_type in ["s21", "spectroscopy", "s21_dis"]:
                 ax.set_xlabel('Frequency (Hz)')
                 ax.set_ylabel('S21 (dB)')
             elif exp_type in ["t1"]:
-                ax.set_xlabel('Delay (s)')
+                ax.set_xlabel('Delay (ns)')
                 ax.set_ylabel('Amplitude')
             elif exp_type in ["ramsey", "piamp"]:
                 ax.set_xlabel('Time (s)')
@@ -329,7 +358,10 @@ class OfflineQubitUpdater:
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
 
-        return {"success": True, "data_shape": data.shape}
+        result = {"success": True, "data_shape": data.shape}
+        if fit_metrics:
+            result["metrics"] = fit_metrics
+        return result
 
     def get_metrics(self) -> Dict[str, float]:
         """

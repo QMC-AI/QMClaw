@@ -189,7 +189,7 @@ const NodeConfigPanel = memo(({ nodeId, onClose, onRunNode }: Props) => {
             nodeId={nodeId}
             nodeType={node?.data.type}
             lastResult={lastResult}
-            nodeStatus={node?.data.status}
+            nodeStatus={(node?.data.status === 'idle' && nodeResult?.status) ? nodeResult.status : node?.data.status}
             nodeMetrics={node?.data.metrics}
             nodeError={node?.data.error}
             conversation={conversation}
@@ -1863,6 +1863,7 @@ const ConfigForm = memo(({ nodeType, config, allNodes, onChange, availableVariab
         <>
           {renderField('qubit', config.qubit || '', 'Qubit ID (e.g. q10lu1)')}
           {renderField('experimentType', config.experimentType || 'spectroscopy', 'Experiment Type')}
+          {renderField('imagePath', String(config.imagePath || ''), 'Image Path (optional; empty = use upstream experiment plot)')}
           <div style={{ marginBottom: '12px' }}>
             <label style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '4px', display: 'block' }}>Backend</label>
             <select
@@ -2571,6 +2572,42 @@ const ResultView = memo(({ nodeId, nodeType, lastResult, nodeStatus, nodeMetrics
             </ResultSection>
 
             <ResultSection title="Output" icon="📤" accentColor="#22c55e">
+              {/* Stdout */}
+              {nodeResult?.stdout && (
+                <div style={{ marginBottom: '12px' }}>
+                  <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '4px' }}>Stdout:</div>
+                  <div style={{
+                    padding: '8px',
+                    background: '#0f172a',
+                    borderRadius: '4px',
+                    fontSize: '10px',
+                    fontFamily: 'monospace',
+                    color: '#e2e8f0',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-all',
+                    maxHeight: '160px',
+                    overflowY: 'auto',
+                  }}>
+                    {nodeResult.stdout}
+                  </div>
+                </div>
+              )}
+
+              {/* Plot preview */}
+              {nodeResult?.plotPath && (
+                <div style={{ marginBottom: '12px' }}>
+                  <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '4px' }}>Plot:</div>
+                  <img
+                    src={`http://localhost:3002${String(nodeResult.plotPath)}`}
+                    alt="Experiment plot"
+                    style={{ width: '100%', borderRadius: '6px', border: '1px solid #334155' }}
+                  />
+                  <div style={{ fontSize: '9px', color: '#64748b', marginTop: '4px', wordBreak: 'break-all' }}>
+                    {String(nodeResult.plotPath)}
+                  </div>
+                </div>
+              )}
+
               {/* Metrics */}
               {nodeMetrics && Object.keys(nodeMetrics).length > 0 && (
                 <div style={{ marginBottom: '12px' }}>
@@ -2745,18 +2782,27 @@ const ResultView = memo(({ nodeId, nodeType, lastResult, nodeStatus, nodeMetrics
       }
 
       case 'image_analysis': {
-        // Image Analysis: input = imagePath/prompt, output = analysis result
-        const analysis = conversation?.analysis;
+        // Image Analysis (VLM): 显示 T1 弛豫时间、衰减可见性、分析描述
+        const iaMetrics = nodeResult?.metrics as { t1_us?: number; decay_visible?: boolean; plot_type?: string } | undefined;
+        const t1us = (nodeResult?.t1_us ?? iaMetrics?.t1_us) as number | undefined;
+        const decayVisible = (nodeResult?.decay_visible ?? iaMetrics?.decay_visible) as boolean | undefined;
+        let analysisText = nodeResult?.description as string | undefined;
+        if (!analysisText && nodeResult?.stdout) {
+          const m = String(nodeResult.stdout).match(/Description:\s*([\s\S]*)$/);
+          if (m) analysisText = m[1].trim();
+        }
 
         return (
           <>
             <ResultSection title="Input" icon="📥" accentColor="#64748b">
-              {conversation?.prompt && <KeyValueRow label="Prompt" value={conversation.prompt} valueColor="#a78bfa" />}
-              {conversation?.model && <KeyValueRow label="Model" value={conversation.model} />}
+              <KeyValueRow label="Experiment" value={String(nodeConfig?.experimentFamily || 't1')} valueColor="#a78bfa" />
             </ResultSection>
 
             <ResultSection title="Output" icon="📤" accentColor="#22c55e">
-              {analysis && typeof analysis === 'object' && (analysis as ExperimentAnalysisResult).result ? (
+              {t1us != null && <KeyValueRow label="T1 (us)" value={String(t1us)} valueColor="#22c55e" />}
+              {decayVisible != null && <KeyValueRow label="Decay visible" value={String(decayVisible)} />}
+              {iaMetrics?.plot_type && <KeyValueRow label="Plot type" value={String(iaMetrics.plot_type)} />}
+              {analysisText ? (
                 <div style={{
                   padding: '10px',
                   background: '#1a1a2e',
@@ -2765,11 +2811,11 @@ const ResultView = memo(({ nodeId, nodeType, lastResult, nodeStatus, nodeMetrics
                   color: '#e2e8f0',
                   lineHeight: '1.5',
                 }}>
-                  {(analysis as ExperimentAnalysisResult).result}
+                  {String(analysisText)}
                 </div>
               ) : (
                 <div style={{ fontSize: '10px', color: '#475569', fontStyle: 'italic' }}>
-                  Run the node to see analysis
+                  Run the workflow to see analysis
                 </div>
               )}
             </ResultSection>
@@ -2829,9 +2875,9 @@ const ResultView = memo(({ nodeId, nodeType, lastResult, nodeStatus, nodeMetrics
 
       case 'image_classification': {
         // Image Classification: input = qubit/experiment_type, output = label/confidence/margin
-        const config = (lastResult?.config || {}) as Record<string, unknown>;
-        const metrics = lastResult?.metrics as { label?: string; confidence?: number; margin?: number; needReview?: boolean } | undefined;
-        const imagePath = lastResult?.imagePath as string | undefined;
+        const config = (nodeConfig || {}) as Record<string, unknown>;
+        const metrics = nodeResult?.metrics as { label?: string; confidence?: number; margin?: number; needReview?: boolean } | undefined;
+        const imagePath = nodeResult?.imagePath as string | undefined;
         return (
           <>
             <ResultSection title="Input" icon="📥" accentColor="#64748b">
@@ -2954,20 +3000,39 @@ const ResultView = memo(({ nodeId, nodeType, lastResult, nodeStatus, nodeMetrics
       }
 
       case 'analyze': {
-        // Analyze node: input = reference experiment, output = analysis
-        const analyzeRef = lastResult?.ref as string | undefined;
+        // Analyze node: qter.fitData 统计拟合，显示拟合图 + T1 参数
+        const analyzeImage = (nodeResult?.plotPath || nodeResult?.image) as string | undefined;
+        const qubit = nodeResult?.qubit as string | undefined;
+        const expType = nodeResult?.experiment_type as string | undefined;
+        const datasetName = nodeResult?.dataset_name as string | undefined;
+        const stdout = nodeResult?.stdout as string | undefined;
+        const t1Us = (nodeResult?.metrics as any)?.T1_us;
+        const r2 = (nodeResult?.metrics as any)?.R_squared;
         return (
           <>
             <ResultSection title="Input" icon="📥" accentColor="#64748b">
-              {analyzeRef && <KeyValueRow label="Reference" value={String(analyzeRef)} />}
+              {qubit && <KeyValueRow label="Qubit" value={String(qubit)} />}
+              {expType && <KeyValueRow label="Experiment" value={String(expType)} />}
             </ResultSection>
 
             <ResultSection title="Output" icon="📤" accentColor="#22c55e">
-              {nodeMetrics && Object.keys(nodeMetrics).length > 0 ? (
-                formatMetrics(nodeMetrics)
+              {analyzeImage ? (
+                <img src={analyzeImage} alt="qter.fitData" style={{ width: '100%', borderRadius: 4, marginTop: 6, border: '1px solid #334155' }} />
               ) : (
                 <div style={{ fontSize: '10px', color: '#475569', fontStyle: 'italic' }}>
-                  Run the node to see output
+                  Run the workflow to see fit result
+                </div>
+              )}
+              {typeof t1Us === 'number' && (
+                <div style={{ marginTop: 8, padding: '8px 10px', background: '#1e293b', borderRadius: 6, borderLeft: '3px solid #ef4444' }}>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: '#f87171' }}>T1 = {t1Us.toFixed(2)} μs</div>
+                  {typeof r2 === 'number' && <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>R² = {r2.toFixed(4)}</div>}
+                </div>
+              )}
+              {datasetName && <KeyValueRow label="Dataset" value={String(datasetName)} />}
+              {stdout && (
+                <div style={{ padding: '8px', background: '#0f172a', borderRadius: 4, fontSize: 10, fontFamily: 'monospace', color: '#22c55e', whiteSpace: 'pre-wrap', marginTop: 6 }}>
+                  {String(stdout)}
                 </div>
               )}
             </ResultSection>
