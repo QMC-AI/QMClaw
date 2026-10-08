@@ -94,3 +94,17 @@ quantum_service 和 analysis_service 支持离线模式，可在 LabRAD 不可�
       `git grep --cached -E "sk-[a-zA-Z0-9]{20,}" | Select-String -NotMatch "sk-x{20,}"`
       一旦误提交并已推送，改历史无用，必须去平台吊销并轮换密钥
     - 只提交本次改动涉及的文件，不要 `git add -A` 把无关的构建产物（如 `tsconfig.tsbuildinfo`）一起带上
+
+# Compaction 压缩规则（自动压缩时生效）
+## 摘要必须保留内容
+1. 项目架构：QMC Pro / QMC Claw微服务分层定义、各个微服务调用关系（Agent、Workflow、Quantum、Analysis、Image、QubitClient）
+2. 关键技术决策：自动驾驶类比的规则引擎+大模型混合方案
+3. 未完成任务清单、当前开发阶段
+4. 核心代码接口定义、重要实验测控逻辑
+
+
+## 需要简化/丢弃
+1. 反复调试的中间失败日志、重复报错
+2. 临时探索性的非核心讨论
+3. 无关闲聊内容
+4. 确认已修复的bug

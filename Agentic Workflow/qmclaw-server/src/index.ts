@@ -52,6 +52,8 @@ console.log("[Debug] __dirname:", __dirname);
 
 import express from "express";
 import { createServer } from "http";
+import { Server as SocketIOServer } from "socket.io";
+import { WebSocketServer, WebSocket } from "ws";
 import cors from "cors";
 import { generateJobId } from "./queue/job-types";
 import { loadExperimentConfigs, saveExperimentConfigs, getExperimentConfig, updateExperimentConfig, ExperimentConfig } from "./services/experimentConfigService";
@@ -2635,6 +2637,566 @@ app.get("/api/hermes/models", (_req, res) => {
   }
 });
 
+/** GET /api/hermes/sessions — List all sessions */
+app.get("/api/hermes/sessions", async (_req, res) => {
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', '/sessions', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Sessions not available in legacy mode" });
+  }
+});
+
+/** GET /api/hermes/sessions/:id — Get session details */
+app.get("/api/hermes/sessions/:id", async (req, res) => {
+  const { id } = req.params;
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', `/sessions/${encodeURIComponent(id)}`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Sessions not available in legacy mode" });
+  }
+});
+
+/** GET /api/hermes/sessions/:id/messages — Get session messages */
+app.get("/api/hermes/sessions/:id/messages", async (req, res) => {
+  const { id } = req.params;
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', `/sessions/${encodeURIComponent(id)}/messages`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Sessions not available in legacy mode" });
+  }
+});
+
+/** DELETE /api/hermes/sessions/:id — Delete a session */
+app.delete("/api/hermes/sessions/:id", async (req, res) => {
+  const { id } = req.params;
+  if (USE_MICROSERVICES) {
+    const result = await proxyToService('hermes', `/sessions/${encodeURIComponent(id)}`, 'DELETE');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  } else {
+    res.status(501).json({ error: "Sessions not available in legacy mode" });
+  }
+});
+
+// ── Hermes Memory ─────────────────────────────────────────────────────────────────
+
+/** GET /api/hermes/memory — Get memory entries */
+app.get("/api/hermes/memory", async (_req, res) => {
+  try {
+    const memoryDir = getHermesMemoryDir();
+    const memoryFile = path.join(memoryDir, 'MEMORY.md');
+
+    if (!fs.existsSync(memoryFile)) {
+      res.json({ entries: [], total: 0 });
+      return;
+    }
+
+    const content = fs.readFileSync(memoryFile, 'utf-8');
+    const entries = content.split('\n§\n').filter(e => e.trim()).map((entry, index) => {
+      const lines = entry.trim().split('\n');
+      const firstLine = lines[0] || '';
+      let title = firstLine.replace(/^##?\s*/, '').replace(/\s*\[.*?\]\(.*?\)\s*/g, '').trim();
+      const body = lines.slice(1).join('\n').trim();
+      return {
+        id: `mem_${index + 1}`,
+        title: title || `记忆 ${index + 1}`,
+        content: entry.trim(),
+        body: body.slice(0, 200) + (body.length > 200 ? '...' : ''),
+        created: null,
+        updated: null,
+      };
+    });
+
+    res.json({ entries, total: entries.length });
+  } catch (err: any) {
+    console.error('Error getting memory:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** POST /api/hermes/memory/add — Add memory entry */
+app.post("/api/hermes/memory/add", async (req, res) => {
+  try {
+    const { title, content } = req.body as { title?: string; content?: string };
+    const addContent = content || title;
+    if (!addContent) {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+
+    const memoryDir = getHermesMemoryDir();
+    if (!fs.existsSync(memoryDir)) {
+      fs.mkdirSync(memoryDir, { recursive: true });
+    }
+
+    const memoryFile = path.join(memoryDir, 'MEMORY.md');
+    let existing = '';
+    if (fs.existsSync(memoryFile)) {
+      existing = fs.readFileSync(memoryFile, 'utf-8');
+      if (!existing.endsWith('\n')) existing += '\n';
+      existing += '\n§\n';
+    }
+
+    const entry = `## ${title || '新记忆'}\n\n${addContent}`;
+    fs.writeFileSync(memoryFile, existing + entry, 'utf-8');
+    res.json({ status: 'ok' });
+  } catch (err: any) {
+    console.error('Error adding memory:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** POST /api/hermes/memory/edit — Edit memory entry */
+app.post("/api/hermes/memory/edit", async (req, res) => {
+  try {
+    // Support both formats: { id, content } or { target, old_text, content }
+    const { id, content, old_text } = req.body as { id?: string; content?: string; old_text?: string; target?: string };
+
+    const memoryDir = getHermesMemoryDir();
+    const memoryFile = path.join(memoryDir, 'MEMORY.md');
+
+    if (!fs.existsSync(memoryFile)) {
+      res.status(404).json({ error: 'MEMORY.md not found' });
+      return;
+    }
+
+    let existing = fs.readFileSync(memoryFile, 'utf-8');
+    const entries = existing.split('\n§\n');
+
+    let idx: number;
+    if (id) {
+      idx = parseInt(id.replace('mem_', '')) - 1;
+    } else if (old_text) {
+      idx = entries.findIndex(e => e.includes(old_text));
+    } else {
+      res.status(400).json({ error: 'id or old_text is required' });
+      return;
+    }
+
+    if (idx < 0 || idx >= entries.length) {
+      res.status(404).json({ error: 'Memory entry not found' });
+      return;
+    }
+
+    const entryLines = entries[idx].split('\n');
+    if (content) {
+      entries[idx] = `${entryLines[0]}\n\n${content}`;
+    }
+
+    fs.writeFileSync(memoryFile, entries.join('\n§\n'), 'utf-8');
+    res.json({ status: 'ok' });
+  } catch (err: any) {
+    console.error('Error editing memory:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** POST /api/hermes/memory/delete — Delete memory entry */
+app.post("/api/hermes/memory/delete", async (req, res) => {
+  try {
+    const { id, old_text } = req.body as { id?: string; old_text?: string; target?: string };
+
+    const memoryDir = getHermesMemoryDir();
+    const memoryFile = path.join(memoryDir, 'MEMORY.md');
+
+    if (!fs.existsSync(memoryFile)) {
+      res.status(404).json({ error: 'MEMORY.md not found' });
+      return;
+    }
+
+    let existing = fs.readFileSync(memoryFile, 'utf-8');
+    const entries = existing.split('\n§\n');
+
+    let idx: number;
+    if (id) {
+      idx = parseInt(id.replace('mem_', '')) - 1;
+    } else if (old_text) {
+      idx = entries.findIndex(e => e.includes(old_text));
+    } else {
+      res.status(400).json({ error: 'id or old_text is required' });
+      return;
+    }
+
+    if (idx < 0 || idx >= entries.length) {
+      res.status(404).json({ error: 'Memory entry not found' });
+      return;
+    }
+
+    entries.splice(idx, 1);
+    fs.writeFileSync(memoryFile, entries.join('\n§\n'), 'utf-8');
+    res.json({ status: 'ok' });
+  } catch (err: any) {
+    console.error('Error deleting memory:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Helper to get Hermes skills directory
+// Helper to get Hermes skills directory
+function getHermesSkillsDir(): string {
+  return path.resolve(__dirname, '..', '..', '..', 'skills');
+}
+
+// Helper to get Hermes memory directory
+function getHermesMemoryDir(): string {
+  return path.resolve(__dirname, '..', '..', '..', 'memory');
+}
+
+// Helper to get Hermes data directory (cron, config, etc.)
+function getHermesDir(): string {
+  const localAppData = process.env.LOCALAPPDATA || '';
+  const localHermes = path.join(localAppData, 'hermes');
+  if (fs.existsSync(localHermes)) {
+    return localHermes;
+  }
+  const home = process.env.HOME || process.env.USERPROFILE || process.env.HOMEPATH || '';
+  return path.join(home, '.hermes');
+}
+
+// ── Hermes Skills ─────────────────────────────────────────────────────────────────
+
+/** DEBUG: Get skills directory info */
+app.get("/api/hermes/skills/debug", async (_req, res) => {
+  const skillsDir = getHermesSkillsDir();
+  const exists = fs.existsSync(skillsDir);
+  let entries: string[] = [];
+  if (exists) {
+    entries = fs.readdirSync(skillsDir);
+  }
+  res.json({ skillsDir, exists, entries });
+});
+
+/** GET /api/hermes/skills — Get skills list */
+app.get("/api/hermes/skills", async (_req, res) => {
+  const skillsDir = getHermesSkillsDir();
+  if (!fs.existsSync(skillsDir)) {
+    res.json({ skills: [], total: 0, enabled_count: 0, custom_count: 0, by_category: {}, category_counts: {} });
+    return;
+  }
+
+  const hermesDir = getHermesDir();
+  const configFile = path.join(hermesDir, 'config.json');
+  let enabledSkills: string[] = [];
+  try {
+    if (fs.existsSync(configFile)) {
+      const config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+      enabledSkills = config.enabled_skills || [];
+    }
+  } catch (e) { /* ignore */ }
+
+  const skills: any[] = [];
+  const byCategory: Record<string, any[]> = {};
+
+  const entries = fs.readdirSync(skillsDir);
+  for (const entry of entries) {
+    if (entry === '_shared') continue;
+    const entryPath = path.join(skillsDir, entry);
+    if (!fs.statSync(entryPath).isDirectory()) continue;
+    const skillFile = path.join(entryPath, 'SKILL.md');
+    if (!fs.existsSync(skillFile)) continue;
+
+    const stat = fs.statSync(skillFile);
+    const content = fs.readFileSync(skillFile, 'utf-8');
+
+    let description = '';
+    const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
+    if (fmMatch) {
+      const fmContent = fmMatch[1];
+      // Handle multi-line YAML description (>, >-, |, |-)
+      const descMatch = fmContent.match(/description:\s*[\|>][\-\s]*([^\n]+(?:\n(?!\s)[^\n]+)*)/);
+      if (descMatch) {
+        description = descMatch[1].replace(/\n\s+/g, ' ').trim().slice(0, 200);
+      }
+    }
+    // Fallback: get first non-empty line that's not a heading
+    if (!description) {
+      const lines = content.split('\n');
+      for (const line of lines) {
+        const stripped = line.trim();
+        if (stripped && !stripped.startsWith('#') && !stripped.startsWith('---')) {
+          description = stripped.slice(0, 120);
+          break;
+        }
+      }
+    }
+
+    const skill = {
+      name: entry,
+      category: 'custom',
+      description: description,
+      enabled: enabledSkills.includes(entry) || enabledSkills.length === 0,
+      is_custom: true,
+      modified_at: stat.mtime.toISOString(),
+      path: skillFile,
+      file_size: stat.size,
+    };
+    skills.push(skill);
+    if (!byCategory['custom']) byCategory['custom'] = [];
+    byCategory['custom'].push(skill);
+  }
+
+  res.json({
+    skills,
+    total: skills.length,
+    enabled_count: skills.filter(s => s.enabled).length,
+    custom_count: skills.length,
+    by_category: byCategory,
+    category_counts: Object.fromEntries(Object.entries(byCategory).map(([k, v]) => [k, v.length])),
+  });
+});
+
+/** GET /api/hermes/skills/:name — Get skill content */
+app.get("/api/hermes/skills/:name+", async (req, res) => {
+  try {
+    const skillsDir = getHermesSkillsDir();
+    const rawName = String((req.params as any)['Name+'] || (req.params as any).name || '');
+    const skillName = decodeURIComponent(rawName);
+
+    // Direct lookup: skills/<name>/SKILL.md
+    const skillFile = path.join(skillsDir, skillName, 'SKILL.md');
+
+    if (!fs.existsSync(skillFile)) {
+      res.status(404).json({ error: `Skill '${skillName}' not found` });
+      return;
+    }
+
+    const content = fs.readFileSync(skillFile, 'utf-8');
+    res.json({
+      name: skillName,
+      path: skillFile,
+      content: content,
+    });
+  } catch (err: any) {
+    console.error('Error getting skill:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** PUT /api/hermes/skills/:name — Update skill */
+app.put("/api/hermes/skills/:name+", async (req, res) => {
+  try {
+    const { description } = req.body as { description?: string };
+    if (!description) {
+      res.status(400).json({ error: 'description is required' });
+      return;
+    }
+
+    const skillsDir = getHermesSkillsDir();
+    const rawName = String((req.params as any)['Name+'] || (req.params as any).name || '');
+    const skillName = decodeURIComponent(rawName);
+
+    // Direct lookup: skills/<name>/SKILL.md
+    const skillFile = path.join(skillsDir, skillName, 'SKILL.md');
+
+    if (!fs.existsSync(skillFile)) {
+      res.status(404).json({ error: `Skill '${skillName}' not found` });
+      return;
+    }
+
+    let content = fs.readFileSync(skillFile, 'utf-8');
+
+    // Update description in frontmatter
+    const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
+    if (fmMatch) {
+      const fm = fmMatch[1];
+      const lines = fm.split('\n');
+      const newLines: string[] = [];
+      let descUpdated = false;
+
+      for (const line of lines) {
+        if (line.trim().startsWith('description:')) {
+          newLines.push(`description: ${description}`);
+          descUpdated = true;
+        } else {
+          newLines.push(line);
+        }
+      }
+
+      if (!descUpdated) {
+        newLines.push(`description: ${description}`);
+      }
+
+      const newFm = newLines.join('\n');
+      content = content.replace(/^---\s*\n[\s\S]*?\n---/, `---\n${newFm}\n---`);
+    } else {
+      // No frontmatter, add one
+      content = `---\ndescription: ${description}\n---\n\n${content}`;
+    }
+
+    fs.writeFileSync(skillFile, content, 'utf-8');
+    res.json({ status: 'ok', name: skillName });
+  } catch (err: any) {
+    console.error('Error updating skill:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** DELETE /api/hermes/skills/:name — Delete skill */
+app.delete("/api/hermes/skills/:name+", async (req, res) => {
+  try {
+    const skillsDir = getHermesSkillsDir();
+    const rawName = String((req.params as any)['Name+'] || (req.params as any).name || '');
+    const skillName = decodeURIComponent(rawName);
+
+    // Direct lookup: skills/<name>
+    const skillPath = path.join(skillsDir, skillName);
+
+    if (!fs.existsSync(skillPath)) {
+      res.status(404).json({ error: `Skill '${skillName}' not found` });
+      return;
+    }
+
+    fs.rmSync(skillPath, { recursive: true });
+    res.json({ status: 'ok', name: skillName });
+
+    res.json({ status: 'ok', name: skillName });
+  } catch (err: any) {
+    console.error('Error deleting skill:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ── Hermes Cron (proxy to hermes_service) ──────────────────────────────────────
+
+/** GET /api/hermes/cron — Get cron jobs */
+app.get("/api/hermes/cron", async (_req, res) => {
+  try {
+    const result = await proxyToService('hermes', '/cron', 'GET');
+    if (result.ok) {
+      res.json(result.data);
+    } else {
+      res.status(result.status || 500).json({ error: result.error || 'Failed to get cron jobs' });
+    }
+  } catch (err: any) {
+    console.error('Error getting cron jobs:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** POST /api/hermes/cron — Create cron job */
+app.post("/api/hermes/cron", async (req, res) => {
+  try {
+    const { name, schedule, prompt, model, skills, qubit } = req.body as any;
+
+    if (!schedule) {
+      res.status(400).json({ error: 'schedule is required' });
+      return;
+    }
+
+    // Map to hermes_service format
+    const taskType = req.body.task_type || 'hermes';
+    const result = await proxyToService('hermes', '/cron', 'POST', {
+      name: name || 'Unnamed Job',
+      schedule,
+      prompt: prompt || '',
+      task_type: taskType,
+      model,
+      skills: skills || [],
+      qubit,
+    });
+
+    if (result.ok) {
+      res.json(result.data);
+    } else {
+      res.status(result.status || 500).json({ error: result.error || 'Failed to create cron job' });
+    }
+  } catch (err: any) {
+    console.error('Error creating cron job:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** PUT /api/hermes/cron/:id — Update cron job */
+app.put("/api/hermes/cron/:id", async (req, res) => {
+  try {
+    const jobId = req.params.id;
+    const updates = req.body as any;
+
+    const result = await proxyToService('hermes', `/cron/${encodeURIComponent(jobId)}`, 'PUT', updates);
+
+    if (result.ok) {
+      res.json(result.data);
+    } else {
+      res.status(result.status || 500).json({ error: result.error || 'Failed to update cron job' });
+    }
+  } catch (err: any) {
+    console.error('Error updating cron job:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** POST /api/hermes/cron/:id/pause — Pause cron job */
+app.post("/api/hermes/cron/:id/pause", async (req, res) => {
+  try {
+    const jobId = req.params.id;
+    const result = await proxyToService('hermes', `/cron/${encodeURIComponent(jobId)}/pause`, 'POST');
+
+    if (result.ok) {
+      res.json(result.data);
+    } else {
+      res.status(result.status || 500).json({ error: result.error || 'Failed to pause cron job' });
+    }
+  } catch (err: any) {
+    console.error('Error pausing cron job:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** POST /api/hermes/cron/:id/resume — Resume cron job */
+app.post("/api/hermes/cron/:id/resume", async (req, res) => {
+  try {
+    const jobId = req.params.id;
+    const result = await proxyToService('hermes', `/cron/${encodeURIComponent(jobId)}/resume`, 'POST');
+
+    if (result.ok) {
+      res.json(result.data);
+    } else {
+      res.status(result.status || 500).json({ error: result.error || 'Failed to resume cron job' });
+    }
+  } catch (err: any) {
+    console.error('Error resuming cron job:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** POST /api/hermes/cron/:id/run — Run cron job immediately */
+app.post("/api/hermes/cron/:id/run", async (req, res) => {
+  try {
+    const jobId = req.params.id;
+    const result = await proxyToService('hermes', `/cron/${encodeURIComponent(jobId)}/run`, 'POST');
+
+    if (result.ok) {
+      res.json(result.data);
+    } else {
+      res.status(result.status || 500).json({ error: result.error || 'Failed to run cron job' });
+    }
+  } catch (err: any) {
+    console.error('Error running cron job:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** DELETE /api/hermes/cron/:id — Delete cron job */
+app.delete("/api/hermes/cron/:id", async (req, res) => {
+  try {
+    const jobId = req.params.id;
+    const result = await proxyToService('hermes', `/cron/${encodeURIComponent(jobId)}`, 'DELETE');
+
+    if (result.ok) {
+      res.json(result.data);
+    } else {
+      res.status(result.status || 500).json({ error: result.error || 'Failed to delete cron job' });
+    }
+  } catch (err: any) {
+    console.error('Error deleting cron job:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // ── MCP Tools CRUD ─────────────────────────────────────────────────────────────
 
 const MCP_TOOLS_FILE = path.join(__dirname, "..", "config", "mcp_tools.json");
@@ -3376,10 +3938,75 @@ app.get("/plot/:jobId", (req, res) => {
   res.sendFile(publicPath);
 });
 
+// ── WebSocket Server for Hermes Approval ───────────────────────────────────────
+
+// Track WebSocket connections for Hermes approval
+const hermesWsConnections = new Map<string, WebSocket>();
+
+// Create WebSocket server
+const wss = new WebSocketServer({ noServer: true });
+
+wss.on('connection', (ws: WebSocket, request: any) => {
+  const url = new URL(request.url, `http://localhost:${PORT}`);
+  const sessionId = url.searchParams.get('session_id');
+
+  if (!sessionId) {
+    console.log('[Hermes WS] Connection rejected: no session_id');
+    ws.close(4000, 'session_id required');
+    return;
+  }
+
+  console.log(`[Hermes WS] Client connected: session=${sessionId}`);
+  hermesWsConnections.set(sessionId, ws);
+
+  ws.on('message', (data: Buffer) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      console.log(`[Hermes WS] Message from ${sessionId}:`, msg.type);
+
+      if (msg.type === 'approval_response') {
+        // Forward approval response to hermes_service via HTTP
+        // The hermes_service will handle the response via its own WebSocket manager
+        // For now, we just log it
+        console.log(`[Hermes WS] Approval response: ${msg.response}`);
+      }
+    } catch (e) {
+      console.error('[Hermes WS] Failed to parse message:', e);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log(`[Hermes WS] Client disconnected: session=${sessionId}`);
+    hermesWsConnections.delete(sessionId);
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[Hermes WS] Error for ${sessionId}:`, err.message);
+    hermesWsConnections.delete(sessionId);
+  });
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────
 
-createServer(app).listen(PORT, () => {
+const server = createServer(app);
+
+// Handle WebSocket upgrade requests
+server.on('upgrade', (request, socket, head) => {
+  const url = new URL(request.url, `http://localhost:${PORT}`);
+
+  // Only handle /api/hermes/ws upgrades
+  if (url.pathname === '/api/hermes/ws' || url.pathname === '/hermes/ws') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+server.listen(PORT, () => {
   console.log(`[Server] Listening on http://localhost:${PORT}`);
+  console.log(`[Server] WebSocket available at ws://localhost:${PORT}/api/hermes/ws`);
   console.log(`[Server] Integrated: experiments, sessions, datasets, plots (no backend needed)`);
 
   // Debug: list all registered routes

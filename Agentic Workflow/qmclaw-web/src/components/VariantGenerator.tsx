@@ -289,7 +289,7 @@ export default function VariantGenerator({ sourceDataset, onClose, onPlotVariant
                       min={param.min ?? 0}
                       max={param.max ?? 100}
                       step={param.type === "float" ? 0.01 : 1}
-                      value={Number(params[param.name] || param.min ?? 0)}
+                      value={Number(params[param.name] || (param.min ?? 0))}
                       onChange={(e) => handleParamChange(param.name, param.type === "int" ? parseInt(e.target.value) : parseFloat(e.target.value))}
                       style={{ width: "100%", accentColor: "#38bdf8" }}
                     />
