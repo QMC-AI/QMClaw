@@ -48,8 +48,8 @@
         "maxTokens": 500
       },
       "id": "model_default_001",
-      "createdAt": "2026-09-23T06:58:42.273Z",
-      "updatedAt": "2026-09-23T06:58:42.273Z"
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z"
     },
     {
       "name": "GPT-4o Mini",
@@ -65,8 +65,8 @@
         "maxTokens": 500
       },
       "id": "model_default_002",
-      "createdAt": "2026-09-23T06:58:42.274Z",
-      "updatedAt": "2026-09-23T06:58:42.274Z"
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z"
     },
     {
       "name": "GPT-4 Turbo",
@@ -82,8 +82,8 @@
         "maxTokens": 500
       },
       "id": "model_default_003",
-      "createdAt": "2026-09-23T06:58:42.274Z",
-      "updatedAt": "2026-09-23T06:58:42.274Z"
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z"
     },
     {
       "name": "Claude 3.5 Sonnet",
@@ -99,8 +99,8 @@
         "maxTokens": 500
       },
       "id": "model_default_004",
-      "createdAt": "2026-09-23T06:58:42.274Z",
-      "updatedAt": "2026-09-23T06:58:42.274Z"
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z"
     },
     {
       "name": "DeepSeek Chat",
@@ -115,8 +115,8 @@
         "maxTokens": 500
       },
       "id": "model_default_005",
-      "createdAt": "2026-09-23T06:58:42.274Z",
-      "updatedAt": "2026-09-23T06:58:42.274Z"
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z"
     },
     {
       "name": "MiniMax Text-01",
@@ -131,8 +131,8 @@
         "maxTokens": 500
       },
       "id": "model_1787551340750_0",
-      "createdAt": "2026-09-23T06:58:42.274Z",
-      "updatedAt": "2026-09-23T06:58:42.274Z"
+      "createdAt": "2026-08-24T06:02:20.750Z",
+      "updatedAt": "2026-08-24T06:02:20.750Z"
     },
     {
       "name": "MiniMax ABAB6.5S",
@@ -147,8 +147,8 @@
         "maxTokens": 500
       },
       "id": "model_1787551340750_1",
-      "createdAt": "2026-09-23T06:58:42.274Z",
-      "updatedAt": "2026-09-23T06:58:42.274Z"
+      "createdAt": "2026-08-24T06:02:20.750Z",
+      "updatedAt": "2026-08-24T06:02:20.750Z"
     },
     {
       "name": "MiniMax ABAB6",
@@ -163,8 +163,8 @@
         "maxTokens": 500
       },
       "id": "model_1787551340750_2",
-      "createdAt": "2026-09-23T06:58:42.274Z",
-      "updatedAt": "2026-09-23T06:58:42.274Z"
+      "createdAt": "2026-08-24T06:02:20.750Z",
+      "updatedAt": "2026-08-24T06:02:20.750Z"
     }
   ]
 }
