@@ -63,12 +63,18 @@ try:
     dup = sorted({k for k in keys if keys.count(k) > 1})
     ids = [m["id"] for m in ms]
     idd = sorted({i for i in ids if ids.count(i) > 1})
-    enabled_text = [m for m in ms if m.get("enabled") and "text" in (m.get("capabilities") or [])]
+    # 关键：handler 的默认模型取的是【按 updatedAt 倒序】后的第一条 enabled+text，
+    # 不是文件里的第一条（src/services/modelService.ts 的 listModels() 就这么排）。
+    # 2026-10-08 的回归正栽在这里：合并采纳了导师的 updatedAt(2026-09-23)，
+    # 把 deepseek-flash(2026-09-21) 从首位挤到第 9 位 → 默认模型变成 GPT-4o Mini。
+    ordered = sorted(ms, key=lambda m: m.get("updatedAt", ""), reverse=True)
+    enabled_text = [m for m in ordered if m.get("enabled") and "text" in (m.get("capabilities") or [])]
     first = enabled_text[0]["id"] if enabled_text else None
+    first_in_file = next((m["id"] for m in ms if m.get("enabled") and "text" in (m.get("capabilities") or [])), None)
     ok = (len(ms) == 10) and not dup and not idd and first == "deepseek-flash"
     rec(2, "模型配置语义", "PASS" if ok else "FAIL",
-        "条数=%d(期望10) (provider,modelId)重复=%d id重复=%d 首条enabled+text=%s" %
-        (len(ms), len(dup), len(idd), first))
+        "条数=%d(期望10) (provider,modelId)重复=%d id重复=%d | 文件首条=%s | 按updatedAt倒序首条=%s（这才是面板默认）" %
+        (len(ms), len(dup), len(idd), first_in_file, first))
 except Exception as e:
     rec(2, "模型配置语义", "FAIL", "JSON 解析失败: %s" % e)
 
