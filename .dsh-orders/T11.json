@@ -1,0 +1,99 @@
+{
+  "$schema": "dsh-work-order/1",
+  "id": "T11",
+  "title": "B组线程安全：B2 绘图锁 + B3 索引锁 + B1 ThreadingHTTPServer",
+  "workspace": "D:/semester4/QMClaw",
+  "goal": "改完后：1) 所有 matplotlib pyplot 全局操作在进程内串行，不再可能互相 close 掉对方 figure；2) memory_store 的 index.json 读-改-写在进程内原子，不再丢条目；3) 10 个微服务共享的 HTTPServer 换成 ThreadingHTTPServer，单个慢请求不再堵死整个服务，且超过阈值的请求会打慢日志。不改变任何对外 API 形状。",
+  "background": "仓库 D:\\semester4\\QMClaw。Agentic Workflow/qmclaw-server 是微服务根目录，10 个 Python 服务共享 services/base/base_service.py。已发生两次「进程活着、端口 LISTENING、但连不上/CLOSE_WAIT」卡死，根因是 base_service 用单线程 HTTPServer.handle_request() 一次只处理一个连接。直接换多线程会引入新问题：matplotlib pyplot 是进程级全局（plt.close('all') / get_fignums()），memory_store 的 index.json 是 load→modify→save 无锁。故必须先做 B2、B3，再做 B1。本工单按 BACKLOG docs/BACKLOG.md 的 B2→B3→B1 顺序一次做完。Python 解释器唯一可用：D:\\semester4\\deploy\\qmclaw\\qmclaw\\python.exe（禁止用裸 python）。项目约定：不 commit/push、不启停服务、不动写闸门、不改 D:\\semester4\\deploy。",
+  "scouted": [
+    {
+      "file": "D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/base/base_service.py",
+      "loc": "run() 约 207-239 行；import 行 18",
+      "current": "from http.server import HTTPServer；handler 用 lambda 包 BaseHTTPRequestHandler(*args, service=self)；self._server = HTTPServer((host, port), handler)；while self._running: self._server.handle_request()。ServiceConfig.request_timeout=60 与 max_workers=4 全项目只有声明无引用。log_message 只打印路径不计时。"
+    },
+    {
+      "file": "D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/common/memory_store.py",
+      "loc": "_load_index:41 / _save_index:56 / create_episode:75 / archive_episode:181 / create_skill:227 / delete_skill:345",
+      "current": "index 读改写全部无锁：create_episode 与 create_skill 各自 _load_index→insert→_save_index；archive_episode 与 delete_skill 各自 load→filter→save。并发会丢更新，产生「有实体文件无索引」孤儿。get_memory_stats:363 起也读 index。scripts/memory_store.py 是 monolithic 遗留副本，本工单不要求改，但不要改坏。"
+    },
+    {
+      "file": "D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/analysis_service/server.py",
+      "loc": "_handle_plot:1243 / _handle_plot_historical:1302 / _handle_plot_experiments:1415 / _handle_plot_offline:584 / _handle_plot_offline_v2:664 / _handle_plot_variant:904",
+      "current": "六个绘图入口内大量 plt.close('all')、plt.get_fignums()、plt.figure(fig_nums[-1])、fig.savefig、plt.close(fig)。典型危险序列见 722-763：close('all') → exec 绘图命令 → get_fignums() → figure(last) → savefig → close(fig)。"
+    },
+    {
+      "file": "D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/quantum_service/server.py",
+      "loc": "_generate_simulation_plot:385 起",
+      "current": "plt.close('all') 后 fig,ax=plt.subplots(...)，savefig 后 plt.close(fig)。与 analysis 一样依赖进程级 pyplot 状态。"
+    },
+    {
+      "file": "D:/semester4/QMClaw/docs/BACKLOG.md",
+      "loc": "B1/B2/B3 条目",
+      "current": "建议改法：新增 services/common/plotting.py 提供 PLOT_LOCK 与 @serialized_plot，只串行化 pyplot 区段；memory_store 加模块级 RLock + _update_index(mutator) 收敛 4 处调用点；HTTPServer→ThreadingHTTPServer 加慢请求日志。"
+    }
+  ],
+  "constraints": {
+    "allow": [
+      "D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/common/plotting.py",
+      "D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/common/memory_store.py",
+      "D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/base/base_service.py",
+      "D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/analysis_service/server.py",
+      "D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/quantum_service/server.py"
+    ],
+    "deny": [
+      "git commit",
+      "git push",
+      "git add / 任何 git 写操作",
+      "启动或杀死任何服务（npm run dev / python -m services.* / LabRAD）",
+      "监听或占用 3002-3012、7682、8081 端口",
+      "修改 D:/semester4/deploy/**",
+      "pip install / uninstall / 升降级任何包",
+      "修改 config/*.json 写闸门（fallback_config.json 的 actuation）",
+      "修改 .env 或任何密钥文件",
+      "改动 scripts/memory_store.py（遗留副本，本单不碰）",
+      "改动 services/agent_service/** 等未列入 allow 的文件",
+      "重构与本组无关的业务逻辑"
+    ]
+  },
+  "acceptance": [
+    {
+      "check": "test -f 'D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/common/plotting.py' 且其中定义了模块级锁（名称含 PLOT 或 LOCK）与可复用的串行化入口（装饰器或 contextmanager）",
+      "expect": "文件存在；锁与串行化入口可被 import"
+    },
+    {
+      "check": "用 D:/semester4/deploy/qmclaw/qmclaw/python.exe -c 导入 services.common.plotting 并确认锁对象存在（例如 print(plotting.PLOT_LOCK)）",
+      "expect": "导入成功，打印出锁对象，无异常"
+    },
+    {
+      "check": "grep -n \"plt.close('all')\\|plt.get_fignums()\" 'D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/analysis_service/server.py' 'D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/quantum_service/server.py' — 这些调用必须处于串行化保护之下（函数级 @serialized_plot 或显式 with PLOT_LOCK：）",
+      "expect": "所有 pyplot 全局操作所在函数/区段均被锁包住；报告中列出每个入口的保护方式"
+    },
+    {
+      "check": "用 python -c 检查 memory_store.py 源码含 threading.RLock（或 Lock）且存在 _update_index 或等价原子更新辅助函数；create_episode/archive_episode/create_skill/delete_skill 四处均通过该辅助或显式加锁",
+      "expect": "源码级确认 4 处索引写路径全部在锁内；无裸的 _load_index()+_save_index() 序列"
+    },
+    {
+      "check": "grep -n ThreadingHTTPServer 'D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/base/base_service.py'",
+      "expect": "构造服务器处使用 ThreadingHTTPServer（来自 http.server 或 socketserver），不再使用单线程 HTTPServer"
+    },
+    {
+      "check": "grep -n -i 'slow\\|elapsed\\|duration' 'D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/base/base_service.py'",
+      "expect": "存在慢请求计时日志：请求处理耗时超过阈值（建议复用 config.request_timeout 或 5s 常量）时打印 path 与耗时"
+    },
+    {
+      "check": "cd 'D:/semester4/QMClaw/Agentic Workflow/qmclaw-server' && D:/semester4/deploy/qmclaw/qmclaw/python.exe -B 'D:/semester4/QMClaw/docs/deploy_diff_tools/check_services.py'",
+      "expect": "输出「可导入 10 / 10，失败 0」；exit code 0（stderr 允许有 hermes 诊断日志）"
+    },
+    {
+      "check": "D:/semester4/deploy/qmclaw/qmclaw/python.exe -B -c \"import ast,sys; paths=[r'D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/common/plotting.py', r'D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/common/memory_store.py', r'D:/semester4/QMClaw/Agentic Workflow/qmclaw-server/services/base/base_service.py']; [ast.parse(open(p,encoding='utf-8').read()) for p in paths]; print('syntax ok')\"",
+      "expect": "输出 syntax ok"
+    },
+    {
+      "check": "git -C 'D:/semester4/QMClaw' status --porcelain 与 git diff --stat",
+      "expect": "改动仅落在 constraints.allow 列出的 5 个文件内；无越界文件"
+    }
+  ],
+  "report_format": "json",
+  "brief_text": "===== B 组详细清单（按顺序做完，回报用 Report Schema JSON） =====\n\n【B2】matplotlib pyplot 串行化（必须先做）\n1. 新建 services/common/plotting.py：\n   - 模块级 PLOT_LOCK = threading.RLock()\n   - 提供 @serialized_plot 装饰器（包住整个函数）或 plot_lock() contextmanager\n   - 注释一句话说明：pyplot 是进程级全局，close('all')/get_fignums() 并发会互踩\n2. analysis_service/server.py 六个绘图入口全部套上串行化：\n   _handle_plot / _handle_plot_historical / _handle_plot_experiments / _handle_plot_offline / _handle_plot_offline_v2 / _handle_plot_variant\n   （只锁绘图区段即可；若函数内含耗时 IO，可用 with 块只包 pyplot 段）\n3. quantum_service/server.py 的 _generate_simulation_plot 同样套上。\n4. 禁止改绘图本身的业务语义（数据、标签、保存路径、base64 流程都不要动）。\n\n【B3】memory_store 索引原子更新（B1 前置）\n5. services/common/memory_store.py 增加模块级 _INDEX_LOCK = threading.RLock()\n6. 增加 _update_index(mutator) 辅助：with lock: idx=_load_index(); mutator(idx); _save_index(idx)\n7. 把 4 处索引写路径收敛进去：\n   - create_episode（insert episodes）\n   - archive_episode（filter episodes）\n   - create_skill（insert skills）\n   - delete_skill（filter skills）\n8. 读路径（list_episodes/get_memory_stats 等）至少保证读到的 index 是完整 JSON；不必过度加锁。\n9. 实体文件（episodes/*.json, skills/*.json）的写入也建议在同一锁内，避免文件-索引不一致。\n10. 不要改磁盘 JSON schema，保持与 scripts/memory_store.py 格式兼容。\n\n【B1】ThreadingHTTPServer + 慢请求日志\n11. base_service.py：from http.server import ThreadingHTTPServer（或 socketserver.ThreadingHTTPServer）\n12. run() 里构造 self._server = ThreadingHTTPServer((host, port), handler)\n13. 慢请求日志：在 do_GET/do_POST 或 handle_request 外包一层计时，耗时 > 阈值（建议 5.0 秒或 config.request_timeout）打印 [service] SLOW <method> <path> <elapsed>s\n14. 保留原有 timeout=1 优雅关闭逻辑与 _cleanup()，不要删生命周期钩子。\n15. 顺手把 request_timeout 或 SLOW_REQUEST_SECONDS 做成可读常量；不强制接进 LLM 调用链（那是后续项）。\n\n【禁止】commit/push、启停服务、占端口、改 deploy、动依赖版本、改写闸门、改 scripts/memory_store.py。\n\n【验证】见 acceptance；每条都要真的跑命令并在 verification[] 里给出 output_tail。\n\n【回报】严格按 dsh-report/1 JSON（id=T11）。status=done 时 verification 必须覆盖全部 acceptance。changed_files 只能是 allow 内 5 个文件。\n",
+  "session_id": null
+}

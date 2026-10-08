@@ -1321,3 +1321,11 @@ Browser → Express (:3002) → Python subprocess → Hermes AIAgent
 - **交付物**：`docs/UPSTREAM_MERGE_DELIVERY.md`（对比改动前的详细交付报告）
 - **仍待人工**：浏览器验前端页面、第 9 项端到端 t1 + **肉眼比图**（`offline_data_lab.py` 被上游整份重写）、第 11/23 项页面看技能列表
 - **提交**：`eb65542`（修复回归）→ `68340d3`（升级校验）→ `c1bfd44`（交付报告）
+
+---
+## 2026-10-08  归档 dsh 工单 T11（分级记忆开工前的干净基线）
+- **范围**：chore（约定 11：动存储格式前先提交回退点）
+- **改动**：`.dsh-orders/T11.json` 入库归档（B 组线程安全改造工单，含 scouted/constraints/acceptance，无密钥）
+- **背景**：分级记忆管理方案与详细 todolist 已产出并与本文件做了差异比对（复用 Hermes 会话 UI/cron、补 `_annotate_episode` 锁外旁路、G3 schema 分叉等修订点），即将按 Phase 0 开工
+- **验证**：`git diff --cached` 仅含 T11.json；密钥扫描无命中
+- **提交**：本条记录 + T11 工单
