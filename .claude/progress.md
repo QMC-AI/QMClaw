@@ -1290,3 +1290,34 @@ Browser → Express (:3002) → Python subprocess → Hermes AIAgent
   ```powershell
   git reset --hard backup/pre-upstream-merge-20261008-202936
   ```
+
+---
+## 2026-10-08  融合后服务启动验收 + **修掉我引入的默认模型回归**
+- **范围**：chore（用户明确授权代启服务，同 2026-09-24 的例外）/ fix / docs
+- **服务启动（11 个，全部 UP）**：
+  - 10 个 Python 微服务 3003–3012（`scripts/start_all_services.py --all`，后台作业）
+  - Express 网关 :3002（`npm run dev`）→ `{"express":"ok","mode":"microservices"}`
+  - Next.js 前端 :8081 → HTTP 200（标题 `qmclaw - Quantum Measurement & Calibration Workflow`）
+  - **前置**：先 `npm install` 装了合并带来的 4 个前端依赖（`highlight.js`/`react-markdown`/`rehype-highlight`/`remark-gfm`，
+    装前 `require.resolve` 全部 MISSING，装后全部 OK；`package-lock.json` 未被改动，added 105 packages）
+- **★ 发现并修复一处我引入的回归（`eb65542`）**：
+  - **现象**：`/api/models` 首条不是 `deepseek-flash`，而是 `model_default_002`（GPT-4o Mini）→ 推翻 H3 验收
+  - **根因两层**：① `src/services/modelService.ts:204` 的 `listModels()` **按 `updatedAt` 倒序排序**，
+    所以"把 deepseek-flash 放 JSON 首位"根本不起作用；② 我在解 model_configs 冲突时"采纳导师字段"
+    把导师那批 `createdAt/updatedAt`(2026-09-23) 也一起采纳了，比我方的 2024-01-01/2026-09-21 新 → 排序整体翻转，
+    `deepseek-flash` 从第 1 掉到第 9
+  - **实测**：导师对同名模型**只改了时间戳**，唯一实质改动是 `MiniMax-M2.7` 的 `baseUrl → .../anthropic`
+  - **修法**：同名逻辑模型保留我方 `createdAt/updatedAt`（纯元数据），只采纳实质字段
+  - **复核**：修复 diff 只动时间戳（16 行），`baseUrl` 导师改动保留；`/api/models` 与 `/api/hermes/models` 首条均恢复 `deepseek-flash`
+- **升级校验器（`68340d3`）**：`probe-verify.py` 第 2 项原只看**文件里**首条 enabled+text，
+  而 handler 取的是**按 updatedAt 倒序后**的首条 → 盲区。已改为两项都打印、以排序后为准。
+  **反向测试**证明判据有效：修复态 PASS、回归态 FAIL（且回归态下"文件首条"仍是 deepseek-flash，正是旧判据漏判的原因）
+- **验收**：
+  - 前端构建 `npm run build` → **`✓ Compiled successfully`**，类型检查通过，4 个静态页生成（验证清单第 7 项）
+  - `/api/hermes/skills` → **非空**，返回 7 个真实技能（技能目录联接生效）
+  - `/api/agent/memory/stats` → `episodeCount:14, orphanCount:0`（我方 memory 功能可用）
+  - `POST /api/hermes/chat` → `completed:true`，回复 `OK`（挂死修复仍生效）
+  - 交付报告自身 **27 条事实核验 0 失败**
+- **交付物**：`docs/UPSTREAM_MERGE_DELIVERY.md`（对比改动前的详细交付报告）
+- **仍待人工**：浏览器验前端页面、第 9 项端到端 t1 + **肉眼比图**（`offline_data_lab.py` 被上游整份重写）、第 11/23 项页面看技能列表
+- **提交**：`eb65542`（修复回归）→ `68340d3`（升级校验）→ `c1bfd44`（交付报告）
