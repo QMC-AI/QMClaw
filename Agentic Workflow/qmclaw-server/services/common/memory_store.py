@@ -10,16 +10,16 @@ Memory Store - 长期记忆存储模块
     ├── skills/       # 自动学习的技能
     └── index.json    # 索引（快速查询用）
 
-来源说明：本模块由 scripts/memory_store.py 移植而来（原文件是微服务化之前
-monolithic job_runner.py 的遗留物，现无任何活跃路径引用）。
-磁盘格式与原版**完全一致**，因此两种模式的数据可以互相读取。
+来源说明：本模块是**唯一权威实现**。scripts/memory_store.py 已收敛为转发层（G3），
+它把 <qmclaw-server> 加入 sys.path 后 `from services.common.memory_store import *`，
+因此两种导入路径读写的是同一份实现、同一份磁盘格式，不会再 schema 分叉。
 """
 
 import os
 import json
 import uuid
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Any
 from pathlib import Path
 
@@ -84,6 +84,74 @@ def _update_index(mutator: Callable[[Dict], None]) -> Dict:
         return index
 
 
+# ── Lifecycle（P4-T7：提升 / 遗忘） ──────────────────────────────────────────
+#
+# episode 生命周期：active（活跃）→ archived（已归档）。
+# 老数据没有 lifecycle 字段（交付包里的 14 条都是），读取口一律按 active 兼容；
+# archived 与 lifecycle 两个字段保持同步（历史实现只写 archived，新实现两者都写）。
+
+LIFECYCLE_ACTIVE = "active"
+LIFECYCLE_ARCHIVED = "archived"
+
+
+def _episode_lifecycle(ep: Dict) -> str:
+    """取 episode 生命周期；字段缺失 / 非法时按老数据规则退化。"""
+    lc = ep.get("lifecycle")
+    if lc in (LIFECYCLE_ACTIVE, LIFECYCLE_ARCHIVED):
+        return lc
+    return LIFECYCLE_ARCHIVED if ep.get("archived") else LIFECYCLE_ACTIVE
+
+
+def _normalize_episode(ep: Optional[Dict]) -> Optional[Dict]:
+    """兼容老数据：原地补齐 lifecycle / archived / promoted_to（所有读取口统一走这里）。
+
+    - 无 lifecycle：按 archived 推断（archived=True → archived，否则 active）
+    - 无 promoted_to：按 None（尚未提升成技能）
+    - archived 与 lifecycle 强制同步
+    """
+    if not isinstance(ep, dict):
+        return ep
+    lc = _episode_lifecycle(ep)
+    ep["lifecycle"] = lc
+    ep["archived"] = (lc == LIFECYCLE_ARCHIVED)
+    if "promoted_to" not in ep:
+        ep["promoted_to"] = None
+    return ep
+
+
+def _list_episode_files() -> List[str]:
+    """EPISODES_DIR 下全部 episode 实体文件路径（*.json，排序保证确定）。"""
+    if not os.path.isdir(EPISODES_DIR):
+        return []
+    return [os.path.join(EPISODES_DIR, f) for f in sorted(os.listdir(EPISODES_DIR))
+            if f.endswith(".json")]
+
+
+def _read_episode_file(path: str) -> Optional[Dict]:
+    """按路径读一个 episode 实体（已做老数据补字段）。读不了返回 None。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _normalize_episode(json.load(f))
+    except Exception as e:
+        print(f"MemoryStore: Failed to read episode file {path}: {e}")
+        return None
+
+
+def _write_episode_file(path: str, episode: Dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(episode, f, indent=2, ensure_ascii=False)
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    """解析 ISO 时间戳；缺失 / 非法返回 None。"""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 # ── Episode 管理 ──────────────────────────────────────────────────────────────
 
 def generate_episode_id() -> str:
@@ -101,9 +169,18 @@ def create_episode(
     qubit: str = None,
     tags: List[str] = None,
     used_skills: List[str] = None,
-    mode: str = "react"
+    mode: str = "react",
+    session_id: str = None,
+    round_index: int = None,
+    model: str = None,
+    response: str = None
 ) -> Dict:
-    """创建并保存一个新的 Episode"""
+    """创建并保存一个新的 Episode
+
+    session_id / round_index / model / response 是会话（分级记忆）字段：
+    即使为 None 也会写入实体与索引（response 只在实体），保持形状稳定，
+    便于后续 update_episode_fields() 回填。老调用方不传这些参数也不受影响。
+    """
     episode_id = generate_episode_id()
 
     episode = {
@@ -117,9 +194,15 @@ def create_episode(
         "metrics": metrics or {},
         "tags": tags or [],
         "usedSkills": used_skills or [],
+        "sessionId": session_id,
+        "roundIndex": round_index,
+        "model": model,
+        "response": response,
         "reflection": None,      # 反思报告，稍后填充
         "skillCreated": None,   # 如果生成了技能，记录 ID
-        "archived": False
+        "archived": False,
+        "lifecycle": LIFECYCLE_ACTIVE,   # P4-T7 生命周期：active / archived
+        "promoted_to": None              # P4-T7 提升：沉淀成的 skill id（未提升为 None）
     }
 
     # 实体文件与索引在同一次加锁内写完，避免出现"有文件、无索引"的孤儿
@@ -131,6 +214,8 @@ def create_episode(
             "timestamp": episode["timestamp"],
             "qubit": qubit,
             "status": status,
+            "sessionId": session_id,
+            "roundIndex": round_index,
             "task_preview": task[:50] if len(task) > 50 else task
         })
 
@@ -144,13 +229,17 @@ def create_episode(
 
 
 def get_episode(episode_id: str) -> Optional[Dict]:
-    """获取单个 Episode 详情"""
+    """获取单个 Episode 详情。
+
+    读取口对老数据做兼容：缺失的 lifecycle / archived / promoted_to 按
+    active / False / None 补齐（见 _normalize_episode）。
+    """
     episode_file = os.path.join(EPISODES_DIR, f"{episode_id}.json")
     if not os.path.exists(episode_file):
         return None
     try:
         with open(episode_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            return _normalize_episode(json.load(f))
     except Exception as e:
         print(f"MemoryStore: Failed to load episode {episode_id}: {e}")
         return None
@@ -167,6 +256,28 @@ def update_episode_reflection(episode_id: str, reflection: Dict):
             return False
 
         episode["reflection"] = reflection
+
+        with open(episode_file, 'w', encoding='utf-8') as f:
+            json.dump(episode, f, indent=2, ensure_ascii=False)
+
+    return True
+
+
+def update_episode_fields(episode_id: str, **fields) -> bool:
+    """通用的 Episode 字段读-改-写：把 fields 合并进实体并写回。
+
+    与 update_episode_reflection / archive_episode 同为实体文件的读-改-写，
+    持 _INDEX_LOCK 互斥，避免并发丢更新。episode 不存在（或文件缺失）返回 False。
+    只合并实体文件，不动 index 摘要条目。
+    """
+    episode_file = os.path.join(EPISODES_DIR, f"{episode_id}.json")
+
+    with _INDEX_LOCK:
+        episode = get_episode(episode_id)
+        if not episode:
+            return False
+
+        episode.update(fields)
 
         with open(episode_file, 'w', encoding='utf-8') as f:
             json.dump(episode, f, indent=2, ensure_ascii=False)
@@ -204,7 +315,10 @@ def list_episodes(
 
 
 def archive_episode(episode_id: str) -> bool:
-    """归档 Episode（软删除）"""
+    """归档 Episode（软删除）
+
+    实体保留（archived=True / lifecycle="archived"，两字段同步），索引条目移除。
+    """
     episode_file = os.path.join(EPISODES_DIR, f"{episode_id}.json")
 
     with _INDEX_LOCK:
@@ -213,6 +327,7 @@ def archive_episode(episode_id: str) -> bool:
             return False
 
         episode["archived"] = True
+        episode["lifecycle"] = LIFECYCLE_ARCHIVED
         episode["archivedAt"] = datetime.now().isoformat()
 
         with open(episode_file, 'w', encoding='utf-8') as f:
@@ -225,6 +340,100 @@ def archive_episode(episode_id: str) -> bool:
         _update_index(_drop_from_index)
 
     return True
+
+
+def run_maintenance(archive_after_days: int = 90, max_archived: int = 200) -> Dict:
+    """提升 / 遗忘：归档超期 episode，并清理超量归档（P4-T7）。
+
+    a) 归档：lifecycle == "active" 且 timestamp 距今超过 archive_after_days 天
+       → lifecycle="archived"、archived=True、archivedAt=now（两字段同步），
+       本次新归档的条目从索引移除（与 archive_episode 的既有语义一致）。
+       archive_after_days=0 表示"立刻归档全部 active"（边界）。
+    b) 清理：归档数 > max_archived 时，按 archivedAt（缺失则 timestamp）从最老开始
+       删除；**实体文件与索引条目一起删**，不留索引残行（orphanCount 语义不被破坏）。
+       本次删除数累加进 index["meta"]["pruned_total"]。
+    c) 全程在一次 _update_index 内完成（持 _INDEX_LOCK 的原子读-改-写）。
+
+    Returns:
+        {"archived": 本次新归档数, "pruned": 本次删除数,
+         "active": 剩余 active 数, "archived_remaining": 剩余 archived 数}
+    """
+    now = datetime.now()
+    try:
+        days = max(0, int(archive_after_days))
+    except (TypeError, ValueError):
+        days = 90
+    try:
+        keep = max(0, int(max_archived))
+    except (TypeError, ValueError):
+        keep = 200
+    cutoff = now - timedelta(days=days)
+
+    result = {"archived": 0, "pruned": 0, "active": 0, "archived_remaining": 0}
+
+    def _mutate(index: Dict):
+        active_ids: List[Any] = []
+        archived: List[Dict] = []
+        newly_archived_ids: List[Any] = []
+
+        for fpath in _list_episode_files():
+            ep = _read_episode_file(fpath)
+            if not ep:
+                continue
+            if _episode_lifecycle(ep) == LIFECYCLE_ACTIVE:
+                ts = _parse_ts(ep.get("timestamp"))
+                if ts is not None and ts < cutoff:
+                    ep["lifecycle"] = LIFECYCLE_ARCHIVED
+                    ep["archived"] = True
+                    ep["archivedAt"] = now.isoformat()
+                    _write_episode_file(fpath, ep)
+                    result["archived"] += 1
+                    if ep.get("id"):
+                        newly_archived_ids.append(ep["id"])
+            if _episode_lifecycle(ep) == LIFECYCLE_ARCHIVED:
+                archived.append({"id": ep.get("id"), "path": fpath, "ep": ep})
+            else:
+                active_ids.append(ep.get("id"))
+
+        # a) 本次新归档的 episode 从索引移除（早已归档的条目不动，prune 时再清）
+        if newly_archived_ids:
+            drop_new = set(newly_archived_ids)
+            index["episodes"] = [e for e in index.get("episodes", [])
+                                 if e.get("id") not in drop_new]
+
+        # b) 超量归档：最老的先删（实体 + 索引条目）
+        pruned_ids: List[Any] = []
+        if len(archived) > keep:
+            archived.sort(key=lambda a: str(a["ep"].get("archivedAt")
+                                             or a["ep"].get("timestamp") or ""))
+            for a in archived[:len(archived) - keep]:
+                try:
+                    os.remove(a["path"])
+                except OSError as e:
+                    print(f"MemoryStore: Failed to prune {a['id']}: {e}")
+                    continue
+                result["pruned"] += 1
+                if a["id"]:
+                    pruned_ids.append(a["id"])
+
+            # 若被删条目在索引里还有残行，一并清掉（否则会变成孤儿索引行）
+            if pruned_ids:
+                drop = set(pruned_ids)
+                index["episodes"] = [e for e in index.get("episodes", [])
+                                     if e.get("id") not in drop]
+
+        if result["pruned"]:
+            meta = index.setdefault("meta", {})
+            meta["pruned_total"] = int(meta.get("pruned_total", 0) or 0) + result["pruned"]
+
+        result["active"] = len(active_ids)
+        result["archived_remaining"] = len(archived) - result["pruned"]
+
+    _update_index(_mutate)
+
+    print(f"MemoryStore: maintenance archived={result['archived']} "
+          f"pruned={result['pruned']}", flush=True)
+    return result
 
 
 def get_recent_episodes_for_qubit(qubit: str, limit: int = 5) -> List[Dict]:
@@ -241,6 +450,109 @@ def get_failed_episodes(limit: int = 10) -> List[Dict]:
     episodes = index.get("episodes", [])
     failed = [e for e in episodes if e.get("status") == "failed"]
     return failed[:limit]
+
+
+# ── 会话（Session）管理 ──────────────────────────────────────────────────────
+
+def _iter_live_episodes() -> List[Dict]:
+    """索引条目 ∧ 实体文件真实存在的完整 episode（按索引顺序去重）。
+
+    与 get_memory_stats() 的有效口径一致：只看索引里有条目且文件还在的。
+    """
+    index = _load_index()
+    out: List[Dict] = []
+    seen = set()
+    for e in index.get("episodes", []):
+        eid = e.get("id")
+        if not eid or eid in seen:
+            continue
+        seen.add(eid)
+        ep = get_episode(eid)
+        if ep:
+            out.append(ep)
+    return out
+
+
+def _has_valid_task(ep: Dict) -> bool:
+    """task 是否为有效字符串（非 None / 非纯空白）。
+
+    空 task / 纯空白 task 的 episode 属脏数据：会话列表与会话回放都不该带上它，
+    否则 list_sessions 的 rounds 与 get_session_episodes 的条数会对不上。
+    """
+    task = ep.get("task")
+    return isinstance(task, str) and bool(task.strip())
+
+
+def _session_key(ep: Dict) -> str:
+    """episode 所属会话的 key。
+
+    sessionId 缺失 / null / 空 的老数据退化：各自构成单轮会话，
+    用该 episode 自己的 id 作为 sessionId。
+    """
+    sid = ep.get("sessionId")
+    return sid if sid else ep.get("id")
+
+
+def list_sessions(limit: int = 50) -> List[Dict]:
+    """按 session 分组的会话摘要列表（最近有更新的会话在前）。
+
+    只统计有效 episode（索引条目且文件真实存在），并过滤 task 为空 / 纯空白的
+    脏数据。sessionId 缺失/null 的 episode 各自构成单轮会话（sessionId 取 episode id）。
+    """
+    groups: Dict[str, List[Dict]] = {}
+    for ep in _iter_live_episodes():
+        if not _has_valid_task(ep):
+            continue
+        groups.setdefault(_session_key(ep), []).append(ep)
+
+    sessions: List[Dict] = []
+    for sid, rounds in groups.items():
+        # 组内按 timestamp 升序（ISO 字符串比较即可），并列时保持索引顺序
+        ordered = sorted(rounds, key=lambda r: r.get("timestamp") or "")
+        first, last = ordered[0], ordered[-1]
+
+        statuses = {r.get("status") for r in ordered}
+        if "success" in statuses and "failed" in statuses:
+            status = "mixed"
+        else:
+            status = last.get("status")
+
+        sessions.append({
+            "sessionId": sid,
+            "rounds": len(ordered),
+            "firstAt": first.get("timestamp"),
+            "lastAt": last.get("timestamp"),
+            "taskPreview": (first.get("task") or "")[:50],   # 最早一轮 task 截 50 字符
+            "qubit": next((r.get("qubit") for r in ordered if r.get("qubit")), None),
+            "model": last.get("model"),                      # 最新一轮的 model
+            "status": status
+        })
+
+    # 会话按 lastAt 倒序，截 limit（并列时保持稳定顺序）
+    sessions.sort(key=lambda s: s.get("lastAt") or "", reverse=True)
+    return sessions[:limit]
+
+
+def get_session_episodes(session_id: str) -> List[Dict]:
+    """返回一个会话的全部完整 episode（含 steps / response）。
+
+    与 list_sessions 口径一致：过滤 task 为空 / 纯空白的脏数据，保证
+    rounds == len(get_session_episodes(session_id)) 的不变量成立。
+
+    排序规则（简单确定，不做混合插入排序）：
+    - 组内 roundIndex 全部非 null → 按 roundIndex 升序；
+    - 否则（全 null 或混有 null）→ 按 timestamp 升序。
+    """
+    rounds = [
+        ep for ep in _iter_live_episodes()
+        if _session_key(ep) == session_id and _has_valid_task(ep)
+    ]
+
+    if rounds and all(r.get("roundIndex") is not None for r in rounds):
+        rounds.sort(key=lambda r: r.get("roundIndex"))
+    else:
+        rounds.sort(key=lambda r: r.get("timestamp") or "")
+    return rounds
 
 
 # ── Skill 管理 ──────────────────────────────────────────────────────────────
@@ -333,8 +645,17 @@ def list_skills(status: str = None) -> List[Dict]:
 
 
 def match_skills(task: str) -> List[Dict]:
-    """根据任务描述匹配技能"""
-    task_lower = task.lower()
+    """根据任务描述匹配技能，并按相关度排序（P3-T6 召回升级）。
+
+    排序规则（Python 稳定排序，同分保持索引顺序 = 新技能在前）：
+    1. 关键词**命中数**降序（命中越多越相关）
+    2. 其次 successRate = successCount / (successCount + failureCount) 降序
+       （分母为 0 时按 0.0 处理）
+
+    返回值仍是 list[Dict]（技能实体），签名与旧调用方完全兼容；
+    只是顺序从"索引顺序"变成了"相关度顺序"。
+    """
+    task_lower = (task or "").lower()
     matched = []
 
     index = _load_index()
@@ -343,13 +664,25 @@ def match_skills(task: str) -> List[Dict]:
         if not skill or skill.get("status") != "active":
             continue
 
-        # 检查关键词匹配
+        # 检查关键词匹配，并统计命中数
+        hits = 0
         for kw in skill.get("triggerKeywords", []):
-            if kw.lower() in task_lower or task_lower in kw.lower():
-                matched.append(skill)
-                break
+            if not isinstance(kw, str) or not kw:
+                continue
+            kw_lower = kw.lower()
+            if kw_lower in task_lower or task_lower in kw_lower:
+                hits += 1
+        if hits:
+            matched.append((hits, skill))
 
-    return matched
+    def _success_rate(skill: Dict) -> float:
+        sc = skill.get("successCount", 0) or 0
+        fc = skill.get("failureCount", 0) or 0
+        total = sc + fc
+        return (sc / total) if total > 0 else 0.0
+
+    matched.sort(key=lambda item: (-item[0], -_success_rate(item[1])))
+    return [skill for _, skill in matched]
 
 
 def update_skill_usage(skill_id: str, success: bool):
@@ -434,6 +767,16 @@ def get_memory_stats() -> Dict:
     success_count = sum(1 for e in live_episodes if e.get("status") == "success")
     success_rate = success_count / len(live_episodes) if live_episodes else 0
 
+    # 生命周期计数（P4-T7）：直接扫实体文件 —— 归档后实体保留、索引条目移除，
+    # 只看索引会漏掉全部 archived。老数据无 lifecycle 按 active 计。
+    lifecycle = {"active": 0, "archived": 0, "pruned": 0}
+    for fpath in _list_episode_files():
+        ep = _read_episode_file(fpath)
+        if not ep:
+            continue
+        lifecycle[_episode_lifecycle(ep)] += 1
+    lifecycle["pruned"] = int((index.get("meta") or {}).get("pruned_total", 0) or 0)
+
     return {
         "episodeCount": episode_count,
         "skillCount": skill_count,
@@ -441,6 +784,7 @@ def get_memory_stats() -> Dict:
         "storageBytes": total_size,
         "storageMB": round(total_size / (1024 * 1024), 2),
         "successRate": round(success_rate * 100, 1),
+        "lifecycle": lifecycle,
         "lastUpdated": index.get("last_updated")
     }
 

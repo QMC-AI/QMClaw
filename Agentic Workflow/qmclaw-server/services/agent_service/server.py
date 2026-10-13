@@ -19,6 +19,7 @@ from enum import Enum
 
 from ..base import BaseService, ServiceConfig, run_service, _safe_print
 from ..common import setup_logging, config
+from ..common.config import load_system_config
 
 # 记忆与反思（由 scripts/ 移植而来，磁盘格式与旧版一致）
 from ..common import memory_store
@@ -32,6 +33,53 @@ from .adapter import AgentServiceAdapter, setup_agent_tools, fetch_experiment_pl
 def _log(msg: str):
     """安全日志输出"""
     _safe_print(f"[agent_service] {msg}")
+
+
+# ── L0 工作记忆配置（P2-T5）───────────────────────────────────────────────────
+#
+# config/system.json 的 "memory" 块；块缺失 / 字段缺失 / 非法值一律回退下面这套
+# 默认值 —— 配置文件坏掉绝不能把 agent 服务带崩。
+
+WORKING_MEMORY_DEFAULTS: Dict[str, int] = {
+    "window_size": 10,       # 除第 1 轮外，额外保留的最近轮数
+    "summary_threshold": 20,  # 溢出折叠阈值（保留项，见 _wm_history_messages）
+    "session_ttl": 86400,    # 会话空闲多久后惰性淘汰（秒）
+}
+
+
+def _positive_int(value: Any, default: int) -> int:
+    """配置值收敛成正整数；bool / 非数字 / <=0 一律回退默认值。"""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value if value > 0 else default
+    if isinstance(value, float):
+        return int(value) if value > 0 else default
+    if isinstance(value, str):
+        try:
+            n = int(value.strip())
+        except (TypeError, ValueError):
+            return default
+        return n if n > 0 else default
+    return default
+
+
+def load_memory_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+    """读取工作记忆配置。
+
+    raw 为 None 时读 config/system.json；显式传入 dict 时只用它（便于测试与复用）。
+    任何异常都收敛成默认值，不向上抛。
+    """
+    if raw is None:
+        try:
+            raw = load_system_config()
+        except Exception as e:  # 配置读取失败 → 默认值
+            _log(f"Working memory: failed to load system config, using defaults: {e}")
+            raw = {}
+    block = raw.get("memory") if isinstance(raw, dict) else None
+    if not isinstance(block, dict):
+        block = {}
+    return {k: _positive_int(block.get(k), v) for k, v in WORKING_MEMORY_DEFAULTS.items()}
 
 
 class TaskStatus(Enum):
@@ -191,10 +239,23 @@ class AgentService(BaseService):
         # quantum_service 地址（通过 HTTP 调用）
         self._quantum_service_url = "http://localhost:3003"
 
+        # L0 工作记忆（跨轮会话窗口）：session_id -> {"turns": [...], "updated_at": ts}
+        # 纯进程内存，与 L1（memory_store 落盘的 episodes/skills）互不影响；
+        # TTL 到期只在下次访问该会话时惰性淘汰，不启后台线程。
+        self._working_memory: Dict[str, Dict[str, Any]] = {}
+        self._wm_lock = threading.Lock()
+        self._memory_config = load_memory_config()
+
         # 初始化 adapter（通过 HTTP 调用 quantum_service）
         self._adapter = AgentServiceAdapter(self._quantum_service_url)
         self._registry = self._adapter.get_registry()
 
+        _log(
+            "Working memory (L0) enabled: "
+            f"window_size={self._memory_config['window_size']}, "
+            f"summary_threshold={self._memory_config['summary_threshold']}, "
+            f"session_ttl={self._memory_config['session_ttl']}s"
+        )
         _log("Agent service initialized with unified quantum tools (HTTP to quantum_service)")
 
     def register_tool(self, tool: Tool):
@@ -338,6 +399,98 @@ class AgentService(BaseService):
                 continue
         return out
 
+    # ── L0 工作记忆（跨轮会话窗口 + 溢出压缩 + TTL）──────────────────────────
+    #
+    # 只保存最近若干轮的 user/assistant 原文（纯内存），供 _react_reason 回灌到
+    # system 与当前 user 之间。L1 落盘记忆（episodes/skills）完全不受影响。
+
+    def _wm_session_id(self, task: AgentTask) -> str:
+        """会话键：与 _record_episode 保持一致，context.session_id 优先，退回 task_id。"""
+        ctx = task.context or {}
+        return ctx.get("session_id") or task.task_id
+
+    def _wm_evict_stale(self, session_id: str) -> None:
+        """TTL 惰性淘汰：只在该会话被访问时检查，顺带清掉其它已过期的会话。
+
+        不启后台线程：淘汰完全由访问触发，避免会话表在长跑进程里无限增长。
+        """
+        ttl = self._memory_config["session_ttl"]
+        now = time.time()
+        with self._wm_lock:
+            stale = [sid for sid, e in self._working_memory.items()
+                     if (now - (e.get("updated_at") or 0)) > ttl]
+            for sid in stale:
+                del self._working_memory[sid]
+        for sid in stale:
+            _log(f"Working memory: evicted stale session {sid} (ttl={ttl}s, accessed={session_id})")
+
+    def _wm_get_turns(self, session_id: str) -> List[Dict[str, str]]:
+        """取该会话的历史轮次（副本）；过期的会话先被惰性淘汰。"""
+        self._wm_evict_stale(session_id)
+        with self._wm_lock:
+            entry = self._working_memory.get(session_id)
+            if not entry:
+                return []
+            return [dict(t) for t in (entry.get("turns") or [])]
+
+    @staticmethod
+    def _wm_round_text(round_turns: List[Dict[str, str]]) -> str:
+        """一轮压成一行：user → assistant，换行拍平，最多 120 字符。"""
+        text = " → ".join(
+            (t.get("content") or "").strip()
+            for t in round_turns
+            if (t.get("content") or "").strip()
+        )
+        return text.replace("\n", " ")[:120]
+
+    def _wm_history_messages(self, session_id: str) -> List[Dict[str, str]]:
+        """把历史轮次转成可注入 messages 的片段。
+
+        窗口规则：保留第 1 轮 + 最近 window_size 轮；中间部分折叠成**一条**
+        role=system 的压缩消息（纯截断，不调 LLM）。
+        """
+        turns = self._wm_get_turns(session_id)
+        if not turns:
+            return []
+
+        # turns = [user, assistant, user, assistant, ...] —— 每 2 条一轮
+        rounds = [turns[i:i + 2] for i in range(0, len(turns), 2)]
+        window = self._memory_config["window_size"]
+
+        # 第 1 轮 + 最近 window 轮已经覆盖全部 → 没有中间部分可折叠
+        if len(rounds) <= window + 1:
+            return [dict(t) for r in rounds for t in r]
+
+        head = rounds[0]
+        tail = rounds[len(rounds) - window:]
+        middle = rounds[1:len(rounds) - window]
+
+        out: List[Dict[str, str]] = [dict(t) for t in head]
+        out.append({
+            "role": "system",
+            "content": f"[记忆压缩] 此前 {len(middle)} 轮："
+                       + " | ".join(self._wm_round_text(r) for r in middle),
+        })
+        for r in tail:
+            out.extend(dict(t) for t in r)
+        _log(f"Working memory: session {session_id} compressed "
+             f"({len(rounds)} rounds -> keep first + last {window}, fold {len(middle)})")
+        return out
+
+    def _wm_append_turn(self, session_id: str, user_content: str,
+                        assistant_content: str) -> None:
+        """一轮成功结束后追加 user/assistant 两条并刷新 updated_at。"""
+        self._wm_evict_stale(session_id)
+        now = time.time()
+        with self._wm_lock:
+            entry = self._working_memory.get(session_id)
+            if entry is None:
+                entry = {"turns": [], "updated_at": now}
+                self._working_memory[session_id] = entry
+            entry["turns"].append({"role": "user", "content": user_content or ""})
+            entry["turns"].append({"role": "assistant", "content": assistant_content or ""})
+            entry["updated_at"] = now
+
     def _react_reason(self, task: AgentTask) -> Dict[str, Any]:
         """ReAct 推理循环（原生 function calling 版本）
 
@@ -350,10 +503,17 @@ class AgentService(BaseService):
         iteration = 0
 
         tools = self._registry.get_definitions()
+
+        # L0 工作记忆：同会话的历史轮次插在 system 与当前 user 之间
+        session_id = self._wm_session_id(task)
+        history = self._wm_history_messages(session_id)
+
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self._system_prompt},
-            {"role": "user", "content": task.message},
         ]
+        messages.extend(history)
+        round_start = len(messages)   # 历史结束处：_final 只回报本轮的 user/assistant
+        messages.append({"role": "user", "content": task.message})
 
         # 汇集给前端的结果（steps 已在 task.steps 里，这里收数值与图表）
         collected_metrics: Dict[str, Any] = {}
@@ -366,7 +526,8 @@ class AgentService(BaseService):
                 "success": success,
                 "iterations": iteration,
                 "messages": [{"role": m.get("role"), "content": m.get("content") or ""}
-                             for m in messages if m.get("role") in ("user", "assistant")],
+                             for m in messages[round_start:]
+                             if m.get("role") in ("user", "assistant")],
                 "metrics": collected_metrics,
                 "charts": collected_charts,
                 "synthetic": saw_synthetic,
@@ -389,6 +550,8 @@ class AgentService(BaseService):
             if not tool_calls:
                 # 没有工具调用 —— 这就是最终回复
                 task.messages.append(AgentMessage(role="assistant", content=content))
+                # 一轮成功结束：user/assistant 轮写入 L0 工作记忆（失败不写）
+                self._wm_append_turn(session_id, task.message, content)
                 return _final(True, response=content)
 
             _log(f"Model requested {len(tool_calls)} tool call(s)")
@@ -781,7 +944,8 @@ class AgentService(BaseService):
     # ── 记忆与反思 (Memory & Reflection) ─────────────────────────────────────
     #
     # Express 侧 /api/agent/memory/* 会原样代理到下面这些路径。
-    # 数据落在 <qmclaw-server>/config/memory/，格式与 scripts/memory_store.py 完全一致。
+    # 数据落在 <qmclaw-server>/config/memory/；权威实现是 services/common/memory_store.py，
+    # scripts/memory_store.py 已收敛为转发层（G3），两者共用同一份实现与磁盘格式。
 
     @staticmethod
     def _q(query: Dict[str, List[str]], key: str, default=None):
@@ -818,6 +982,42 @@ class AgentService(BaseService):
                 return {"success": False, "error": f"Episode not found: {episode_id}"}
             return {"success": True, "episode": episode}
 
+        # /memory/sessions — 会话列表（POST {"limit":50}）
+        if path == "/memory/sessions":
+            try:
+                limit = int(data.get("limit") or self._q(query, "limit", 50))
+            except (TypeError, ValueError):
+                limit = 50
+            sessions = memory_store.list_sessions(limit=limit)
+            _log(f"Memory: listed {len(sessions)} sessions (limit={limit})")
+            return {"success": True, "count": len(sessions), "sessions": sessions}
+
+        # /memory/sessions/{id} — 会话回放：完整 episode + 拼好的对话消息
+        if path.startswith("/memory/sessions/"):
+            session_id = path[len("/memory/sessions/"):].strip("/")
+            episodes = memory_store.get_session_episodes(session_id)
+            if not episodes:
+                _log(f"Memory: session not found: {session_id}")
+                return {"success": False, "error": f"Session not found: {session_id}"}
+            messages = []
+            for ep in episodes:
+                ts = ep.get("timestamp")
+                messages.append({
+                    "role": "user",
+                    "content": ep.get("task"),
+                    "timestamp": ts,
+                })
+                messages.append({
+                    "role": "assistant",
+                    "content": ep.get("response"),
+                    "steps": ep.get("steps") or [],
+                    "results": ep.get("metrics") or {},
+                    "timestamp": ts,
+                })
+            _log(f"Memory: session {session_id} replayed ({len(episodes)} episodes)")
+            return {"success": True, "sessionId": session_id,
+                    "messages": messages, "episodes": episodes}
+
         # /memory/skills — 列表
         if path == "/memory/skills":
             status = data.get("status") or self._q(query, "status")
@@ -837,19 +1037,55 @@ class AgentService(BaseService):
 
         # /memory/stats — 统计
         if path == "/memory/stats":
+            # get_memory_stats() 已含 lifecycle（P4-T7：active/archived/pruned），这里原样透传
             stats = memory_store.get_memory_stats()
             stats["success"] = True
             return stats
 
-        # /memory/recall — 按任务召回相关记忆
+        # /memory/maintenance/forget — 提升/遗忘：归档超期 episode + 清理超量归档（P4-T7）
+        if path == "/memory/maintenance/forget":
+            try:
+                archive_after_days = int(data.get("archive_after_days")
+                                         if data.get("archive_after_days") is not None
+                                         else self._q(query, "archive_after_days", 90))
+            except (TypeError, ValueError):
+                archive_after_days = 90
+            try:
+                max_archived = int(data.get("max_archived")
+                                   if data.get("max_archived") is not None
+                                   else self._q(query, "max_archived", 200))
+            except (TypeError, ValueError):
+                max_archived = 200
+            result = memory_store.run_maintenance(
+                archive_after_days=archive_after_days,
+                max_archived=max_archived,
+            )
+            _log(f"Memory: maintenance/forget archived={result.get('archived')} "
+                 f"pruned={result.get('pruned')} "
+                 f"(archive_after_days={archive_after_days}, max_archived={max_archived})")
+            return {"success": True, **result}
+
+        # /memory/recall — 按任务召回相关记忆（P3-T6：分层 + 打分 + 预算）
         if path == "/memory/recall":
             task = data.get("task") or data.get("message") or ""
             qubit = data.get("qubit") or self._q(query, "qubit")
             try:
-                recalled = reflection_engine.recall_for_task(task, qubit)
+                budget_chars = int(data.get("budget_chars") or 2000)
+            except (TypeError, ValueError):
+                budget_chars = 2000
+            try:
+                recalled = reflection_engine.recall_for_task(task, qubit, budget_chars)
             except Exception as e:
                 _log(f"recall failed: {e}")
-                recalled = {"hasMemory": False, "context": "", "error": str(e)}
+                recalled = {
+                    "hasMemory": False, "context": "", "error": str(e),
+                    "recall_meta": {
+                        "scores": [], "budget_chars": budget_chars, "used_chars": 0,
+                        "truncated": [],
+                        "tiers": {"skills": 0, "episodes": 0, "sessions": 0},
+                    },
+                }
+            # recalled 里已带 recall_meta（打分/预算/截断/分层计数），这里原样透传
             return {"success": True, **recalled}
 
         # /memory/reflect — 对某次任务做反思（可选回填到 episode）
@@ -895,6 +1131,8 @@ class AgentService(BaseService):
             except Exception:
                 pass
 
+            # 会话字段（sessionId / roundIndex / model / response）随实体+索引一次写入，
+            # 由 memory_store 在 _INDEX_LOCK 内原子落盘 —— 不再事后 open() 补写。
             episode = memory_store.create_episode(
                 task=task.message,
                 steps=steps,
@@ -907,46 +1145,18 @@ class AgentService(BaseService):
                 tags=[],
                 used_skills=[],
                 mode=task.mode,
+                session_id=task.context.get("session_id") or task.task_id,
+                round_index=task.context.get("round_index"),
+                model=getattr(task, "model", None),
+                response=result.get("response", ""),
             )
 
-            # 回填会话信息，让"每一轮"能串成一次会话
             episode_id = episode.get("id")
-            if episode_id:
-                self._annotate_episode(
-                    episode_id,
-                    session_id=task.context.get("session_id") or task.task_id,
-                    round_index=task.context.get("round_index"),
-                    model=getattr(task, "model", None),
-                    response=result.get("response", ""),
-                )
             _log(f"Memory: recorded episode {episode_id} (status={status}, steps={len(steps)})")
             return episode_id
         except Exception as e:
             _log(f"Memory: failed to record episode: {e}")
             return None
-
-    @staticmethod
-    def _annotate_episode(episode_id: str, session_id=None, round_index=None,
-                          model=None, response=None) -> None:
-        """给已落盘的 episode 补写 session/round/model/response 字段。
-
-        memory_store 的原始 schema 没有这几个字段 —— 但「记录每一轮对话」
-        需要能区分"同一会话的第 N 轮"，所以在这里补上，不改动原模块。
-        """
-        try:
-            ep = memory_store.get_episode(episode_id)
-            if not ep:
-                return
-            ep["sessionId"] = session_id
-            ep["roundIndex"] = round_index
-            ep["model"] = model
-            ep["response"] = response
-            import os as _os
-            fp = _os.path.join(memory_store.EPISODES_DIR, f"{episode_id}.json")
-            with open(fp, "w", encoding="utf-8") as f:
-                json.dump(ep, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            _log(f"Memory: annotate failed: {e}")
 
     def get_health(self) -> Dict[str, Any]:
         """获取健康状态"""

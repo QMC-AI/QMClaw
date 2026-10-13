@@ -16,20 +16,25 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 
 # 导入记忆存储
-# 本模块与 memory_store 同属 services.common 包；同时保留绝对导入回退，
+# 本模块与 memory_store / memory_manager 同属 services.common 包；同时保留绝对导入回退，
 # 以便该文件仍能作为独立脚本直接运行（文件末尾有 __main__ 自测块）。
+# recall_for_task 的召回逻辑已下沉到 memory_manager（P3-T6：分层 + 打分 + 预算）。
 try:
     from .memory_store import (
         create_episode, get_episode, update_episode_reflection,
+        update_episode_fields,
         create_skill, match_skills, get_recent_episodes_for_qubit,
         get_failed_episodes
     )
+    from .memory_manager import recall as _memory_recall
 except ImportError:  # 作为独立脚本运行时（无包上下文）
     from memory_store import (
         create_episode, get_episode, update_episode_reflection,
+        update_episode_fields,
         create_skill, match_skills, get_recent_episodes_for_qubit,
         get_failed_episodes
     )
+    from memory_manager import recall as _memory_recall
 
 
 # ── LLM 调用 ──────────────────────────────────────────────────────────────
@@ -304,6 +309,28 @@ def _validate_report(report: Dict) -> Dict:
     return report
 
 
+# ── 提升（promotion）判定（P4-T7） ──────────────────────────────────────────
+
+def _should_promote_to_skill(status: str, reflection: Dict, steps: List[Dict]) -> bool:
+    """是否把本轮的执行过程沉淀成技能（提升条件）。
+
+    只有**成功**任务的反思报告确实产出了技能内容与可复用步骤时才提升：
+
+    - status == "success"：失败任务只反思不升技能（不把错误做法固化成技能）
+    - reflection.skillSuggestion.shouldCreate 为真
+    - 报告给了名称或触发词（确实产出了技能内容，而不是空壳建议）
+    - steps 非空（有可复用的执行步骤）
+    """
+    if status != "success":
+        return False
+    suggestion = (reflection or {}).get("skillSuggestion") or {}
+    if not isinstance(suggestion, dict) or not suggestion.get("shouldCreate"):
+        return False
+    if not (suggestion.get("name") or suggestion.get("keywords")):
+        return False
+    return bool(steps)
+
+
 # ── 反思流程 ──────────────────────────────────────────────────────────────
 
 def reflect_after_task(
@@ -358,9 +385,9 @@ def reflect_after_task(
     # 3. 更新 Episode
     update_episode_reflection(episode_id, reflection)
 
-    # 4. 标记是否生成了技能
+    # 4. 提升：成功后把可复用的执行步骤沉淀成技能，并把 skill id 回标到 episode
     skill_created = None
-    if reflection.get("skillSuggestion", {}).get("shouldCreate"):
+    if _should_promote_to_skill(status, reflection, steps):
         ss = reflection["skillSuggestion"]
         try:
             skill = create_skill(
@@ -372,9 +399,10 @@ def reflect_after_task(
             )
             skill_created = skill["id"]
 
-            # 更新 episode 标记
-            episode["skillCreated"] = skill_created
-            update_episode_reflection(episode_id, reflection)  # 更新
+            # 提升链回标：promoted_to 是权威字段（skillCreated 保留，兼容旧前端/调用方）。
+            # 走 update_episode_fields —— 实体文件读-改-写在 _INDEX_LOCK 内完成。
+            update_episode_fields(episode_id, promoted_to=skill_created,
+                                  skillCreated=skill_created)
 
             print(f"ReflectionEngine: Created skill {skill['id']}", flush=True)
         except Exception as e:
@@ -474,61 +502,25 @@ def format_reflection_report(reflection_result: Dict) -> str:
 
 # ── 记忆召回 ──────────────────────────────────────────────────────────────
 
-def recall_for_task(task: str, qubit: str = None) -> Dict:
+def recall_for_task(task: str, qubit: str = None, budget_chars: int = 2000) -> Dict:
     """
-    召回与当前任务相关的记忆
+    召回与当前任务相关的记忆（P3-T6 起委托给 memory_manager.recall）
+
+    分层召回：L3 技能 → L2 情景（episodes）→ L1 会话摘要，
+    关键词 + 元数据打分、时间衰减、预算截断，见 services/common/memory_manager.py。
+
+    Args:
+        task: 当前任务描述
+        qubit: 当前比特（可选）
+        budget_chars: context 文本预算上限（默认 2000 字符）
 
     Returns:
-        包含相关记忆的上下文，用于增强 Agent prompt
+        与旧实现**形状兼容**的字典：
+        hasMemory / relevantSkills / recentEpisodes / qubitHistory / context
+        外加 sessionSummaries 与 recall_meta（可解释元数据：scores / budget_chars /
+        used_chars / truncated / tiers）。旧字段语义不变，只是内容经过了相关度排序与预算裁剪。
     """
-    result = {
-        "hasMemory": False,
-        "relevantSkills": [],
-        "recentEpisodes": [],
-        "qubitHistory": [],
-        "context": ""
-    }
-
-    # 1. 匹配技能
-    skills = match_skills(task)
-    result["relevantSkills"] = [
-        {
-            "id": s["id"],
-            "name": s["name"],
-            "keywords": s.get("triggerKeywords", []),
-            "successRate": s.get("successCount", 0) / max(s.get("successCount", 1) + s.get("failureCount", 1), 1)
-        }
-        for s in skills
-    ]
-
-    # 2. 同比特最近经验
-    if qubit:
-        recent = get_recent_episodes_for_qubit(qubit, limit=3)
-        result["recentEpisodes"] = recent
-        result["qubitHistory"] = recent
-
-    # 3. 如果有相关记忆，构建上下文
-    if result["relevantSkills"] or result["recentEpisodes"]:
-        result["hasMemory"] = True
-
-        context_parts = []
-        if result["relevantSkills"]:
-            context_parts.append("📚 相关已学技能:")
-            for s in result["relevantSkills"]:
-                rate = s.get("successRate", 0) * 100
-                context_parts.append(f"   • {s['name']} (成功率: {rate:.0f}%)")
-
-        if result["recentEpisodes"]:
-            context_parts.append("")
-            context_parts.append(f"📋 {qubit or '同类'}任务的历史经验:")
-            for ep in result["recentEpisodes"]:
-                ts = ep.get("timestamp", "")[:16]  # 只取日期时间
-                status = "✅" if ep.get("status") == "success" else "⚠️"
-                context_parts.append(f"   • {ts} {status}")
-
-        result["context"] = "\n".join(context_parts)
-
-    return result
+    return _memory_recall(task, qubit, budget_chars)
 
 
 # ── 初始化 ──────────────────────────────────────────────────────────────
