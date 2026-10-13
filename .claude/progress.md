@@ -1329,3 +1329,33 @@ Browser → Express (:3002) → Python subprocess → Hermes AIAgent
 - **背景**：分级记忆管理方案与详细 todolist 已产出并与本文件做了差异比对（复用 Hermes 会话 UI/cron、补 `_annotate_episode` 锁外旁路、G3 schema 分叉等修订点），即将按 Phase 0 开工
 - **验证**：`git diff --cached` 仅含 T11.json；密钥扫描无命中
 - **提交**：本条记录 + T11 工单
+
+---
+## 2026-10-08  分级记忆管理落地（T1–T7，brain-worker-team 派单）
+- **范围**：feat(memory)（分支 `feat/c-real-machine`）
+- **架构**：五级记忆模型——L0 工作记忆 / L1 会话 / L2 情景 / L3 技能 / L4（待 G1 收敛，本期不动导师侧）；
+  召回 = 关键词+元数据打分（qubit+实验类型+失败教训+时间衰减）+ 字符预算 + `recall_meta` 可解释；存储保持 JSON 文件
+- **改动**：
+  1. T1 `services/common/memory_store.py`：`create_episode` +session_id/round_index/model/response（实体+索引原子写）；
+     `update_episode_fields`（受锁 RMW）；`list_sessions`/`get_session_episodes`（空 task 过滤、老数据单轮退化、roundIndex/timestamp 双排序）
+  2. T2 `services/agent_service/server.py`：`_annotate_episode` 直写旁路收编进受锁路径（B3 遗留清零）；
+     `POST /memory/sessions`、`GET /memory/sessions/{id}`（user/assistant 回放映射）
+  3. T3 `src/index.ts`：两条 Express 会话路由（+12 行，tsc 错误数持平）
+  4. T4 `AgentChatPanel.tsx` + `api.ts`：sessionId/round_index 状态、会话侧栏（照 Hermes 模式）、刷新恢复、老数据退化入口
+  5. T5 L0 工作记忆：`_working_memory` 窗口（保首轮+最近 10 轮）+ 中段折叠压缩（纯截断不调 LLM）+ TTL 惰性淘汰；
+     `config/system.json` 增 `memory` 块（window_size/summary_threshold/session_ttl，缺省安全）
+  6. T6 `services/common/memory_manager.py`（新）：分层召回门面，`match_skills` 命中数+成功率排序，
+     `recall_for_task` 形状兼容、`/memory/recall` 透传 `recall_meta`
+  7. T7 episode `lifecycle(active|archived|pruned)`+`promoted_to`（缺省兼容老数据）、`run_maintenance` 归档/清理
+     （实体+索引同删保 orphanCount 语义）、`POST /memory/maintenance/forget`、反思提升链收紧（仅 success 升技能，
+     回标 promoted_to，顺带修掉 skillCreated 从不落盘的老 bug）、**G3**：`scripts/memory_store.py` 收敛为转发层（单实现）
+- **验证**：pytest 全量 **59 passed**（基线 21 → 59；新增 5 个测试文件 37 用例，含 10 线程并发不丢索引）；
+  web `tsc --noEmit` **EXIT=0**；server tsc 错误数不增（32 持平）；真实 `config/memory` 14 episode 全程未动；
+  Lead 对 7 单逐单 `git diff` 逐行审 + 亲自实跑 acceptance（1 个 must-fix 已打回闭环：空 task 过滤口径）
+- **施工方式**：brain-worker-team——Lead 拆单/侦察/对抗式审查，deepseek-flash 打手经 `workflow.agent()` 派单。
+  **实测结论**：`spawn_teammate`/`subagent` 均无 model 字段且子代理继承主模型（mimo），`agent-default-model` 无效；
+  `workflow.agent()` 的 provider/model 覆盖是本构建唯一便宜打手路由（子代理自报 deepseek-flash 验证）
+- **遗留（已登记 BACKLOG H 组）**：summary_threshold 语义空挂；update_episode_fields 不回写 index 摘要；
+  单轮退化种子消息仅前端内存；42 个 pytest-cache-files-* 空目录删不掉（目录授权表异常，ACL 技能判定 NOT_THIS_CLASS）
+- **待人工**：端到端验收需重启服务（约定 3）——当前全部服务未运行（0 监听）
+- **提交**：`feat(memory)` ×2 + `docs(memory)` ×1

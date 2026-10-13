@@ -237,9 +237,11 @@ self._server = HTTPServer((self.config.host, self.config.port), handler)
 
 ## D. 工程质量（P2）
 
-### D1 ⏸ 既有 TypeScript 类型错误阻塞生产构建
+### D1 ⏸ 既有 TypeScript 类型错误阻塞生产构建（2026-10-08 复核：web 侧已消失）
 
 **证据**（已实测）：`tsc --noEmit` —— **web 6 个**（`page.tsx` ×4、`AgentToolsPanel` ×1、`VariantGenerator` ×1）、**server 24 个**。
+
+**2026-10-08 复核**：web `tsc --noEmit --incremental false` **EXIT=0**（零错误，原 6 个存量疑随上游合并消失，`npm run build` 仍被沙箱限制未完整验证）；server 侧 `index.ts` 存量 29 行错误仍在（T3 实测改动前后 32 持平）。
 
 **影响**：dev 模式可用，生产构建被阻塞。
 
@@ -293,7 +295,7 @@ self._server = HTTPServer((self.config.host, self.config.port), handler)
 
 后端 `/api/chat/sessions`（增删查）与 `chatService.ts`（消息数组落盘到 `data/chat_history/`）**都已就绪**，但这个侧栏点击什么都不做。实测 `data/chat_history/` 里 **0 个会话**。
 
-### F1 ⬜ 后端：会话（session）列表与回放接口
+### F1 ✅ 后端：会话（session）列表与回放接口（2026-10-08 分级记忆 P1 落地）
 
 `memory_store` + `agent_service`：
 
@@ -314,7 +316,7 @@ self._server = HTTPServer((self.config.host, self.config.port), handler)
 
 **前置**：F0-2 必须先解决（前端开始传 `session_id`），否则新产生的 episode 仍然无法分组。
 
-### F2 ⬜ 前端：agent 面板支持持久会话
+### F2 ✅ 前端：agent 面板支持持久会话（2026-10-08 分级记忆 P1 落地）
 
 1. `AgentChatPanel` 增加 `sessionId` 状态（新建时生成 / 选中时载入），每次 `POST /chat` 带上 `session_id`
    —— **后端已支持，不用改后端**（`_handle_chat` 会把它透传进 `task.context`，`_record_episode` 用它填 `sessionId`）
@@ -414,9 +416,10 @@ F5 在 F1 之后随手处理（尤其是 charts 要不要补存）
 **另**：你自己的 agent 侧技能功能**不受影响**（走 `config/skills.json` + `memory_store` 的 `/api/agent/memory/skills`），本项只影响导师新加的界面。
 `HERMES_HOME` 语义（本机 `.env` 指向 `data\hermes`，导师假设项目根）本身仍待你决策 —— 详见 `UPSTREAM_MERGE_PLAN.md` 第十·补.1。
 
-### G3 ⬜ `scripts/memory_store.py` 与 `services/common/memory_store.py` 双份
+### G3 ✅ `scripts/memory_store.py` 与 `services/common/memory_store.py` 双份（2026-10-08 P4 已收敛）
 
-后者是从前者移植的（磁盘格式不变），移植后脚本版仍在库里。当前无引用冲突，但改存储格式时容易只改一份 → 建议择机删一份。
+后者是从前者移植的（磁盘格式不变），移植后脚本版仍在库里。当前无引用冲突，但改存储格式时容易只改一份。
+**已处理**：脚本版收敛为**转发层**（`sys.path` 挂载 + `from services.common.memory_store import *` + 显式重导出公开/私有名字），单实现，schema 不再可能分叉；测试用 `is` 身份断言验证两条导入路径指向同一实现。
 
 ### G4 ⬜ 新模块的第三方依赖未声明（**上游原来的漏项**）
 
@@ -508,3 +511,18 @@ D1 / D2（有空再说）
 
 **优先级判断依据**：A 组决定「数能不能信」，B 组决定「会不会挂/丢数据」，C 组决定「能不能接真机」。
 在 A1 确认之前，**不要基于当前 T1 数值做任何判断**。
+
+---
+
+## H. 分级记忆落地后的 nits 与收尾（登记日期：2026-10-08）
+
+> 分级记忆 T1–T7 已落地（详见 `.claude/progress.md` 同日条目）。以下为审查中记录、暂不阻塞的小项。
+
+| 编号 | 项 | 说明 | 状态 |
+|---|---|---|---|
+| H1 | `summary_threshold` 语义空挂 | `config/system.json` 的 memory 块有此键且被校验读取，但折叠触发只用 `window_size` 规则——需定义它到底约束什么（或删除该键） | ⬜ 待定义 |
+| H2 | `update_episode_fields` 不回写 index 摘要 | 只合并实体文件；若日后用它改 status/qubit，index 条目会滞后（`list_sessions`/`get_session_episodes` 读实体不受影响） | ⬜ 已知 |
+| H3 | 单轮退化的种子消息仅前端内存 | 「以该任务为起点新建会话」的首轮内容不入后端 session，刷新后消失；此后 `round_index` 从 2 起而 rounds 计 1（语义固有，可接受） | ⏸ 接受现状 |
+| H4 | 42 个 `pytest-cache-files-*` 空目录删不掉 | 目录授权表只剩 SYSTEM/Administrators/特殊身份，当前用户 `MY_RIGHTS=[]`；ACL 诊断技能判定 NOT_THIS_CLASS（管辖外），git 不可见（空目录）。需要时请人工删除或切完全权限后清理 | ⬜ 待人工 |
+| H5 | skill 文档与实际不符 | `brain-worker-team` skill 写的「subagent 有 model 字段」在本构建不成立（实测 spawn_teammate/subagent 均继承主模型）；唯一便宜路由是 `workflow.agent()` 的 model 覆盖。skill 文档待回写 | ⬜ 待改 |
+| H6 | L4 用户画像与 G1 收敛 | 分级记忆 L4 本期未接（导师 hermes 侧已有 MEMORY.md/USER.md 实现）；G1 三处收敛时一并决策 | ⬜ 见 G1 |
