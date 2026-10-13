@@ -1355,6 +1355,24 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
+  // ── Agent 会话（分级记忆 session） ────────────────────────────────────────
+
+  agentGetSessions: async (limit = 50) => {
+    const res = await fetch(`${API_BASE}/api/agent/memory/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit }),
+    });
+    return res.json();
+  },
+
+  agentGetSessionMessages: async (sessionId: string) => {
+    const res = await fetch(
+      `${API_BASE}/api/agent/memory/sessions/${encodeURIComponent(sessionId)}`
+    );
+    return res.json();
+  },
+
   // ── MCP Tools ────────────────────────────────────────────────────────────
 
   getMcpTools: async () => {

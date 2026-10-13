@@ -2479,6 +2479,18 @@ app.post("/api/agent/memory/reflect", async (req, res) => {
   }
 });
 
+/** POST /api/agent/memory/sessions — list memory sessions */
+app.post("/api/agent/memory/sessions", async (req, res) => {
+  const result = await proxyToService('agent', '/memory/sessions', 'POST', req.body);
+  res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+});
+
+/** GET /api/agent/memory/sessions/:sessionId — get memory session details */
+app.get("/api/agent/memory/sessions/:sessionId", async (req, res) => {
+  const result = await proxyToService('agent', '/memory/sessions/' + req.params.sessionId, 'GET');
+  res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+});
+
 // ── Hermes Agent API (microservice) ──────────────────────────────────────────────────────────
 
 /** POST /api/hermes/chat — Hermes agent chat */
