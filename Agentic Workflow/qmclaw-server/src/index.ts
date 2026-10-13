@@ -2491,6 +2491,12 @@ app.get("/api/agent/memory/sessions/:sessionId", async (req, res) => {
   res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
 });
 
+/** POST /api/agent/memory/maintenance/forget — run memory lifecycle maintenance (archive/prune) */
+app.post("/api/agent/memory/maintenance/forget", async (req, res) => {
+  const result = await proxyToService('agent', '/memory/maintenance/forget', 'POST', req.body);
+  res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+});
+
 // ── Hermes Agent API (microservice) ──────────────────────────────────────────────────────────
 
 /** POST /api/hermes/chat — Hermes agent chat */
