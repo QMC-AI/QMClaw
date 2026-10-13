@@ -523,6 +523,6 @@ D1 / D2（有空再说）
 | H1 | `summary_threshold` 语义空挂 | `config/system.json` 的 memory 块有此键且被校验读取，但折叠触发只用 `window_size` 规则——需定义它到底约束什么（或删除该键） | ⬜ 待定义 |
 | H2 | `update_episode_fields` 不回写 index 摘要 | 只合并实体文件；若日后用它改 status/qubit，index 条目会滞后（`list_sessions`/`get_session_episodes` 读实体不受影响） | ⬜ 已知 |
 | H3 | 单轮退化的种子消息仅前端内存 | 「以该任务为起点新建会话」的首轮内容不入后端 session，刷新后消失；此后 `round_index` 从 2 起而 rounds 计 1（语义固有，可接受） | ⏸ 接受现状 |
-| H4 | 42 个 `pytest-cache-files-*` 空目录删不掉 | 目录授权表只剩 SYSTEM/Administrators/特殊身份，当前用户 `MY_RIGHTS=[]`；ACL 诊断技能判定 NOT_THIS_CLASS（管辖外），git 不可见（空目录）。需要时请人工删除或切完全权限后清理 | ⬜ 待人工 |
+| H4 | ~~42 个 `pytest-cache-files-*` 空目录删不掉~~ | **已解决（2026-10-13）**：根因是 `Agentic Workflow` 等四层目录缺「完全控制」授权（同 memory 目录问题），`diagnose-windows-sandbox-acl` 修复授权链后 42/42 删除 | ✅ |
 | H5 | skill 文档与实际不符 | `brain-worker-team` skill 写的「subagent 有 model 字段」在本构建不成立（实测 spawn_teammate/subagent 均继承主模型）；唯一便宜路由是 `workflow.agent()` 的 model 覆盖。skill 文档待回写 | ⬜ 待改 |
 | H6 | L4 用户画像与 G1 收敛 | 分级记忆 L4 本期未接（导师 hermes 侧已有 MEMORY.md/USER.md 实现）；G1 三处收敛时一并决策 | ⬜ 见 G1 |

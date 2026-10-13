@@ -1359,3 +1359,19 @@ Browser → Express (:3002) → Python subprocess → Hermes AIAgent
   单轮退化种子消息仅前端内存；42 个 pytest-cache-files-* 空目录删不掉（目录授权表异常，ACL 技能判定 NOT_THIS_CLASS）
 - **待人工**：端到端验收需重启服务（约定 3）——当前全部服务未运行（0 监听）
 - **提交**：`feat(memory)` ×2 + `docs(memory)` ×1
+
+---
+## 2026-10-13  分级记忆端到端验收（全绿）+ 记忆目录权限修复
+- **范围**：fix / chore（用户授权启动服务验收）
+- **验收结果**：
+  1. **会话分组（F 验收核心判据）**：2 轮对话 = 1 会话 2 轮（`rounds=2`，不是 2 个单轮）；`roundIndex` 1→2 连续；回放 4 条消息（user/assistant ×2）
+  2. `/memory/stats` 带 lifecycle、`/memory/recall` 带 recall_meta（tiers/预算/截断）、`/memory/maintenance/forget` 经网关安全空转——全通过
+  3. 前端 :8081 HTTP 200；验收测试 episode 已归档清理（14→16→14，orphan 0）
+- **e2e 抓到并修掉两个问题**：
+  1. **Express 缺 `/api/agent/memory/maintenance/forget` 代理路由**（T7 工单 write_scope 不含 index.ts 的集成缝隙）→ Lead 3 行微调补上、重启网关复验通过
+  2. **`config/memory` 目录树对所有人不可写**（手工交付拷贝的权限残留：`memory`/`config`/`qmclaw-server`/`Agentic Workflow` 四层缺「完全控制」授权，
+     episode 落盘链断在索引写入 `[Errno 13]`）→ `diagnose-windows-sandbox-acl` 技能定点诊断 PRECONDITION → 补 4 条授权并验证
+     （备份/还原命令存 `D:\semester4\.acl-recovery\`）；对照探针确认**非受限可写、沙箱受限 token 仍受限** → 微服务改以非受限方式启动后落盘正常
+  3. 同一权限修复顺带解决 BACKLOG H4：42 个 pytest-cache-files-* 积灰目录 **42/42 删除**
+- **服务状态**：10 微服务（非受限）+ Express :3002 + Next.js :8081 全部运行中
+- **提交**：`fix(gateway)` + 本条记录
