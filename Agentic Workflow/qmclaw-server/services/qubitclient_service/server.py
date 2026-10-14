@@ -41,8 +41,6 @@ EXPERIMENT_FAMILIES = [
     {"id": "t1_fluctuations", "name": "T1 Fluctuations", "description": "T1 涨落"},
     {"id": "t2", "name": "T2", "description": "T2 退相干时间"},
     {"id": "s21", "name": "S21", "description": "传输测量 S21"},
-    {"id": "s21peak", "name": "S21 Peak", "description": "S21 峰值检测"},
-    {"id": "s21peakmulti", "name": "S21 Peak Multi", "description": "多 qubit S21 峰值"},
     {"id": "s21vflux", "name": "S21 vs Flux", "description": "S21 随磁通变化"},
     {"id": "spectrum", "name": "Spectrum", "description": "光谱测量"},
     {"id": "spectrum_2d", "name": "Spectrum 2D", "description": "二维光谱"},

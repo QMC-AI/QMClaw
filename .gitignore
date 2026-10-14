@@ -33,6 +33,11 @@ Agentic Workflow/qmclaw-server/config/qubitclient.json
 *.pem
 *.key
 
+# QubitClient / NNScope 服务配置：内含实验室内网地址与 API Key，禁止外传
+# 客户端是按「当前工作目录」找 qubitclient.json 的，所以任何目录下都可能出现同名文件。
+# 这条不带斜杠的规则会匹配任意层级，别删。
+qubitclient.json
+
 # Logs
 *.log
 npm-debug.log*
