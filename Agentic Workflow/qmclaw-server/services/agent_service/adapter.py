@@ -233,6 +233,21 @@ def setup_agent_tools(
 
         return get_actuation_flags("quantum_service")
 
+    def is_offline() -> bool:
+        """quantum_service 当前是否处于离线模式。
+
+        离线豁免口径与 quantum_service/server.py 的 `if self._is_offline_mode:
+        return self._execute_offline_simulation(...)` 对齐：离线模拟不碰硬件、
+        不受写闸门限制；真机在线仍严格受闸门约束。
+
+        仅在写闸门关闭、且 agent 侧工具即将拒绝时才会被调用（开销可忽略）。
+        任何查询失败都视为「非离线」，即退回改动前的严格闸门行为。
+        """
+        try:
+            return _get_data_source(quantum_service_url) == "offline"
+        except Exception:
+            return False
+
     def get_qubits() -> List[Dict[str, Any]]:
         """获取量子比特列表"""
         result = _http_call(f"{quantum_service_url}/qubits")
@@ -309,7 +324,9 @@ def setup_agent_tools(
     registry.register_tool(GetQubitsTool(get_qubits))
     registry.register_tool(GetQubitParamsTool(get_qubit_params, get_qubits))
     registry.register_tool(ListExperimentsTool(list_experiments))
-    registry.register_tool(RunCodeTool(execute_code, is_connected, actuation_flags))
+    registry.register_tool(RunCodeTool(
+        execute_code, is_connected, actuation_flags, is_offline=is_offline
+    ))
     # 注意 RunExperimentTool 的契约是：
     #   code_builder(name, params) -> 代码字符串
     #   executor(代码字符串) -> 执行结果
@@ -325,6 +342,7 @@ def setup_agent_tools(
         execute_code,
         is_connected=is_connected,
         actuation_flags=actuation_flags,
+        is_offline=is_offline,
     ))
     registry.register_tool(ListHistoryTool(list_history))
 

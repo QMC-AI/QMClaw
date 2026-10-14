@@ -38,16 +38,23 @@ class RunCodeTool(QuantumTool):
         executor: Callable[[str], Dict[str, Any]],
         is_connected: Callable[[], bool] = None,
         actuation_flags: Callable[[], Dict[str, bool]] = None,
+        is_offline: Optional[Callable[[], bool]] = None,
     ):
         """
         Args:
             executor: 代码执行函数，签名为 (code: str) -> Dict[str, Any]
             is_connected: 连接检查函数，签名为 () -> bool
             actuation_flags: 写闸门查询，签名为 () -> {"allow_execute": bool, ...}
+            is_offline: 离线模式查询，签名为 () -> bool。默认 False（按在线处理），
+                即不传该参数时写闸门行为与改动前完全一致。
         """
         self._executor = executor
         self._is_connected = is_connected or (lambda: True)
         self._actuation_flags = actuation_flags or (lambda: {"allow_execute": True, "allow_set_params": True})
+        # 离线豁免：与 quantum_service/server.py 的离线判定口径对齐
+        # （服务端先判 `if self._is_offline_mode: return self._execute_offline_simulation(...)`，
+        # 离线模拟不碰硬件、不受写闸门限制）。真机在线仍严格受闸门约束。
+        self._is_offline = is_offline or (lambda: False)
 
     @property
     def name(self) -> str:
@@ -85,7 +92,10 @@ Returns the experiment result or error message."""
 
     def execute(self, code: str, timeout: int = 300, **kwargs) -> ToolResult[Dict[str, Any]]:
         """执行代码"""
-        if not self._actuation_flags().get("allow_execute", True):
+        # 写闸门：仅在非离线时强制。离线模拟不碰硬件，与服务端
+        # quantum_service/server.py 的离线优先判定保持同一口径；
+        # 真机在线（_is_offline() 为 False）闸门文案/错误码/status 一字未改。
+        if not self._actuation_flags().get("allow_execute", True) and not self._is_offline():
             return ToolResult.err(
                 "当前为只读联调，禁止向真机下发实验",
                 error_code=ErrorCode.FORBIDDEN.value,
@@ -179,6 +189,7 @@ class RunExperimentTool(QuantumTool):
         schema_getter: Callable[[str], Optional[Dict[str, Any]]] = None,
         is_connected: Callable[[], bool] = None,
         actuation_flags: Callable[[], Dict[str, bool]] = None,
+        is_offline: Optional[Callable[[], bool]] = None,
     ):
         """
         Args:
@@ -187,12 +198,18 @@ class RunExperimentTool(QuantumTool):
             schema_getter: 实验 schema 获取函数，签名为 (name: str) -> Optional[Dict]
             is_connected: 连接检查函数，签名为 () -> bool
             actuation_flags: 写闸门查询，签名为 () -> {"allow_execute": bool, ...}
+            is_offline: 离线模式查询，签名为 () -> bool。默认 False（按在线处理），
+                即不传该参数时写闸门行为与改动前完全一致。
         """
         self._code_builder = code_builder
         self._executor = executor
         self._schema_getter = schema_getter
         self._is_connected = is_connected or (lambda: True)
         self._actuation_flags = actuation_flags or (lambda: {"allow_execute": True, "allow_set_params": True})
+        # 离线豁免：与 quantum_service/server.py 的离线判定口径对齐
+        # （服务端先判 `if self._is_offline_mode: return self._execute_offline_simulation(...)`，
+        # 离线模拟不碰硬件、不受写闸门限制）。真机在线仍严格受闸门约束。
+        self._is_offline = is_offline or (lambda: False)
 
     @property
     def name(self) -> str:
@@ -264,7 +281,7 @@ Returns experiment results including measured data and parameters."""
                 error_code=ErrorCode.VALIDATION_ERROR.value,
             )
 
-        if not self._actuation_flags().get("allow_execute", True):
+        if not self._actuation_flags().get("allow_execute", True) and not self._is_offline():
             return ToolResult.err(
                 "当前为只读联调，禁止向真机下发实验",
                 error_code=ErrorCode.FORBIDDEN.value,
