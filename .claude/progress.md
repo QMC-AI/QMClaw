@@ -1375,3 +1375,25 @@ Browser → Express (:3002) → Python subprocess → Hermes AIAgent
   3. 同一权限修复顺带解决 BACKLOG H4：42 个 pytest-cache-files-* 积灰目录 **42/42 删除**
 - **服务状态**：10 微服务（非受限）+ Express :3002 + Next.js :8081 全部运行中
 - **提交**：`fix(gateway)` + 本条记录
+
+---
+## 2026-10-14  Hermes 技能接线 + agent 图表修复（brain-worker-team 派单）
+- **范围**：feat / fix（分支 `feat/c-real-machine`）
+- **诊断方式**：两个用户报障 → 派 **4 个只读子代理**（每个问题各 1 静态链路 + 1 运行时实证），Lead 逐条复核关键代码行
+  1. **Hermes 技能**：Web 读 `<repo>/skills`（Express `getHermesSkillsDir()` / `data/skills` 联接），agent 读 `$HERMES_HOME/skills` = `data/hermes/skills`（**空目录**）→ 对话里 0 技能；`agent.log` 里 `skills_list completed (101 chars)`（= 空结果 JSON）
+  2. **agent 无图**：**断点①**（当轮）agent 侧写闸门在调用服务**之前**拦死（`execution.py:88/:267`），而服务端 `quantum_service/server.py:865` 明确豁免离线；**断点②**（回放）10-13 分级记忆的会话回放链路 `charts` **三层全缺**
+  3. **推翻 G7 假设**：`offline_data_lab.py` 重写**不是**原因——今天生成的 `temp_*.png` 与 09-23 参考图 **SHA256 逐字节相同**
+- **改动（7 个文件 + 4 个测试文件）**：
+  1. **A1** `scripts/setup_hermes_skills.py`（新，340 行）：幂等自举——把 `<repo>/skills` 写进 `$HERMES_HOME/config.yaml` 的 `skills.external_dirs`（vendor 原生机制，external 技能**只读**），并修复 `data/skills` 联接；不碰 vendor/上游
+  2. **A2** `scripts/start_all_services.py`（+59）：启动前调用自举，失败不阻断；`QMCLAW_BOOTSTRAP_ONLY=1` 可只跑自举；**Lead 微调**：不再打印 API Key 值（改 `(set)/(not set)`）
+  3. **B1** `quantum_tools/execution.py` + `agent_service/adapter.py`：两个工具加 `is_offline`（**默认 False 保真机安全**），adapter 用 `/health` 的 `data_source` 注入；**在线+闸门关仍 FORBIDDEN**
+  4. **B2** `agent_service/server.py` + `AgentChatPanel.tsx`：episode 用 `update_episode_fields` 补写 `charts`+`dataset_id`；回放 assistant 消息带 `charts`；前端 `sessionToMessages` 两分支映射
+  5. **B3** `agent_service/server.py`：`_experiment_outcome()` 纯函数 + `metrics.experiment_executed`/`blocked_reason`（**status 语义不变**）
+  6. 测试：新增 `tests/test_agent_offline_gate.py`(14) / `tests/test_agent_episode_charts.py`(9)；`tests/test_agent_sessions.py` 一处「metrics 精确等值」改**按键断言**（Lead 修，顺带覆盖新键）
+- **验证（Lead 亲跑，不信打手自述）**：
+  - pytest 全量 **82 passed / 0 failed / 0 skipped**；web `tsc --noEmit --incremental false` **EXIT=0**
+  - **live**：Hermes 对话 **12 秒列出全部 7 个技能**（含 description）；agent 离线跑 t1 → **`charts=1`（80KB PNG）** + `dataset_id=20251103_00398` + `metrics T1(µs)=8`，且**闸门仍关闭**（离线豁免生效）；回放 assistant `charts=1`、episode 落盘一致
+  - 自举脚本：真实路径 `no change` + `junction ok`（幂等）、短路模式 EXIT=0 且**不启动任何服务**
+- **新发现（已登记 BACKLOG I5，P1）**：**并发 `/execute` 使服务挂死**——19:56 两个并发离线实验服务端都跑完出图，但响应双双未回，此后 quantum `:3003` 与 hermes `:3012` 全无响应（TCP 可连、HTTP 无响应），重启后恢复；**与 B1（单线程 HTTPServer）不同源**
+- **施工方式**：brain-worker-team（Lead 拆单/侦察/对抗式审查/亲自 live 验收；打手为 deepseek-flash——本机 `settings.yaml` 缺失使 `subagent` 显式模型选择被禁用，靠「Lead=flash → 子代继承」达成，见 BACKLOG I6）
+- **提交**：`feat(hermes)` + `fix(agent)` ×2 + `docs`

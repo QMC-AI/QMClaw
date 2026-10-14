@@ -524,5 +524,22 @@ D1 / D2（有空再说）
 | H2 | `update_episode_fields` 不回写 index 摘要 | 只合并实体文件；若日后用它改 status/qubit，index 条目会滞后（`list_sessions`/`get_session_episodes` 读实体不受影响） | ⬜ 已知 |
 | H3 | 单轮退化的种子消息仅前端内存 | 「以该任务为起点新建会话」的首轮内容不入后端 session，刷新后消失；此后 `round_index` 从 2 起而 rounds 计 1（语义固有，可接受） | ⏸ 接受现状 |
 | H4 | ~~42 个 `pytest-cache-files-*` 空目录删不掉~~ | **已解决（2026-10-13）**：根因是 `Agentic Workflow` 等四层目录缺「完全控制」授权（同 memory 目录问题），`diagnose-windows-sandbox-acl` 修复授权链后 42/42 删除 | ✅ |
-| H5 | skill 文档与实际不符 | `brain-worker-team` skill 写的「subagent 有 model 字段」在本构建不成立（实测 spawn_teammate/subagent 均继承主模型）；唯一便宜路由是 `workflow.agent()` 的 model 覆盖。skill 文档待回写 | ⬜ 待改 |
+| H5 | skill 文档与环境 | `brain-worker-team` skill 已更正为「`subagent` 可显式传 `provider/model` 锁 flash；`spawn_teammate` 恒继承 Lead 模型」。**本机当前不可用**：`settings.yaml` 缺失（只剩 `settings.yaml.imported`）→ 报 `child model selection is disabled`（见 I6） | ✅ 文档已更正 |
 | H6 | L4 用户画像与 G1 收敛 | 分级记忆 L4 本期未接（导师 hermes 侧已有 MEMORY.md/USER.md 实现）；G1 三处收敛时一并决策 | ⬜ 见 G1 |
+
+---
+
+## I. Hermes 技能接线 + agent 图表修复（登记日期：2026-10-14）
+
+> 本组由 brain-worker-team 多智能体流程完成（Lead 拆单/侦察/对抗式审查，deepseek-flash 打手施工），
+> 诊断 → 修复 → **Lead 亲自 live 验收**。诊断阶段的只读报告见对应工单记录。
+
+| 编号 | 项 | 说明 | 状态 |
+|---|---|---|---|
+| I1 | **Hermes 技能随工程走** | 根因：Web 读 `<repo>/skills`（或 `data/skills` 联接），agent 读 `$HERMES_HOME/skills` = `data/hermes/skills`（**空**）→ 对话里列不出技能。修法：新增 `scripts/setup_hermes_skills.py`（幂等）把 `<repo>/skills` 写入 `$HERMES_HOME/config.yaml` 的 `skills.external_dirs`（**vendor 原生机制**，external 技能对 agent **只读**，仓库不被改脏），并确保 `data/skills` 联接；`scripts/start_all_services.py` 启动前自动调用（`QMCLAW_BOOTSTRAP_ONLY=1` 可只跑自举）。**不碰 vendor/上游文件**。实测：脚本幂等（`no change`）、Hermes 对话 **12 秒列出全部 7 个技能** | ✅ |
+| I2 | **agent 实验无图 · 断点①（当轮）** | 根因：agent 侧写闸门在调用服务**之前**拦死（`execution.py:88`/`:267`），而服务端 `quantum_service/server.py:865` 明确豁免离线 → 离线实验也跑不了 → `charts=[]`。修法：两个工具加 `is_offline`（**默认 False 保真机安全**），adapter 用 `/health` 的 `data_source` 注入；**在线+闸门关仍 FORBIDDEN**。实测：闸门仍关闭下离线 t1 跑通、`charts=1`（80KB PNG） | ✅ |
+| I3 | **agent 实验无图 · 断点②（回放）** | 根因：10-13 分级记忆的会话回放链路 `charts` **三层全缺**（episode 不落盘 / 回放不返回 / 前端不映射）→ 刷新或切会话后图消失。修法：episode 用 `update_episode_fields` 补写 `charts`+`dataset_id`；回放 assistant 消息带 `charts`；前端 `sessionToMessages` 两分支映射。实测：回放 assistant `charts=1`、episode 落盘一致 | ✅ |
+| I4 | **G7 真因修正** | 复核结论：`offline_data_lab.py` 重写**不是**这次「无图」的原因——今天生成的 `temp_*.png` 与 09-23 参考图 **SHA256 逐字节相同**，绘图链路（离线模拟 → `/plot/offline/v2` → `/plots/*.png`）实测全通。G7 的「肉眼比图」仍建议补一次人工确认 | ✅ 修正 |
+| I5 | **并发 `/execute` 导致服务挂死**（新发现，P1） | 19:56 两个并发离线实验**服务端都跑完并出图**（有时间戳为证），但 HTTP 响应双双未回客户端；此后 quantum `:3003` 与 hermes `:3012` 全部无响应（TCP 可连、HTTP 无响应），重启微服务后才恢复。与 B1（单线程 `HTTPServer`）**不同源**，疑 stdout 管道阻塞或线程/句柄耗尽。建议（约定 6：同类问题已出现两次以上）：给 `/execute` 加**请求级日志 + 耗时/超时监控**，并写可复现脚本 | ⬜ |
+| I6 | `settings.yaml` 被改名 → subagent 模型选择禁用 | `C:\Users\39045\.dsh\settings.yaml` 不存在，只剩 `settings.yaml.imported`（内容含 `subagent-model-selection.enabled: true`）→ `subagent` 传 `provider/model` 报 `child model selection is disabled for this tool instance`。本次靠「Lead=deepseek-flash → 子代继承」达成便宜打手。恢复：把 `.imported` 复制回 `settings.yaml`（**用户级配置，待人工确认**） | ⬜ |
+| I7 | ~~`start_all_services.py` 打印 API Key **值**~~ | **已修（2026-10-14）**：改为只打印 `(set)/(not set)`，密钥值不再进终端/日志 | ✅ |
