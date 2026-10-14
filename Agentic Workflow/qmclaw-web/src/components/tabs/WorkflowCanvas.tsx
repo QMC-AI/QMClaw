@@ -166,6 +166,19 @@ export default function WorkflowCanvas({ onLog }: Props) {
                 metrics: typedStatus.metrics,
                 error: typedStatus.error,
                 plotPath: typedStatus.plotPath,
+                // 透传完整结果字段（conversation / symptom / recommendations 等）
+                conversation: output.conversation ?? raw.conversation,
+                symptom: output.symptom ?? raw.symptom,
+                reasoning: output.reasoning ?? raw.reasoning,
+                recommendations: output.recommendations ?? raw.recommendations,
+                matchedRules: output.matchedRules ?? raw.matchedRules,
+                t1_us: (output as any).t1_us ?? (raw as any).t1_us,
+                decay_visible: (output as any).decay_visible ?? (raw as any).decay_visible,
+                description: (output as any).description ?? (raw as any).description,
+                qubit: (output as any).qubit ?? (raw as any).qubit,
+                dataset_id: (output as any).dataset_id ?? (raw as any).dataset_id,
+                experiment_type: (output as any).experiment_type ?? (raw as any).experiment_type,
+                dataset_name: (output as any).dataset_name ?? (raw as any).dataset_name,
               });
 
               // Log node progress to output panel with detailed info
