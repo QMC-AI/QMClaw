@@ -725,6 +725,7 @@ class AnalysisService(BaseService):
             plt.close('all')
 
             # 执行绘图命令
+            cmd_result = None
             try:
                 # 解析命令，提取参数
                 cmd_result = self._execute_plot_command(command, {
@@ -788,6 +789,9 @@ class AnalysisService(BaseService):
 
             _log(f"Offline v2 plot saved to {filepath}")
 
+            fit_metrics = {}
+            if isinstance(cmd_result, dict):
+                fit_metrics = cmd_result.get("metrics", {}) or {}
             return {
                 "success": True,
                 "image_url": image_url,
@@ -796,6 +800,7 @@ class AnalysisService(BaseService):
                 "dataset_name": ds_info.get("name", ""),
                 "qubit": ds_info.get("qubit", ""),
                 "experiment_type": ds_info.get("experiment_type", ""),
+                "fit_metrics": fit_metrics,
             }
 
         except Exception as e:

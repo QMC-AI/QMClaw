@@ -341,6 +341,54 @@ class OfflineQubitUpdater:
                 return result
             return None
 
+        # T1 实验类型：指数衰减拟合 A*exp(-t/T1)+c（最小二乘）
+        if exp_type == "t1":
+            from scipy.optimize import curve_fit
+            if data.ndim == 2 and data.shape[1] >= 2:
+                x = data[:, 0]
+                y = data[:, 1]
+            else:
+                x = np.arange(len(data.flatten()))
+                y = data.flatten()
+            fit_metrics = {}
+            try:
+                def _exp_decay(t, A, tau, c):
+                    return A * np.exp(-t / tau) + c
+                A0 = float(np.max(y) - np.min(y))
+                c0 = float(np.min(y))
+                tau0 = float((np.max(x) - np.min(x)) / 3.0)
+                popt, _ = curve_fit(_exp_decay, x, y, p0=[A0, tau0, c0], maxfev=20000)
+                A_fit, tau_fit, c_fit = [float(v) for v in popt]
+                if tau_fit > 0:
+                    if tau_fit > 1000:
+                        fit_metrics["T1_us"] = tau_fit / 1000.0
+                    else:
+                        fit_metrics["T1_us"] = tau_fit
+                    y_pred = _exp_decay(x, *popt)
+                    ss_res = float(np.sum((y - y_pred) ** 2))
+                    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+                    if ss_tot > 0:
+                        fit_metrics["R_squared"] = 1.0 - ss_res / ss_tot
+                    if do_plot:
+                        plt.close('all')
+                        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+                        ax.plot(x, y, 'b.-', markersize=3, label='Data')
+                        x_fit = np.linspace(float(np.min(x)), float(np.max(x)), 300)
+                        y_fit = A_fit * np.exp(-x_fit / tau_fit) + c_fit
+                        ax.plot(x_fit, y_fit, 'r--', linewidth=2,
+                                label=f'Fit: T1 = {fit_metrics["T1_us"]:.2f} us')
+                        ax.set_xlabel('Delay (ns)')
+                        ax.set_ylabel('Amplitude')
+                        ax.set_title(f"{info.get('qubit', 'Unknown')}: t1 ({info.get('date', '')})")
+                        ax.legend(fontsize=10)
+                        ax.grid(True, alpha=0.3)
+                        plt.tight_layout()
+            except Exception as e:
+                _log(f"T1 exponential fit failed: {e}")
+            if collect:
+                return {"success": True, "data_shape": data.shape, "metrics": fit_metrics}
+            return None
+
         # 其他实验类型：检查是否有对应的拟合函数
         if fit_func is None:
             fit_func = self._auto_detect_fit_func(exp_type, dataset_name)

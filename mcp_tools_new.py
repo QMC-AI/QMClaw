@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 新的 MCP 服务代码 — 参照 mcp_tools.py
-包含的实验不变（13 个 @mcp.tool），底层对接新的测控系统。
+包含的实验不变（13 个 @mcp.tool()），底层对接新的测控系统。
 
 区别于原版:
   - 原版: from qubitctrl import mcp  → from quark_mcp.tools import s21 → call_interface(...)
@@ -16,8 +16,8 @@
 import json
 import numpy as np
 
-from swiftmcp import FastMCP
-mcp = FastMCP('quantum-service')
+from mcp.server.mcpserver import MCPServer
+mcp = MCPServer('quantum-service')
 from new_ctrl.tools import (                # ← 你的新测控系统 (见下方 new_ctrl 目录)
     s21 as new_s21,
     rabi as new_rabi,
@@ -59,21 +59,21 @@ def convert_ndarray(obj):
 #  通用接口 (不依赖具体实验)
 # ═══════════════════════════════════════════════════════════════
 
-@mcp.tool
+@mcp.tool()
 def get_data(rid: int | str):
     """根据实验记录 ID (rid) 获取测量数据。"""
     data = get_data_by_rid(rid)
     return convert_ndarray(data)
 
 
-@mcp.tool
+@mcp.tool()
 def query_param(key: str):
     """查询指定 key 的参数值。"""
     value = query_new_param(key)
     return value
 
 
-@mcp.tool
+@mcp.tool()
 def update_param(key: str, value):
     """更新指定 key 的参数值。"""
     update_new_param(key, value)
@@ -81,11 +81,11 @@ def update_param(key: str, value):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  13 个实验任务 (@mcp.tool)
+#  13 个实验任务 (@mcp.tool())
 #  接口与原版 mcp_tools.py 完全一致，底层对接 new_ctrl
 # ═══════════════════════════════════════════════════════════════
 
-@mcp.tool
+@mcp.tool()
 def s21(
         qubits: list[str] = ['Q0', 'Q1'],
         frequency_center: float = 6.5,
@@ -113,7 +113,7 @@ def s21(
     return str(tid)  # 返回实验记录 ID（字符串）
 
 
-@mcp.tool
+@mcp.tool()
 def rabi(
         qubits: list[str] = ['Q0', 'Q1'],
         amp_start: float = 0,
@@ -135,7 +135,7 @@ def rabi(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def ramsey(
         qubits: list[str] = ['Q0', 'Q2'],
         delta: float = 20e6,
@@ -162,7 +162,7 @@ def ramsey(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def t1(
         qubits: list[str] = ['Q0', 'Q1'],
         delay_start: float = 0,
@@ -183,7 +183,7 @@ def t1(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def spectrum(
         qubits: list[str] = ['Q0', 'Q1'],
         freq_start: float = -3,
@@ -214,7 +214,7 @@ def spectrum(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def spectrum_2d(
         qubits: list[str] = ['Q0', 'Q1'],
         freq_start: float = -3,
@@ -246,7 +246,7 @@ def spectrum_2d(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def s21vsflux(
         qubits_scan: list[str] = ['Q0', 'Q1'],
         qubits_read: list[str] = None,
@@ -276,7 +276,7 @@ def s21vsflux(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def singleshot(
         qubits: list[str] = ['Q0', 'Q1'],
         stage: int = 1,
@@ -291,7 +291,7 @@ def singleshot(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def drag(
         qubits: list[str] = ['Q0', 'Q1'],
         lamb: list[float] = [-0.5, 0.5],
@@ -314,7 +314,7 @@ def drag(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def opt_pipulse(
         qubits: list[str] = ['Q0', 'Q1'],
         stage: int = 1,
@@ -339,7 +339,7 @@ def opt_pipulse(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def powershift(
         qubits: list[str] = ['Q0', 'Q1'],
         power_start: float = -40,
@@ -362,7 +362,7 @@ def powershift(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def delta(
         qubits: list[str] = ['Q0', 'Q1'],
         N_list: list[int] = [1, 5, 13],
@@ -387,7 +387,7 @@ def delta(
     return str(tid)
 
 
-@mcp.tool
+@mcp.tool()
 def rb(
         qubits: list[str],
         couplers: tuple = tuple([]),
@@ -435,5 +435,7 @@ if __name__ == "__main__":
         mcp.run(transport="stdio")
     else:
         port = int(os.environ.get("MCP_PORT", "8008"))
-        print(f"启动新的 MCP 服务 [streamable-http:{port}] ...")
-        mcp.run(transport=transport, port=port)
+        print(f"启动新的 MCP 服务 [{transport}:{port}] ...")
+        import uvicorn
+        app = mcp.streamable_http_app() if transport == "streamable-http" else mcp.sse_app()
+        uvicorn.run(app, host="127.0.0.1", port=port)

@@ -162,6 +162,8 @@ class WorkflowService(BaseService):
         self._quantum_service_url = "http://localhost:3003"
         self._analysis_service_url = "http://localhost:3004"
         self._llm_service_url = "http://localhost:3006"
+        self._image_service_url = "http://localhost:3007"
+        self._qubitclient_service_url = "http://localhost:3010"
 
         # 确保数据目录存在
         _ensure_data_dir()
@@ -227,7 +229,7 @@ class WorkflowService(BaseService):
             executor = self._executors.get(node.type)
             if not executor:
                 # 默认执行器：通过 HTTP 调用服务
-                result = self._execute_via_http(node)
+                result = self._execute_via_http(node, context)
             else:
                 result = executor(node, context)
 
@@ -248,7 +250,7 @@ class WorkflowService(BaseService):
             node.completed_at = time.time()
             return {"error": str(e)}
 
-    def _execute_via_http(self, node: WorkflowNode) -> Dict[str, Any]:
+    def _execute_via_http(self, node: WorkflowNode, context: Dict[str, Any] = None) -> Dict[str, Any]:
         """通过 HTTP 调用服务执行节点"""
         import urllib.request
         import urllib.error
@@ -258,10 +260,280 @@ class WorkflowService(BaseService):
 
         if node_type == "experiment":
             url = f"{self._quantum_service_url}/execute"
-            payload = {"code": config.get("code", "")}
-        elif node_type == "analysis":
-            url = f"{self._analysis_service_url}/analyze"
-            payload = {"type": config.get("analysis_type", "basic")}
+            # 由 fn + qubit + params 拼出可执行代码，并解析 {{变量}} 引用
+            fn = config.get("fn", "sq.iqraw")
+            qubit = str(config.get("qubit", "") or "")
+            ctx = context or {}
+            if qubit.startswith("{{") and qubit.endswith("}}") and len(qubit) > 4:
+                var_name = qubit[2:-2].strip()
+                qubit = str(ctx.get(var_name, ""))
+            params = config.get("params") or {}
+            arg_strs = []
+            if qubit:
+                arg_strs.append(qubit)
+            for k, v in params.items():
+                if isinstance(v, (dict, list, bool)) or v is None:
+                    arg_strs.append(f"{k}={json.dumps(v)}")
+                else:
+                    arg_strs.append(f"{k}={v!r}")
+            payload = {"code": f"{fn}({', '.join(arg_strs)})"}
+
+        elif node_type in ("analysis", "analyze"):
+            # Analyze 节点：用 qter.fitData 对上游实验数据做统计拟合
+            dataset_id = str(config.get("datasetId", "") or "")
+            if not dataset_id:
+                # 多级回溯：沿 depends 链向上找 dataset_id（支持 experiment -> image_analysis -> analyze 这类链路）
+                visited = set()
+                frontier = list(getattr(node, "depends", []) or [])
+                while frontier and not dataset_id:
+                    cur = frontier.pop(0)
+                    if cur in visited:
+                        continue
+                    visited.add(cur)
+                    cur_result = (context or {}).get(cur) or {}
+                    if isinstance(cur_result, dict) and cur_result.get("dataset_id"):
+                        dataset_id = str(cur_result["dataset_id"])
+                        break
+                    wf_obj = None
+                    try:
+                        wf_obj = self._workflows.get(getattr(workflow, "id", ""))
+                    except Exception:
+                        pass
+                    if wf_obj and wf_obj.nodes.get(cur):
+                        wf_node = wf_obj.nodes[cur]
+                        if getattr(wf_node, "depends", None):
+                            frontier.extend(wf_node.depends)
+            if not dataset_id:
+                return {"error": "dataset_id not found from upstream experiment", "status": "failed"}
+            command = str(config.get("command", "qter.fitData(do_plot=True)"))
+            fit_payload = {"dataset_id": dataset_id, "command": command}
+            fit_data = json.dumps(fit_payload).encode("utf-8")
+            fit_req = urllib.request.Request(
+                f"{self._analysis_service_url}/plot/offline/v2",
+                data=fit_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(fit_req, timeout=120) as resp:
+                    fit_result = json.loads(resp.read().decode("utf-8"))
+            except Exception as e:
+                return {"error": f"qter.fitData failed: {e}", "status": "failed"}
+            if not fit_result.get("success"):
+                return {"error": fit_result.get("error", "fitData failed"), "status": "failed"}
+            # 把拟合图 base64 存为文件，返回 plotPath（与 experiment 节点一致）
+            import base64 as _b64
+            plot_path = None
+            img_data_url = fit_result.get("image", "") or ""
+            if isinstance(img_data_url, str) and img_data_url.startswith("data:image/png;base64,"):
+                try:
+                    b64part = img_data_url.split(",", 1)[1]
+                    web_public = Path(__file__).parent.parent.parent.parent / "qmclaw-web" / "public"
+                    plots_dir = web_public / "plots"
+                    plots_dir.mkdir(parents=True, exist_ok=True)
+                    fname = f"analyze_{int(time.time()*1000)}.png"
+                    with open(plots_dir / fname, "wb") as _fh:
+                        _fh.write(_b64.b64decode(b64part))
+                    plot_path = f"/plots/{fname}"
+                except Exception as _se:
+                    _log(f"[analyze] save fit image failed: {_se}")
+            fit_metrics = fit_result.get("fit_metrics", {}) or {}
+            t1_us = fit_metrics.get("T1_us")
+            r2 = fit_metrics.get("R_squared")
+            metrics_out = {
+                "dataset_id": dataset_id,
+                "qubit": fit_result.get("qubit", ""),
+                "experiment_type": fit_result.get("experiment_type", ""),
+            }
+            if t1_us is not None:
+                metrics_out["T1_us"] = t1_us
+            if r2 is not None:
+                metrics_out["R_squared"] = r2
+            stdout_lines = [
+                f"[ANALYZE] qter.fitData on {dataset_id}",
+                f"Qubit: {fit_result.get('qubit', '')}",
+                f"Experiment: {fit_result.get('experiment_type', '')}",
+                f"Dataset: {fit_result.get('dataset_name', '')}",
+            ]
+            if t1_us is not None:
+                stdout_lines.append(f"T1 = {t1_us:.2f} us")
+            if r2 is not None:
+                stdout_lines.append(f"R^2 = {r2:.4f}")
+            return {
+                "status": "completed",
+                "plotPath": plot_path,
+                "dataset_id": dataset_id,
+                "qubit": fit_result.get("qubit", ""),
+                "experiment_type": fit_result.get("experiment_type", ""),
+                "dataset_name": fit_result.get("dataset_name", ""),
+                "metrics": metrics_out,
+                "stdout": "\n".join(stdout_lines),
+            }
+        elif node_type == "decision":
+            # LLM Decision 节点：收集上游实验结果 → 调 Ising 校准 LLM → 推断下一步实验
+            ctx = context or {}
+            dep_ids = getattr(node, "depends", []) or []
+            summary_lines = []
+            for dep_id in dep_ids:
+                dep_result = ctx.get(dep_id) or {}
+                if not isinstance(dep_result, dict):
+                    continue
+                tag = dep_id
+                if dep_result.get("qubit"):
+                    summary_lines.append(f"[{tag}] qubit={dep_result.get('qubit')}")
+                if dep_result.get("experiment_type") or dep_result.get("exp_type"):
+                    summary_lines.append(f"[{tag}] experiment={dep_result.get('experiment_type') or dep_result.get('exp_type')}")
+                if dep_result.get("dataset_id"):
+                    summary_lines.append(f"[{tag}] dataset_id={dep_result.get('dataset_id')}")
+                m = dep_result.get("metrics") or {}
+                if isinstance(m, dict):
+                    for k in ("T1_us", "R_squared", "t1_us", "SNR", "F0", "F1", "pi_amp", "separation", "decay_visible", "confidence"):
+                        if m.get(k) is not None:
+                            summary_lines.append(f"[{tag}] {k}={m.get(k)}")
+                if dep_result.get("symptom"):
+                    summary_lines.append(f"[{tag}] symptom={dep_result.get('symptom')}")
+                if dep_result.get("description"):
+                    summary_lines.append(f"[{tag}] description={str(dep_result.get('description'))[:300]}")
+                if dep_result.get("stdout"):
+                    summary_lines.append(f"[{tag}] stdout={str(dep_result.get('stdout'))[:400]}")
+            if not summary_lines:
+                return {"error": "decision node requires upstream experiment/analysis results", "status": "failed"}
+            experiment_summary = "\n".join(summary_lines)
+
+            # 读取 Ising 校准模型配置（config/qubitclient.json 的 llm_decision 字段）
+            qcfg = {}
+            qcfg_path = Path(__file__).parent.parent.parent / "config" / "qubitclient.json"
+            if qcfg_path.exists():
+                try:
+                    with open(qcfg_path, "r", encoding="utf-8") as _f:
+                        qcfg = json.load(_f)
+                except Exception as _ce:
+                    _log(f"[decision] load config failed: {_ce}")
+            ld = qcfg.get("llm_decision") or {}
+            api_key = ld.get("api_key", "")
+            base_url = ld.get("base_url", "")
+            model = ld.get("model", "")
+            if not api_key or not base_url:
+                return {"error": "llm_decision not configured in qubitclient.json", "status": "failed"}
+
+            mode = str(config.get("mode", "analysis"))
+            intent_prompt = str(config.get("intentPrompt", "") or "")
+            system_prompt = str(config.get("systemPrompt", "") or "")
+            temperature = float(config.get("temperature", 0.3) or 0.3)
+            max_tokens = int(config.get("maxTokens", 1200) or 1200)
+
+            if not system_prompt:
+                system_prompt = (
+                    "You are an expert quantum calibration assistant for superconducting qubits. "
+                    "Given the latest experiment results, diagnose the qubit state and decide the NEXT experiment to run. "
+                    "Supported experiment functions: sq.t1, sq.ramsey, sq.ramsey_df, sq.iqraw, sq.s21, sq.s21_dis, "
+                    "sq.spectroscopy, sq.pulsed_spec, sq.piamp, sq.xeb, sq.allxy, sq.single_shot, sq.swap, sq.drag_calibrate. "
+                    "Respond ONLY with JSON: "
+                    '{"symptom": "<short diagnosis>", "reasoning": "<why>", "recommendations": [{"fn": "sq.xxx", "reason": "<why this experiment>", "params": {}}]} '
+                    "Give 1-3 recommendations ordered by priority."
+                )
+            if mode == "intent":
+                user_content = (
+                    f"User intent: {intent_prompt}\n\n"
+                    f"Current experiment context:\n{experiment_summary}\n\n"
+                    "Decide the next experiments to fulfill the user intent."
+                )
+            else:
+                user_content = (
+                    f"Latest experiment results:\n{experiment_summary}\n\n"
+                    "Diagnose the qubit state and recommend the next experiment(s) to run."
+                )
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ]
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            req = urllib.request.Request(
+                base_url.rstrip("/") + "/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer " + api_key},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+            except Exception as e:
+                return {"error": f"decision LLM call failed: {e}", "status": "failed"}
+            try:
+                content = raw["choices"][0]["message"]["content"]
+            except Exception:
+                return {"error": "decision LLM returned no content", "status": "failed", "raw": raw}
+
+            # 解析 JSON（模型可能带 markdown 围栏或多余文字）
+            import re as _re
+            symptom = ""
+            reasoning = ""
+            recommendations = []
+            json_str = content.strip()
+            m_fence = _re.search(r"```(?:json)?\s*([\s\S]*?)```", json_str)
+            if m_fence:
+                json_str = m_fence.group(1).strip()
+            try:
+                parsed = json.loads(json_str)
+            except Exception:
+                try:
+                    start = json_str.find("{")
+                    end = json_str.rfind("}")
+                    if start != -1 and end > start:
+                        parsed = json.loads(json_str[start:end + 1])
+                    else:
+                        parsed = {}
+                except Exception:
+                    parsed = {}
+            if isinstance(parsed, dict):
+                symptom = str(parsed.get("symptom", "") or "")
+                reasoning = str(parsed.get("reasoning", "") or "")
+                recs = parsed.get("recommendations") or []
+                if isinstance(recs, list):
+                    for rec in recs:
+                        if isinstance(rec, dict) and rec.get("fn"):
+                            recommendations.append({
+                                "fn": str(rec.get("fn")),
+                                "reason": str(rec.get("reason", "") or ""),
+                                "params": rec.get("params") or {},
+                            })
+            if not recommendations:
+                # fallback：把原文当 reasoning
+                reasoning = content
+
+            stdout_lines = [
+                f"[DECISION] model={model}",
+                f"Mode: {mode}",
+                f"Symptom: {symptom}" if symptom else "[DECISION] no symptom parsed",
+                f"Recommendations: {len(recommendations)}",
+            ]
+            for i, rec in enumerate(recommendations):
+                stdout_lines.append(f"  {i+1}. {rec['fn']} - {rec['reason']}")
+
+            conversation = {
+                "model": model,
+                "symptom": symptom,
+                "reasoning": reasoning,
+                "recommendations": recommendations,
+                "matchedRules": [],
+            }
+            return {
+                "status": "completed",
+                "conversation": conversation,
+                "symptom": symptom,
+                "reasoning": reasoning,
+                "recommendations": recommendations,
+                "model": model,
+                "metrics": {"recommendation_count": len(recommendations)},
+                "stdout": "\n".join(stdout_lines),
+            }
+
         elif node_type == "llm":
             url = f"{self._llm_service_url}/chat"
             payload = {
@@ -269,6 +541,156 @@ class WorkflowService(BaseService):
                 "model": config.get("model", "minimax"),
                 "temperature": config.get("temperature", 0.7),
             }
+        elif node_type == "image_classification":
+            # 图像分类：优先用配置 imagePath；否则取依赖节点结果中的 plotPath
+            image_path = str(config.get("imagePath", "") or "")
+            if not image_path:
+                for dep_id in getattr(node, "depends", []) or []:
+                    dep_result = (context or {}).get(dep_id) or {}
+                    plot_path = dep_result.get("plotPath")
+                    if plot_path:
+                        plot_path = str(plot_path)
+                        if plot_path.startswith("/plots/"):
+                            web_public = Path(__file__).parent.parent.parent.parent / "qmclaw-web" / "public"
+                            image_path = str(web_public / plot_path.lstrip("/"))
+                        else:
+                            image_path = plot_path
+                        break
+            threshold = float(config.get("reviewThreshold", 0.75) or 0.75)
+            payload = {"imagePath": image_path, "threshold": threshold}
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self._image_service_url}/classify/single",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as response:
+                    raw = json.loads(response.read().decode("utf-8"))
+            except Exception as e:
+                return {"error": f"image classification failed: {e}"}
+            if "error" in raw:
+                return {"error": raw["error"], "status": "failed"}
+            cls_name = str(raw.get("class", "unknown"))
+            conf = float(raw.get("confidence", 0.0))
+            probs = raw.get("probabilities", {}) or {}
+            p0 = float(probs.get("bad", 0.0))
+            p1 = float(probs.get("good", 0.0))
+            label = "class_1" if cls_name == "good" else ("class_0" if cls_name == "bad" else cls_name)
+            need_review = bool(raw.get("needs_review", False))
+            metrics = {
+                "label": label,
+                "confidence": conf,
+                "margin": abs(p1 - p0),
+                "needReview": need_review,
+            }
+            return {
+                "status": "completed",
+                "class": cls_name,
+                "label": label,
+                "confidence": conf,
+                "margin": abs(p1 - p0),
+                "needReview": need_review,
+                "needs_review": need_review,
+                "probabilities": probs,
+                "imagePath": image_path,
+                "metrics": metrics,
+                "stdout": (
+                    f"[IMAGE CLASSIFICATION] {image_path}\n"
+                    f"Class: {cls_name} (label={label})\n"
+                    f"Confidence: {conf:.3f}\n"
+                    f"Margin: {abs(p1 - p0):.3f}\n"
+                    f"Need review: {need_review}"
+                ),
+            }
+
+        elif node_type == "image_analysis":
+            # 图像分析(VLM)：取上游实验 plot，转 base64 调 qubitclient 提取参数+描述
+            image_path = str(config.get("imagePath", "") or "")
+            if not image_path:
+                for dep_id in getattr(node, "depends", []) or []:
+                    dep_result = (context or {}).get(dep_id) or {}
+                    plot_path = dep_result.get("plotPath")
+                    if plot_path:
+                        plot_path = str(plot_path)
+                        if plot_path.startswith("/plots/"):
+                            web_public = Path(__file__).parent.parent.parent.parent / "qmclaw-web" / "public"
+                            image_path = str(web_public / plot_path.lstrip("/"))
+                        else:
+                            image_path = plot_path
+                        break
+            if not image_path or not Path(image_path).exists():
+                return {"error": f"imagePath not found: {image_path}", "status": "failed"}
+            import base64 as _b64
+            try:
+                with open(image_path, "rb") as fh:
+                    b64img = _b64.b64encode(fh.read()).decode("utf-8")
+            except Exception as e:
+                return {"error": f"failed to read image: {e}", "status": "failed"}
+            family = str(config.get("experimentFamily", config.get("family", "t1")) or "t1")
+            vlm_payload = {"image": f"data:image/png;base64,{b64img}", "experiment_family": family, "language": "zh"}
+            vlm_data = json.dumps(vlm_payload).encode("utf-8")
+
+            def _post_vlm(path):
+                req = urllib.request.Request(
+                    f"{self._qubitclient_service_url}{path}",
+                    data=vlm_data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+
+            params, desc = {}, {}
+            try:
+                params = (_post_vlm("/extract_params") or {}).get("result", {}) or {}
+            except Exception as e:
+                params = {"error": str(e)}
+            try:
+                desc = (_post_vlm("/describe") or {}).get("result", {}) or {}
+            except Exception as e:
+                desc = {"error": str(e)}
+
+            t1_us = params.get("T1_us")
+            features = desc.get("main_features", "") if isinstance(desc, dict) else ""
+            # 透传上游实验的 dataset_id（便于 analyze 节点衔接）
+            up_dataset_id = ""
+            for dep_id in getattr(node, "depends", []) or []:
+                dep_result = (context or {}).get(dep_id) or {}
+                if isinstance(dep_result, dict) and dep_result.get("dataset_id"):
+                    up_dataset_id = str(dep_result["dataset_id"])
+                    break
+            metrics = {
+                "t1_us": t1_us,
+                "decay_visible": params.get("decay_visible") if isinstance(params, dict) else None,
+                "plot_type": desc.get("plot_type") if isinstance(desc, dict) else None,
+            }
+            stdout_lines = [
+                f"[IMAGE ANALYSIS] {image_path}",
+                f"Experiment family: {family}",
+            ]
+            if up_dataset_id:
+                stdout_lines.append(f"Dataset: {up_dataset_id}")
+            if t1_us is not None:
+                stdout_lines.append(f"T1 = {t1_us} us")
+            if isinstance(params, dict) and params.get("decay_visible") is not None:
+                stdout_lines.append(f"Decay visible: {params.get('decay_visible')}")
+            if features:
+                stdout_lines.append(f"Description: {features}")
+            return {
+                "status": "completed",
+                "t1_us": t1_us,
+                "decay_visible": params.get("decay_visible") if isinstance(params, dict) else None,
+                "description": features,
+                "raw_params": params,
+                "raw_description": desc,
+                "imagePath": image_path,
+                "dataset_id": up_dataset_id,
+                "metrics": metrics,
+                "stdout": "\n".join(stdout_lines),
+            }
+
         else:
             return {"error": f"Unknown node type: {node_type}"}
 
@@ -472,7 +894,7 @@ class WorkflowService(BaseService):
                     break
 
             # 检查工作流是否完成
-            if workflow.status == NodeStatus.PENDING:
+            if workflow.status in (NodeStatus.PENDING, NodeStatus.RUNNING):
                 all_completed = all(
                     node.status in (NodeStatus.COMPLETED, NodeStatus.CANCELLED)
                     for node in workflow.nodes.values()

@@ -359,8 +359,36 @@ export function createServiceProxy() {
   });
 
   proxy.post('/workflow/run', async (req, res) => {
-    const result = await proxyToService('workflow', '/workflows/run', 'POST', req.body, 300000);
-    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+    const body = req.body || {};
+    let workflowId = body.workflow_id || body.workflowId;
+    // 前端直接提交 nodes（无 workflow_id）时，先自动创建工作流再运行
+    if (!workflowId && Array.isArray(body.nodes)) {
+      const created = await proxyToService('workflow', '/workflows/create', 'POST', {
+        name: body.name || 'Untitled Workflow',
+        nodes: body.nodes,
+      });
+      if (!created.ok || !created.data?.workflow_id) {
+        res.status(502).json(created.data ?? { error: created.error || 'Failed to create workflow' });
+        return;
+      }
+      workflowId = created.data.workflow_id;
+    }
+    if (!workflowId) {
+      res.status(400).json({ error: 'workflow_id is required' });
+      return;
+    }
+    const result = await proxyToService('workflow', '/workflows/run', 'POST', {
+      workflow_id: workflowId,
+      context: body.context || {},
+    }, 300000);
+    // 前端读取 workflowId（驼峰），后端返回 workflow_id（下划线）——补上驼峰字段
+    if (result.ok) {
+      const data: any = result.data || {};
+      if (data.workflow_id && !data.workflowId) data.workflowId = data.workflow_id;
+      res.status(200).json(data);
+    } else {
+      res.status(502).json(result.data ?? { error: result.error });
+    }
   });
 
   proxy.post('/workflow/status', async (req, res) => {
