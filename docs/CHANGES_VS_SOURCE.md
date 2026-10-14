@@ -1,0 +1,347 @@
+# 相对源代码的改动与已实现功能
+
+> **基线**：`f2d83b5`（Merge pull request #2 from Secsix/main）—— 本次工作开始前的仓库状态
+> **范围**：`f2d83b5..HEAD`
+> **本文档回答两个问题**：改了源代码的什么、现在能实现什么
+>
+> **给导师的摘要版**（进度 + 待确认问题）见 `docs/导师对齐-进度与待确认.md`。
+>
+> **后续工作**：本文记录的改动全部围绕**离线模式**。
+> **所有尚未完成的待办（含数据正确性、真机接通、新功能）统一登记在 `docs/BACKLOG.md`** —— 那是唯一入口。
+> 从离线切到**远程真机调控**的完整设计见 `docs/REAL_MACHINE_PLAN.md`；
+> 本文第五节 L4 局限会在接通在线后自然消解。真机接通（只读联调）见 `docs/REAL_MACHINE.md`。
+
+---
+
+## 一、现在能实现什么
+
+一条主链路被打通了：**在 agent 页面用自然语言下指令 → 自动执行实验 → 返回可读结果与图表**。
+
+| 能力 | 状态 | 说明 |
+|------|------|------|
+| 自然语言驱动实验 | ✅ | 「对 q10lu12 运行 t1 实验」→ 自动选工具、执行、回填结果 |
+| 真实离线历史数据 | ✅ | 有历史数据的 qubit 走真实数据；没有的走合成并**明确标注** |
+| 图表生成与访问 | ✅ | 前端在聊天气泡里渲染；有真实数据集时与 experiments 页出的图**逐字节相同** |
+| 长期记忆 | ✅ | 每轮对话落 episode，`/memory/*` 8 个端点可用 |
+| 多轮会话串联 | ✅ | 同一 `sessionId` 下 `roundIndex` 递增 |
+| 模型切换 | ✅ | 10 个模型配置；agent 与 hermes 两侧接口一致 |
+| 运行模式 | ✅ | 离线优先，无需 LabRAD 即可跑通全链路 |
+
+### 实测两个场景
+
+**场景 1 —— `对 q10lu12 运行 t1 实验`**
+该 qubit 在离线库中只有 `s21` + `s21power2d`，**没有 T1 数据**：
+
+```
+success=True  iterations=2  steps=2  charts=1
+```
+
+正确降级到合成数据，并在响应里带免责声明。
+
+**场景 2 —— `对 q10lu8 运行 t1 实验`**
+该 qubit 有真实 T1 数据（`data/offline_data/20251103.dir/00398 - q10lu8%c T1.hdf5`）：
+
+```
+success=True  iterations=2  steps=1  results={"T1 (µs)": 8}  charts=1
+```
+
+无合成警告，走的是真实数据路径。
+
+---
+
+## 二、改动前的问题（源代码的实际状态）
+
+五个各自独立、但都指向"链路跑不通"的缺陷：
+
+1. **工具从不执行**
+   agent 的 ReAct 循环解析文本 `Action: tool(args)` 协议，但 system prompt 从未教过这个格式。模型输出的是它原生的工具调用标记（`｜DSML｜`），解析不到就被当成最终答案直接返回（实测 `iterations=1`）。工具注册表存在但形同虚设。
+
+2. **`RunExperimentTool` 注册错误**
+   它的契约是 `code_builder(name, params) -> 代码字符串`，而旧实现传入的 `run_experiment` 返回结果 dict，于是 executor 把 dict 当代码 POST 出去，服务端 `code[:100]` 抛 `unhashable type: 'slice'`（HTTP 500）。
+
+3. **真实离线数据从未被解析**
+   即使 qubit 有历史数据也一律走合成路径（stdout 里永远是 `No matching historical data found`）。根因是两处独立缺陷：加载器没拆复合 dtype、扫描轴单位差 1e9。
+
+4. **前端契约字段一个都没返回**
+   `AgentChatPanel` 期望 `steps` / `results` / `charts`，后端一个都不给 —— 步骤区和结果卡片永不渲染。
+
+5. **memory 功能在两个模式下都从未跑通**
+   前端 `MemoryPanel` 和 Express 的 `/api/agent/memory/*` 代理都在，但 agent_service 没有任何 `/memory/*` 路由（实测返回 502 Unknown path）。
+
+---
+
+## 三、改动清单
+
+### 1. agent 工具循环：改用原生 function calling
+
+**提交**：`edf528c` `b016df1`
+**文件**：`services/llm_service/server.py`（+95/−13）、`services/agent_service/server.py`（+540）、`services/agent_service/adapter.py`、`services/common/quantum_tools/execution.py`
+
+**llm_service —— 打通 tools 透传**
+
+- `_handle_chat` 接受并透传 `tools` / `tool_choice`；**不带 tools 时行为完全不变**（向后兼容）
+- `_call_deepseek` / `_call_openai` 在 tools 非空时写入 payload（两者同为 OpenAI 兼容形状）
+- `_call_minimax` 不支持工具调用，带 tools 时记 warning 后继续，不报错
+- 新增 `_normalize_tool_calls`：把 API 返回的 `tool_calls` 归一化成 `[{id, name, arguments(dict), arguments_raw}]`。`arguments` 是 JSON 字符串需解析，解析失败保留原始串并标 `parse_error`
+- 响应新增 `tool_calls` / `finish_reason` / `assistant_message` —— 后者供上层原样回灌，因为原生协议要求 assistant 的 `tool_calls` 消息与其后的 `role="tool"` 消息**成对出现**
+
+**agent_service —— 重写推理循环**
+
+- `_react_reason` 重写为原生循环：`registry.get_definitions()` 作为 tools 传给模型 → 读 `tool_calls` → `registry.execute` → 结果以 `role="tool"` 回灌 → 直到模型不再调用工具
+- 删除文本 `Action:` 解析分支（含 eval 参数解析）
+- 新增 `_compact_for_llm`：曲线数组只留点数，避免把 100 个数据点塞进 LLM 上下文
+- 新增 `_summarize_tool_result`：按类型分派 —— `get_qubits` 返回 **list**、实验类返回 **dict**，不判类型会直接抛异常
+- system prompt 重写：工具参数由 schema 携带，prompt 只补行为约束
+
+**前端契约补齐**（原先一个字段都没返回）
+
+- `steps`: `[{tool, input, observation}]`
+- `results`: `Record<string, number>`，**做单位换算** —— 前端用 `v.toFixed(4)` 渲染，T1 = 5.56e-5 秒会被显示成 `0.0001`，故换算为 µs / GHz
+- `charts`: 绘图路径，由前端 `public/` 静态提供
+- 合成数据时**强制**在 response 前加免责提示，不依赖模型自觉
+
+**adapter**
+
+- 修复 `RunExperimentTool` 注册：改传 `build_experiment_code`
+- 新增 `build_experiment_code`：按 `config/experiment_configs.json` 的 `defaultCommand` 模板生成代码。旧实现拼成 `sq.t1(target='q10lu12')`，而权威约定是 `sq.t1(q10lu12, do_plot=True)` —— **qubit 必须是位置参数**，否则离线模拟器的解析正则会把整串当 qubit 名；同时修正函数名映射（ramsey 实际是 `sq.ramsey_df`）
+- `_http_call` 的 HTTPError 分支带上响应体，否则 500 的真实原因全被丢掉
+- 删除已成死代码的 `run_experiment`
+
+**quantum_tools/execution.py**
+
+- 成功判定接受 `offline_simulated`（离线跑通却被报成 failed）
+- 结果字段映射：离线返回的是 `data` / `metrics` / `plotPath`，而不是 `result`
+
+---
+
+### 2. 离线数据链路：真实历史数据首次可用
+
+**提交**：`07ceb0d`
+**文件**：`services/common/offline_data_provider.py`、`services/quantum_service/offline_simulator.py`、`services/quantum_service/server.py`
+
+**(1) 加载器拆复合列**
+
+本仓库所有离线 HDF5 的根下只有 `DataVault`，是一个**复合 dtype 的 1 维数组**：
+
+```
+f0  = 扫描轴（t1/ramsey 是 ns，s21/spectroscopy 是 GHz）
+f1.. = 测量列
+```
+
+旧代码先命中 `ndim == 1` 分支，把整块复合数组塞进 `data['x']`，模拟器找不到 y。改为优先识别 `arr.dtype.names` 并拆列：`x = f0`、`y = f1`、其余进 `series`。
+
+**(2) 扫描轴单位归一化**
+
+历史数据用 ns / GHz，而模拟器的合成路径用 SI，两者相差 1e9 量级。新增 `X_UNIT_SCALE` 换算表与 `_load_data`，在**计算 metrics / 生成 stdout 之前**完成换算 —— 否则 stdout 会留下未换算的原始值（T1 报成 8000）而 metrics 已是换算值，两者自相矛盾。
+
+| 实验族 | 系数 |
+|--------|------|
+| `t1` / `ramsey` / `ramsey_df` / `spinechocpmg` | `1e-9` |
+| `s21` / `s21_dis` / `s21power2d` / `s21zpa2d` / `spectroscopy` / `spectroscopyauto` | `1e9` |
+| `iqraw` / `piamp*` / `xeb` 等序号或无量纲量 | 不换算 |
+
+**(3) 顺带修 JSON 序列化崩溃**
+
+`_generate_plot_data` 把 numpy 数组直接放进 `x`/`y`（合成路径用了 `tolist`，真实路径没有），导致 `json.dumps` 抛 `Object of type ndarray is not JSON serializable`，响应退化成 500。改为源头 `tolist`，另加 `quantum_service._json_safe` 做兜底递归转换。
+
+---
+
+### 3. memory 长期记忆：从 502 到完整可用
+
+**提交**：`73b257b`
+**文件**：`services/common/memory_store.py`（新增，425 行）、`services/common/reflection_engine.py`（新增，556 行）、`services/agent_service/server.py`
+
+**存储层**
+
+- `memory_store.py` 由 `scripts/memory_store.py` 移植，**磁盘格式完全不变**（两种模式的数据可互读）
+- 路径改为按服务根解析 —— 原实现写的是 `dirname(__file__)/../config`，那是站在 `scripts/` 下的正确写法，搬到 `services/common/` 后会解析成 `services/config`（错的）
+- `reflection_engine.py` 同步移植，导入改为包内相对导入并保留脚本回退
+- `get_memory_stats` / `list_skills` 统一为"文件真实存在"口径，修复"stats 说有 N 条、list 却一条都列不出来"的不一致；索引里文件缺失的历史残留用 `orphanCount` 透明暴露
+
+**接口**
+
+- agent_service 新增 `/memory/{episodes,skills,stats,recall,reflect}` 共 8 个端点
+- `handle_request` 增加前缀路由，以支持 `/memory/episodes/{id}` 这类路径参数
+
+**记录每一轮对话**
+
+- `AgentTask` 增加 `steps` 字段；`_react_reason` 每轮记录 `{iteration, assistant, action, observation}`
+- `_handle_chat` 完成后落一条 episode，并回填 `sessionId` / `roundIndex` / `model` / `response`（原 schema 没有这几个字段，无法把多轮串成一次会话）
+- 写盘失败不影响对话返回；失败的一轮同样记入，以便前端看到失败案例
+
+---
+
+### 4. hermes 模型接口对齐 + `/chat` 挂死修复
+
+**提交**：`9985eba`
+**文件**：`services/hermes_service/server.py`、`services/llm_service/server.py`、`src/index.ts`、`qmclaw-web/src/components/HermesChatPanel.tsx`、`config/model_configs.json`
+
+**模型接口不一致的三处**（此前靠"id 恰好等于 modelId"侥幸工作，换任何别的模型就错位）
+
+| 问题 | 修法 |
+|------|------|
+| `/api/hermes/models` 是 Express 内联读 `model_configs.json` 的**另一套实现**，且把 id 映射成 `m.modelId` | 改为复用与 `/api/models` 相同的 `listModels()` |
+| hermes_service 只匹配 `modelId`/`name`，而前端传的是条目的 `id` | 抽出 `_resolve_model_config()`，优先级改为 `id -> modelId -> name`，两处调用点统一 |
+| `HermesChatPanel` 硬编码默认值 `minimax/MiniMax-M2.7` 在配置里根本不存在 | 改为复用与 `AgentChatPanel` 同一个 `useModelStore`，取第一个 enabled 的 text 模型；删掉会把不存在模型塞进下拉框的硬编码兜底列表 |
+
+**修复 hermes `/chat` 挂死**（>300s 无响应且无日志）
+
+根因是 `HERMES_HOME` 默认指向 `%LOCALAPPDATA%\hermes`，在受限环境下不可写，`AIAgent` 卡死在 `run_conversation`。已在 `.env` 显式指向项目内 `data/hermes`，实测 **8.3s** 正常返回。
+
+**其他**
+
+- `_call_deepseek` 现在真正使用传入的 `model`（原来硬编码 `deepseek-chat`，上层选什么都无效）
+- 未知 model 回退到"已配置 key 的 provider"，而不是硬走 MiniMax
+- 去掉三行会**完整打印 API Key** 的调试日志，改为只报长度
+- `config/model_configs.json` 新增 `deepseek-flash` 条目
+
+---
+
+### 5. 本机运行接线
+
+**提交**：`0635fa0`
+**文件**：`config/session.json`、`requirements.txt` ×3、`run-dev.cmd` ×2、`scripts/start_all_services.py`、`analysis_service/server.py`、`qca_service/server.py`、`qca_service/tools/lab_tool.py`、`quantum_service/labrad_client.py`、`qubitclient_service/server.py`、`offline_data_provider.py`、`test_offline.py`、`test_load_qubits.py`
+
+- `session.json` 指向本机实测可用的 `test/20260324`
+- **`start_all_services.py` 显式把 stdout/stderr 切到 UTF-8** —— 脚本会打印 ✅/⏳/⚠️，而 Windows 控制台/管道默认是 GBK，会抛 `UnicodeEncodeError` 并让整个启动流程异常退出，**连带杀掉已经起来的子服务**（表现为"服务其实起得来、却被收尾逻辑干掉"）
+- 各处路径改为按本机实际目录结构解析，不再依赖 cwd
+- 补齐依赖声明
+
+---
+
+### 6. 文档、校验工具与约定
+
+**提交**：`0d77a0b` `59cbc6a` `447e363` `470d847` `e288bd5` `221abf3`
+
+| 文件 | 内容 |
+|------|------|
+| `docs/DEPLOY_DIFF.md` | deploy 包与项目的逐项差异（vendor / lqms / qubitclient / offline_data 等） |
+| `docs/RUNTIME_DEPS.md` | 运行所需依赖与接线说明 |
+| `docs/TODO_RUNTIME.md` | 本机运行待办清单 + 阶段执行记录 + 4 条已知局限 |
+| `docs/TODO_MEMORY_HERMES.md` | memory 与 hermes 的实施记录 |
+| `docs/deploy_diff_tools/` | 7 个**只读**校验脚本（导入 / 依赖 / vendor / 服务 / 配置一致性） |
+
+**`CLAUDE.md` 约定变更**
+
+- 约定 10：python 路径改为本机实际的 `D:\semester4\deploy\qmclaw\qmclaw\python.exe`（原 `C:\Users\HUAWEI\...` 是他人机器路径，本机不存在）
+- 约定 3：Next.js 端口 `3001 -> 8081`（`qmclaw-web/package.json` 的 dev 脚本写死 `-p 8081`，实测 3001 未监听）
+- 约定 11：提交时机从"每改一处就提交"改为**按节奏提交**（攒够 3~5 处，或重要节点前后各一次）
+- 新增「记忆数据（不纳入版本控制）」一节
+
+**`.gitignore`**
+
+- `config/memory/` **整目录**忽略。原规则只忽略了 `episodes/` 与 `skills/` 两个子目录，**漏了 `index.json`** —— 而它每轮对话都会被重写，导致工作树长期带一个 modified 文件；且它单独存在没有意义（引用的是未跟踪的实体文件，clone 下来只是一份悬空目录）
+- 删除 `CLAUDE.md` 一行：该文件已被跟踪，此规则当前无效，但一旦被 untrack 就会**静默**变成不可提交，属于埋雷
+
+---
+
+### 7. agent 实验图表与 experiments 页同源
+
+**提交**：`ff252cd` `5acc1fb` `30a156c` `69608a0`
+
+此前 agent 与 experiments 页各画一套图，版式不同、来源不同：
+
+| | agent（旧） | experiments 页 |
+|---|---|---|
+| 图源 | `quantum_service._generate_simulation_plot`（模拟器自绘） | `analysis_service /plot/offline/v2` → `OfflineQubitUpdater.fitData` |
+| x 轴（t1） | `Time (s)` | `Delay (s)` |
+| 标题 | `t1 on q10lu12 (Offline Sim)` | `q10lu12: t1 (20251103)` |
+| 返回 | `/plots/offline_sim_*.png` 路径 | `data:image/png;base64,...` |
+
+三个缺陷：
+
+1. **前端根本没渲染 `charts`** —— `AgentChatPanel` 声明了 `charts?: string[]` 并读入了值，但渲染只覆盖 `content`/`steps`/`results`/`reflectionReport`，所以后端返回了图用户也看不见。
+2. **`dataset_id` 在工具层被丢掉** —— 离线模拟器已产出 `dataset_id`（`offline_simulator.simulate`），`quantum_service` 也原样透传，但 `RunExperimentTool` 重建 `ExperimentResult` 时只拷贝固定字段，`dataset_id` 在此丢失，上层无从知道这次实验用的是哪个数据集。
+3. **`defaultPlotCommand` 从未被读取** —— experiments 页画图用的就是这个配置字段，agent 侧只读了 `defaultCommand`。
+
+改动后分两档：
+
+| 档 | 条件 | 产出 |
+|---|---|---|
+| Tier 1 | 命中真实数据集（有 `dataset_id`） | 向 `/plot/offline/v2` 取图，**与 experiments 页逐字节相同** |
+| Tier 2 | 合成数据（无 `dataset_id`） | 沿用模拟器 PNG，但版式对齐（t1 的 x 轴改 `Delay (s)`）、标题改为 `{qubit}: {类型} (合成数据)` |
+
+关键取舍：
+
+- **复用 experiments 页的同一个接口**，不新写绘图代码 —— 两边共用一个图源才能保证不漂移；`offline_data_lab.py`（experiments 页的图源）**刻意不改**。
+- **降级优先于失败**：合成数据、analysis_service 未启动、超时、HDF5 读不出、命令执行失败 —— 任一情形都退回模拟器那张图，画图失败绝不让整轮对话失败。
+- **合成数据必须可辨识**：Tier 1 与 Tier 2 的图在标题上明确区分，避免合成值被误读成真实测量。
+- 顺带补了 matplotlib CJK 字体配置 —— `services/` 下此前没有任何字体设置，标题一旦含中文会渲染成方框。
+
+**验收证据**（`q10lu8` 有真实 T1 数据，`q10lu12` 没有）：
+
+```
+Tier 1  q10lu8  : charts[0] 是 data: URL，60639 bytes
+                  SHA256 F87A67F60887FC8FD76BBC11D0209BAF6CA51B612EEC872FA0A36E8E290594A6
+                  与直接调 /plot/offline/v2 的参考图完全一致 → 逐字节相同
+Tier 2  q10lu12 : charts[0] 是 /plots/offline_sim_t1_*.png，HTTP 200 / 74261 bytes
+                  标题 q10lu12: t1 (合成数据) 正常渲染，x 轴 Delay (s)、y 轴 Amplitude
+```
+
+---
+
+## 四、验收证据
+
+| 检查项 | 结果 |
+|--------|------|
+| 10 个 Python 服务端口 | `3003`–`3012` 全部 `LISTENING` 且 `/health` 返回 `healthy` |
+| Express 网关 `:3002` | health OK，microservices 模式，agent 指向 `:3005` |
+| Next.js `:8081` | HTTP 200 |
+| 场景 1：`对 q10lu12 运行 t1 实验` | `success=True iterations=2 steps=2 charts=1`，带合成数据免责声明 |
+| 场景 2：`对 q10lu8 运行 t1 实验` | `success=True iterations=2 steps=1 results={"T1 (µs)": 8} charts=1`，无合成警告 |
+| 图表可访问 | `:8081/plots/...` 返回 HTTP 200 |
+| memory 接口 | `/memory/stats` 返回 `episodeCount` / `skillCount` / `orphanCount`，与 `/memory/episodes` 列表计数一致 |
+| 模型接口一致性 | `/api/models` 与 `/api/hermes/models` 均返回 10 个，id 序列与字段结构完全一致 |
+| hermes 对话 | 经网关 `completed=True`，耗时 8.3s（原先 >300s 挂死） |
+
+---
+
+## 五、已知局限（已记录、未修）
+
+记录于 `docs/TODO_RUNTIME.md`：
+
+| 编号 | 局限 | 影响 |
+|------|------|------|
+| **L1** | 离线模拟器的 T1 数值**不是真拟合** —— 取曲线 1/3 处的 x 值当 T1（代码注释自称"简化估算"） | 数值仅供参考，建议后续改用 `curve_fit` 拟合 `a*exp(-t/T1)+c` |
+| **L2** | `X_UNIT_SCALE` 换算表是从 17 类实验的实测抽样推断的 | 需与实验室确认；`pipulse_df` / `pulseshape` / `timingxyz` 暂未覆盖 |
+| **L3** | Ramsey 的索引类型名是 `ramsey df`（**带空格**）而模拟器查 `ramsey_df` | Ramsey 即使有真实数据也走合成路径；`t1` 不受影响 |
+| **L4** | `get_qubit_params` 查不到离线数据里的 qubit（走的是 LabRAD 路径而非离线 provider） | 不影响实验执行，但会让 agent 多绕一步。**接通在线后自然消解**（见 BACKLOG E3 / C1） |
+
+---
+
+## 六、服务稳定性改造（已于 2026-09-29 完成）
+
+> 此前列为「待办」的服务卡死 / 并发绘图 / 索引竞态问题，已随提交 `af90c1c` 落地。
+
+### 6.1 原问题（已完成）
+
+**现象**：agent 服务 `:3005` 出现"进程活着、端口 `LISTENING`、但连不上"，连接僵在 `CLOSE_WAIT`。已发生**两次**。
+
+**根因**：`base_service.py` 使用单线程 `HTTPServer`，`while self._running: self._server.handle_request()` 一次只处理一个连接，任何卡住的请求都会堵死整个服务。`ServiceConfig` 的 `max_workers` / `request_timeout` 原先只有声明、无引用点。
+
+### 6.2 改动（提交 `af90c1c`，dsh 工单 T11 + MiMo 复核）
+
+1. **B2 绘图线程安全**：新增 `services/common/plotting.py`（`PLOT_LOCK` / `@serialized_plot` / `plot_lock()`）；analysis 6 个绘图入口 + quantum `_generate_simulation_plot` 全部串行化
+2. **B3 记忆索引原子化**：`memory_store` 增加 `_INDEX_LOCK` + `_update_index()`，`create_episode` / `archive_episode` / `create_skill` / `delete_skill` 四处写路径收敛进锁
+3. **B1 多线程服务**：`HTTPServer` → `ThreadingHTTPServer`；慢请求（默认 5s）打印 `SLOW <method> <path> <elapsed>s`；`request_count` 改为只计真实请求（原先把空闲超时也计成一次）
+4. **密钥加载修复**：`services/common/config.py` 启动时 `load_dotenv(qmclaw-server/.env)`，与 Express / hermes 对齐（原先 Python 侧只读 `os.environ`）
+
+### 6.3 实测证据
+
+| 项 | 改前 | 改后 |
+|----|------|------|
+| 记忆索引并发（8 线程） | 丢 316 条索引 | 0 孤儿 |
+| 快请求被慢请求堵住 | 1.203s | 0.017s |
+| `check_services.py` | 10/10 | 10/10 |
+| LLM Key | `.env` 读不到 | DeepSeek 已识别 |
+
+**残留（已知、刻意不做）**：`analysis_service._handle_execute` 把 `plt` 注入用户 exec 上下文，未加 PLOT_LOCK——若加锁，卡死的 exec 会拖死所有绘图请求；建议后续单独处理。
+
+### 6.4 仍未做的待办
+
+统一登记在 **`docs/BACKLOG.md`**（唯一入口）：
+
+- **A 组（P0，数据正确性）**：信号列语义、T1 拟合、单位表、Ramsey 命名 —— **待导师确认**，见 `docs/导师对齐-进度与待确认.md`
+- **C 组**：真机接通收尾（C7–C9，待硬件/实验室）
+- **F 组**：从历史记录继续对话（可并行）
+- **D 组**：工程质量（TS 类型错误、measure_scripts 不完整）

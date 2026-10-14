@@ -8,7 +8,13 @@ Usage:
 
 import sys
 import json
+from pathlib import Path
 from typing import Dict, Any
+
+# 允许直接 `python scripts/check_services.py` 运行时解析 services.*
+_QMCLAW_SERVER = Path(__file__).resolve().parent.parent
+if str(_QMCLAW_SERVER) not in sys.path:
+    sys.path.insert(0, str(_QMCLAW_SERVER))
 
 def check_port(port: int) -> tuple[bool, int | None]:
     """检查端口是否被占用"""
@@ -50,8 +56,9 @@ def get_service_status() -> Dict[str, Any]:
     # 检查 LabRAD 连接
     if occupied:
         try:
-            import labrad
-            cxn = labrad.connect()
+            from services.common.config import labrad_connect
+
+            cxn = labrad_connect()
             status["labrad"]["connected"] = cxn.connected
             cxn.disconnect()
         except Exception as e:

@@ -36,10 +36,13 @@ if qubits:
 
 # 保存 qubit 以便后续使用
 import json
-with open('D:/QMClaw/test_qubit_info.json', 'w') as f:
+from pathlib import Path
+
+OUT_FILE = Path(__file__).resolve().parent / "test_qubit_info.json"
+with open(OUT_FILE, 'w', encoding='utf-8') as f:
     info = {
         'qubits': list(qubits.keys()),
         'qubit_type': str(type(qobj).__name__) if qubits else None
     }
-    json.dump(info, f, indent=2)
-print('\nQubit info saved to D:/QMClaw/test_qubit_info.json')
+    json.dump(info, f, indent=2, ensure_ascii=False)
+print(f'\nQubit info saved to {OUT_FILE}')

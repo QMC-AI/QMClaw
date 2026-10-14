@@ -24,6 +24,7 @@ from ..common import setup_logging, config, FallbackManager, ConnectionState
 from ..common.offline_data_provider import OfflineDataProvider
 from ..common.offline_data_lab import OfflineDataLab, OfflineQubitUpdater
 from ..common.offline_variant_generator import VariantGenerator
+from ..common.plotting import serialized_plot
 
 
 def _log(msg: str):
@@ -77,6 +78,9 @@ class AnalysisService(BaseService):
         self._busy = threading.Event()
         self._busy_lock = threading.Lock()
         self._current_task_id: Optional[str] = None
+
+        # 执行超时后标记卡死：守护线程可能仍在跑，必须拒绝后续写操作
+        self._exec_stuck: Optional[str] = None
 
         # 绘图配置
         self._default_dpi = 150
@@ -136,8 +140,12 @@ class AnalysisService(BaseService):
             self._current_task_id = None
 
     def _find_qmclaw_root(self) -> Path:
-        """找到 QMClaw 根目录"""
-        current = Path(__file__).parent  # .../services/analysis_service
+        """找到 QMClaw 根目录
+
+        向上查找含 measure_scripts 的目录。找不到时直接抛错，
+        而不是回退到写死的旧路径。
+        """
+        current = Path(__file__).resolve().parent  # .../services/analysis_service
         for _ in range(10):
             if (current / "measure_scripts").exists():
                 return current
@@ -145,7 +153,11 @@ class AnalysisService(BaseService):
             if not parent or str(parent) == str(current):
                 break
             current = parent
-        return Path("D:/QMClaw")
+        raise RuntimeError(
+            f"QMClaw root not found from {Path(__file__).resolve()} — "
+            "expected an ancestor directory containing 'measure_scripts'. "
+            "Set BACKEND_DIR / MEASURE_SCRIPTS env vars if the repo layout is non-standard."
+        )
 
     def _setup_paths(self):
         """设置 Python 路径"""
@@ -181,13 +193,14 @@ class AnalysisService(BaseService):
 
         # 创建 LabRAD 连接（参考 dp_config.py 第26-27行）
         try:
-            import labrad
             from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
             from lqms.utils.save_path import get_info_path
 
             self._fallback.set_state(ConnectionState.CONNECTING)
             _log("Connecting to LabRAD...")
-            self._cxn = labrad.connect()
+            from services.common.config import labrad_connect
+
+            self._cxn = labrad_connect()
             self._dv = self._cxn.data_vault
             _log("LabRAD connected")
 
@@ -244,12 +257,13 @@ class AnalysisService(BaseService):
                 return False
 
         try:
-            import labrad
             from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
             from lqms.utils.save_path import get_info_path
             from lqms.pyle import registry_wrapper2
 
-            self._cxn = labrad.connect()
+            from services.common.config import labrad_connect
+
+            self._cxn = labrad_connect()
             self._dv = self._cxn.data_vault
             self._session_path = self._load_session_config()
             self._s = registry_wrapper2.RegistryWrapper(self._cxn, self._session_path)
@@ -324,6 +338,27 @@ class AnalysisService(BaseService):
         with self._mode_lock:
             return self._mode
 
+    def _connection_fields(self) -> Dict[str, Any]:
+        """健康接口共用的连接与闸门字段"""
+        from services.common.config import get_actuation_flags, get_labrad_params
+
+        params = get_labrad_params()
+        flags = get_actuation_flags("analysis_service")
+        if self._data is not None and self._fallback.is_connected:
+            data_source = "labrad"
+        elif self._is_offline_mode:
+            data_source = "offline"
+        else:
+            data_source = "fallback"
+        return {
+            "data_source": data_source,
+            "actuation_allowed": flags["allow_execute"] or flags["allow_set_params"],
+            "allow_execute": flags["allow_execute"],
+            "allow_set_params": flags["allow_set_params"],
+            "labrad_host": params["host"],
+            "labrad_port": params["port"],
+        }
+
     def _load_session_config(self) -> List[str]:
         """加载会话配置"""
         config_path = Path(__file__).parent.parent.parent / "config" / "session.json"
@@ -343,7 +378,6 @@ class AnalysisService(BaseService):
 
     def _switch_session(self, session_path: List[str]):
         """切换会话（参考 dp_config.py switch_session 函数）"""
-        import labrad
         from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
         from lqms.utils.save_path import get_info_path
         from lqms.pyle import registry_wrapper2
@@ -434,15 +468,22 @@ class AnalysisService(BaseService):
             "session_path": self._session_path,
             "mode": self._get_mode(),
             "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
+            "stuck": self._exec_stuck is not None,
+            "stuck_reason": self._exec_stuck,
+            **self._connection_fields(),
         }
 
     def _handle_mode(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理模式切换请求"""
+        """处理模式切换请求
+
+        切到 online/auto 时清掉永久降级并实际尝试连接，响应带 connected 与失败原因。
+        """
         # GET 请求（无 mode 参数）返回当前状态
         if "mode" not in data:
             return {
                 "success": True,
                 "mode": self._get_mode(),
+                "connected": self._data is not None and self._fallback.is_connected,
                 "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
             }
 
@@ -454,11 +495,58 @@ class AnalysisService(BaseService):
                 "current_mode": self._get_mode(),
             }
 
-        return {
+        result: Dict[str, Any] = {
             "success": True,
             "mode": self._get_mode(),
             "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
         }
+
+        if mode == self.Mode.OFFLINE:
+            result["connected"] = False
+            return result
+
+        if self._fallback.is_degraded:
+            self._fallback.reset()
+
+        connected = self._try_connect()
+        result["connected"] = connected
+        if not connected:
+            result["success"] = False
+            result["error"] = self._fallback.last_error or "LabRAD connection failed"
+        return result
+
+    def _try_connect(self) -> bool:
+        """懒创建并连接 LabRAD（供模式切换使用）"""
+        if self._data is not None and self._fallback.is_connected:
+            return True
+
+        with self._labrad_lock:
+            try:
+                self._fallback.reset()
+                self._fallback.set_state(ConnectionState.CONNECTING)
+
+                from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
+                from lqms.utils.save_path import get_info_path
+                from lqms.pyle import registry_wrapper2
+
+                from services.common.config import labrad_connect
+
+                _log("Connecting to LabRAD...")
+                self._cxn = labrad_connect()
+                self._dv = self._cxn.data_vault
+                self._session_path = self._load_session_config()
+                self._s = registry_wrapper2.RegistryWrapper(self._cxn, self._session_path)
+                self._data = dc.DataLab(self._session_path, self._dv, dv_type="data_vault")
+                info_path = get_info_path(self._s)
+                self._info = dc.InfoBase(info_path)
+                self._qter = QubitUpdater(self._data, self._info)
+                self._load_fallback_data()
+                self._fallback.on_connection_success()
+                return True
+            except Exception as e:
+                _log(f"Failed to connect to LabRAD: {e}")
+                self._fallback.on_connection_failed(str(e))
+                return False
 
     def _handle_datasets_offline(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
         """获取离线数据集列表"""
@@ -494,6 +582,7 @@ class AnalysisService(BaseService):
             "source": "offline",
         }
 
+    @serialized_plot
     def _handle_plot_offline(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """从离线数据绘制图表"""
         job_id = data.get("job_id", f"offline_{int(time.time() * 1000)}")
@@ -574,6 +663,7 @@ class AnalysisService(BaseService):
             _log(f"Offline plot error: {e}\n{traceback.format_exc()}")
             return {"error": str(e), "plotPath": None}
 
+    @serialized_plot
     def _handle_plot_offline_v2(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         新版离线绘图接口
@@ -837,6 +927,7 @@ class AnalysisService(BaseService):
         except Exception as e:
             return {"error": str(e), "success": False}
 
+    @serialized_plot
     def _handle_plot_variant(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """绘制变体数据"""
         variant_id = data.get("variant_id")
@@ -939,13 +1030,14 @@ class AnalysisService(BaseService):
                 self._fallback.reset()
                 self._fallback.set_state(ConnectionState.CONNECTING)
 
-                import labrad
                 from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
                 from lqms.utils.save_path import get_info_path
                 from lqms.pyle import registry_wrapper2
 
                 _log("Connecting to LabRAD...")
-                self._cxn = labrad.connect()
+                from services.common.config import labrad_connect
+
+                self._cxn = labrad_connect()
                 self._dv = self._cxn.data_vault
                 _log("LabRAD connected")
 
@@ -1012,6 +1104,27 @@ class AnalysisService(BaseService):
                 "status": "offline",
                 "error": "离线模式下无法执行代码。请使用在线模式。",
                 "mode": self._get_mode(),
+            }
+
+        # 写闸门：只读联调期间禁止在线执行
+        from services.common.config import get_actuation_flags
+
+        if not get_actuation_flags("analysis_service")["allow_execute"]:
+            return {
+                "task_id": data.get("task_id", f"task_{int(time.time() * 1000)}"),
+                "status": "read_only",
+                "error": "当前为只读联调，禁止执行分析代码",
+                "hint": "如需执行请将 fallback_config.json 的 analysis_service.actuation.allow_execute 设为 true，"
+                        "或设置环境变量 QMCLAW_ALLOW_EXECUTE=1（须人工确认并记录）",
+                "actuation_allowed": False,
+            }
+
+        if self._exec_stuck:
+            return {
+                "task_id": data.get("task_id", f"task_{int(time.time() * 1000)}"),
+                "status": "stuck",
+                "error": self._exec_stuck,
+                "hint": "上一次执行超时后工作线程可能仍在运行，已拒绝并发下发。",
             }
 
         # 降级模式下拒绝执行
@@ -1127,8 +1240,22 @@ class AnalysisService(BaseService):
         if exec_thread.is_alive():
             result_container["status"] = "timeout"
             result_container["error"] = f"Execution timed out after {timeout}s"
+            self._exec_stuck = (
+                f"Task {task_id} timed out after {timeout}s; "
+                "worker thread may still be running"
+            )
+            _log(f"[STUCK] {self._exec_stuck}")
+            return {
+                "task_id": task_id,
+                "status": "timeout",
+                "stdout": result_container["stdout"],
+                "stderr": result_container["stderr"],
+                "error": result_container["error"],
+                "stuck": True,
+                "hint": "服务已标记卡死，后续执行将被拒绝，直到人工确认后重启服务。",
+            }
 
-        # 释放 busy 锁
+        # 释放 busy 锁（仅正常结束时）
         self._release_busy()
 
         return {
@@ -1140,6 +1267,7 @@ class AnalysisService(BaseService):
             "result": result_container.get("result"),
         }
 
+    @serialized_plot
     def _handle_plot(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """绘制最新数据集"""
         job_id = data.get("job_id", f"plot_{int(time.time() * 1000)}")
@@ -1199,6 +1327,7 @@ class AnalysisService(BaseService):
             _log(f"Plot error: {e}\n{traceback.format_exc()}")
             return {"error": str(e), "plotPath": None}
 
+    @serialized_plot
     def _handle_plot_historical(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """绘制历史数据集"""
         job_id = data.get("job_id", f"hist_{int(time.time() * 1000)}")
@@ -1312,6 +1441,7 @@ class AnalysisService(BaseService):
             .replace("{exp_num}", str(exp_num)) \
             .replace("{qubit}", qubit)
 
+    @serialized_plot
     def _handle_plot_experiments(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """根据实验类型绘图（新版）
 
@@ -1649,6 +1779,7 @@ class AnalysisService(BaseService):
             "session_path": self._session_path,
             "fallback_message": self._get_fallback_message(),
             "mode": self._get_mode(),
+            **self._connection_fields(),
         }
 
     def shutdown(self):

@@ -731,20 +731,8 @@ class HermesService(BaseService):
         _log(f"  message: {message[:100]}...")
 
         try:
-            # Find model config
-            model_config = None
-            if model:
-                for m in self._available_models:
-                    if m.get("modelId") == model or m.get("name") == model:
-                        model_config = m
-                        break
-
-            # Fallback: use first enabled model
-            if not model_config:
-                for m in self._available_models:
-                    if m.get("enabled", False):
-                        model_config = m
-                        break
+            # 解析模型配置（与 agent 侧同一套语义）
+            model_config = self._resolve_model_config(model)
 
             if not model_config:
                 write_fn("event: error\ndata: " + json.dumps({"error": "No enabled model found"}) + "\n\n")
@@ -794,6 +782,30 @@ class HermesService(BaseService):
             "toolsets": self._hermes_config.get("toolsets", []),
             "session_db_available": self._hermes_config.get("session_db") is not None,
         }
+
+    def _resolve_model_config(self, model: Optional[str]) -> Optional[Dict[str, Any]]:
+        """按模型标识符解析模型配置。
+
+        与 agent 侧保持**同一套语义**：前端两个面板传的都是 model_configs.json 里的 `id`
+        （agent 走 context.model_id → llm_service；hermes 走 model → 这里）。
+
+        匹配优先级：id → modelId → name。
+        原来的实现只匹配 modelId/name，而前端传的是 id，只能靠"id 恰好等于 modelId"侥幸命中。
+        都匹配不到时退回第一个 enabled 的模型（与原行为一致）。
+        """
+        if model:
+            for key in ("id", "modelId", "name"):
+                for m in self._available_models:
+                    if m.get(key) == model:
+                        _log(f"Model '{model}' resolved via '{key}' -> provider={m.get('provider')}, "
+                             f"modelId={m.get('modelId')}")
+                        return m
+            _log(f"Model '{model}' not found in model_configs.json, falling back to first enabled")
+
+        for m in self._available_models:
+            if m.get("enabled", False):
+                return m
+        return None
 
     def _handle_models(self) -> Dict[str, Any]:
         """获取可用模型列表"""
@@ -917,20 +929,8 @@ class HermesService(BaseService):
         _log(f"  message: {message[:100]}...")
 
         try:
-            # Find model config
-            model_config = None
-            if model:
-                for m in self._available_models:
-                    if m.get("modelId") == model or m.get("name") == model:
-                        model_config = m
-                        break
-
-            # Fallback: use first enabled model
-            if not model_config:
-                for m in self._available_models:
-                    if m.get("enabled", False):
-                        model_config = m
-                        break
+            # 解析模型配置（与 agent 侧同一套语义）
+            model_config = self._resolve_model_config(model)
 
             if not model_config:
                 return {"error": "No enabled model found", "completed": False}

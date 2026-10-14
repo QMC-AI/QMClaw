@@ -14,9 +14,13 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import wraps
 from typing import Any, Callable, Dict, List, Optional
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+
+# 请求处理耗时超过该秒数时打印 SLOW 日志（可用 service.slow_request_seconds 覆盖）
+SLOW_REQUEST_SECONDS = 5.0
 
 
 def _safe_print(msg: str, flush: bool = True):
@@ -49,6 +53,29 @@ class ServiceConfig:
     max_workers: int = 4
 
 
+def _timed_request(method: str):
+    """包装 do_GET/do_POST/do_DELETE：统计请求数，超阈值打印 SLOW 日志。
+
+    服务器是多线程的，每个连接跑在自己的线程里，所以耗时统计和计数
+    只有放在请求线程内才准确。
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            started = time.time()
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                elapsed = time.time() - started
+                self.service.request_count += 1
+                if elapsed > self.service.slow_request_seconds:
+                    _safe_print(
+                        f"[{self.service.config.name}] SLOW {method} {self.path} {elapsed:.3f}s"
+                    )
+        return wrapper
+    return decorator
+
+
 class BaseHTTPRequestHandler(BaseHTTPRequestHandler):
     """通用 HTTP 请求处理器"""
 
@@ -60,6 +87,7 @@ class BaseHTTPRequestHandler(BaseHTTPRequestHandler):
         """统一日志格式"""
         _safe_print(f"[{self.service.config.name}] {args[0]}")
 
+    @_timed_request("GET")
     def do_GET(self):
         """处理 GET 请求"""
         parsed = urlparse(self.path)
@@ -78,6 +106,7 @@ class BaseHTTPRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json_response(500, {"error": str(e)})
 
+    @_timed_request("POST")
     def do_POST(self):
         """处理 POST 请求"""
         parsed = urlparse(self.path)
@@ -138,6 +167,7 @@ class BaseHTTPRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             write_fn(f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n")
 
+    @_timed_request("DELETE")
     def do_DELETE(self):
         """处理 DELETE 请求"""
         parsed = urlparse(self.path)
@@ -188,7 +218,9 @@ class BaseService(ABC):
         self.start_time: Optional[float] = None
         self.request_count = 0
         self.error_count = 0
-        self._server: Optional[HTTPServer] = None
+        # 单请求耗时超过该秒数时打 SLOW 日志；子类可调小/调大
+        self.slow_request_seconds = SLOW_REQUEST_SECONDS
+        self._server: Optional[ThreadingHTTPServer] = None
         self._server_thread: Optional[threading.Thread] = None
         self._running = False
 
@@ -265,20 +297,21 @@ class BaseService(ABC):
         try:
             self.before_start()
 
-            # 创建 HTTP 服务器
+            # 创建 HTTP 服务器：ThreadingHTTPServer 每个连接一个线程，
+            # 单个慢请求（LLM 调用 / LabRAD 往返）不再堵死整个服务。
             handler = lambda *args, **kwargs: BaseHTTPRequestHandler(*args, service=self, **kwargs)
-            self._server = HTTPServer((self.config.host, self.config.port), handler)
+            self._server = ThreadingHTTPServer((self.config.host, self.config.port), handler)
             self._server.timeout = 1  # 1秒超时用于优雅关闭
 
             self.start_time = time.time()
             self.status = ServiceStatus.RUNNING
             self.after_start()
 
-            # 主事件循环
+            # 主事件循环：handle_request() 收到连接后立刻交给工作线程返回，
+            # 请求计数在请求线程内完成（见 _timed_request）。
             while self._running:
                 try:
                     self._server.handle_request()
-                    self.request_count += 1
                 except Exception as e:
                     # 超时和其他异常处理
                     if "timeout" not in str(e).lower():

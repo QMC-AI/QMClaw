@@ -1129,3 +1129,271 @@ Browser → Express (:3002) → Python subprocess → Hermes AIAgent
 - 反思触发: 任务完成后自动调用 `reflect_after_task()`
 - 技能提取: 反思报告建议创建时自动生成
 - 记忆召回: 任务开始前 `recall_for_task()` 匹配相关技能和历史
+
+
+---
+
+## 2026-09-24  C 组真机接通（只读联调）落地
+
+- **范围**：feat / fix / test / docs（分支 `feat/c-real-machine`，7 个提交）
+- **改动**：
+  1. LabRAD 连接参数外置：`get_labrad_params` / `labrad_connect` / `get_labrad_paths`，10 处 `labrad.connect()` 全部替换
+  2. 修复离线↔在线切换：懒连接、清 `DEGRADED_PERMANENT`、`/mode` 真实返回 `connected`；`default_mode: auto`
+  3. 写闸门 `actuation`（默认全关）+ `/health` `/status` 增补 `data_source` / `actuation_allowed` / `labrad_host:port`
+  4. 执行超时标记 `stuck` 并拒绝后续下发（BACKLOG B4）
+  5. agent 在线图源切换 + 工具层 `read_only` hint 透传
+  6. 14 个单元测试 + `check_readonly_regression.py` + `check_labrad_link.py`
+  7. `docs/REAL_MACHINE.md` 运维手册；CLAUDE.md 写闸门约定
+- **文件**：
+  - `services/common/config.py`、`quantum_service/{server,labrad_client}.py`、`analysis_service/server.py`
+  - `agent_service/{adapter,server}.py`、`common/quantum_tools/execution.py`
+  - `config/{system,fallback_config}.json`、`tests/test_real_machine_unit.py`
+  - `docs/{REAL_MACHINE.md,deploy_diff_tools/check_labrad_link.py,BACKLOG.md,REAL_MACHINE_PLAN.md}`
+  - 另有 gateway / workflow / scripts / backends 的 `labrad_connect` 接线
+- **验证**：
+  - 单元测试 14/14 PASS
+  - 活体只读回归 ALL CHECKS PASSED（13/13）：闸门关、`set_params`→`read_only`、离线模拟不受闸门限制
+  - `check_labrad_link.py`：3 项 FAIL 均为预期缺口（无 manager / 无 `~/.lqcs` / connect 连不上）
+- **提交**：`fe73642` → `5a0fc90` → `209f494` → `a1a4e5e` → `8079bf3` → `2bd4dac` → `7b65bd3`
+
+## 2026-09-24  服务启动与验收
+
+- **范围**：chore（用户授权代启服务）
+- **改动**：启动 Python 微服务（3003–3011）、Express（3002）、Next.js（8081）；跑验收脚本
+- **验证**：活体只读回归 13/13 PASS；前端 200；`quantum: mode=auto data_source=offline actuation=False`
+- **备注**：默认仍遵守约定 3「服务启停由人控制」；本次为用户明确授权例外
+
+## 2026-09-24  约定：每次修改必须记录日志
+
+- **范围**：docs（约定）
+- **改动**：用户要求「以后每次修改都要记录进日志」。本文件为开发日志入口，**每次修改后追加一条**
+- **文件**：`CLAUDE.md` 约定 5、`.claude/progress.md`
+
+---
+## 2026-09-29  P0 本机接线闭环 + 服务验收（前端用户已确认）
+- **范围**：chore / fix（分支 `feat/c-real-machine`）
+- **改动**：
+  1. vendor 三模块落位 `QMClaw\\vendor\\`（hermes-agent / QubitClient 0.6.22 / QCA）
+  2. qca_service 两处 `D:\\Documents\\QMClaw` 硬编码改为相对 `__file__` 推导（server.py / tools/lab_tool.py）
+  3. 离线数据 5011 hdf5 拷入 `qmclaw-server\\data\\offline_data` 并生成索引（qubits 111 / datasets 5008 / experiments 13）
+  4. `.env` 落位（PYTHON_BIN 指 deploy 环境、PORT=3002；密钥不入库）
+  5. qmclaw-web / qmclaw-server `npm install`；4 个包 `pip install -e` 指向新路径
+- **验收**：
+  - `check_services.py` 10/10 可导入（qca 由 FAIL → OK）
+  - 服务实启：quantum:3003 / analysis:3004 / Express:3002 / Next.js:8081
+  - `GET /health` → express ok + 微服务清单；前端 HTTP 200
+  - **用户浏览器验证前端页面通过**
+  - 无 LabRAD 时 quantum 自动降级离线（auto 模式），加载 5008 datasets
+- **遗留（待决策）**：
+  - pip check：`openai 2.54.0` / `rich 14.3.4` vs hermes-agent pin
+  - qca 自有 `tools/lab_tool.py` 被 vendor 同名包遮蔽（含悬空 `from .runner import`），当前不可达
+  - `config/qubitclient.json` 是否需要由人工配置
+- **提交**：本条 progress 记录
+
+---
+## 2026-09-29  B 组线程安全落地（B2→B3→B1）+ 服务重启验收
+- **范围**：fix（分支 `feat/c-real-machine`）
+- **改动**：
+  1. B2：新增 `services/common/plotting.py`（PLOT_LOCK / @serialized_plot / plot_lock()）；analysis 6 个绘图入口 + quantum `_generate_simulation_plot` 全部串行化
+  2. B3：`memory_store` 加 `_INDEX_LOCK` + `_update_index()`；create/archive/create_skill/delete 四处索引写路径原子化
+  3. B1：`base_service` `HTTPServer` → `ThreadingHTTPServer`；慢请求（默认 5s）打 `SLOW` 日志；`request_count` 改为只计真实请求
+  4. 修复：`services/common/config.py` 启动时 `load_dotenv(qmclaw-server/.env)`——原先 Python 侧只读 os.environ，.env 里的 LLM Key 读不到
+- **施工**：dsh 派单 T11（沙箱不能写 D 盘，产出 T11.patch）→ MiMo 应用 patch 并逐条复核
+- **验收**：
+  - `check_services.py` 10/10，exit 0
+  - 绘图锁/索引锁/ThreadingHTTPServer 源码与 import 实测通过
+  - dsh 并发实测：memory 索引孤儿 316→0；快请求被堵 1.2s→0.02s
+  - 服务重启后：3002/3003/3004/8005/3006/8081 全监听；memory/stats 经 Express 返回正常
+  - llm_service 读到 DEEPSEEK_API_KEY（SET）
+- **遗留**：
+  - `analysis_service._handle_execute` 注入 plt 未加 PLOT_LOCK（刻意，避免卡死拖死绘图）
+  - image :3007 / qubitclient 等可选服务仍未启；OPENAI/ANTHROPIC/MINIMAX Key 未配
+  - BACKLOG A 组（信号列/T1 拟合）仍待导师确认
+- **提交**：本条记录 + B 组代码
+
+---
+## 2026-10-08  导师上游融合方案（方案已就绪，**合并尚未执行**）
+- **范围**：docs（方案 + 复核 + 校对）；**未改动任何源码**
+- **改动**：
+  1. 定源：导师上游是 `Secsix/QMClaw`（main=`03d838d`）；`f2d83b5` 是**本仓库 PR #2 的合并提交**、不在上游历史里。fork 点靠**内容相同**确认（上游 `c3fd6e6` 的 tree 与 `f2d83b5` 的 tree 哈希相同）
+  2. 量化：我方 36 提交 / 62 文件；导师 2 提交 / 41 文件；**重叠 11 文件 = 7 自动合并 + 4 冲突（共 6 处）**
+  3. 冲突解法做成可运行脚本 `docs/merge_verify_tools/resolve-conflicts.py`（默认试算，`--write` 才写回），规则见方案第五节
+  4. 归档 12 个验证脚本 + `README.md`（含 8 个实测过的坑）+ `ARCHIVE_CHECK.md`（哈希校验）
+  5. BACKLOG 新增 **G 组 10 条**（记忆三处收敛 / skills 修法 / 依赖未声明 / 状态文件入库 / 前端 4 依赖 / offline_data_lab 回归 / qca 死代码 / tsbuildinfo / SSE）
+  6. `.gitignore` 加了 3 条临时目录规则（**未提交**；第 0 步会先还原成 HEAD 版再提交）
+- **验收**：
+  - 真实 `git merge` 重放：冲突 4 文件 / 6 块，与预判**逐项一致**
+  - 端到端流水线：`merge exit=1` → `resolve exit=0` → 后处理 3 提交 → **13 PASS / 0 FAIL**
+  - 方案 32 条事实主张机器复核：**0 失败**
+  - 独立对抗式复核 + 逐字校对共修复 **13 处必改 / 3 处建议改**（含 2 条"照抄会失败"的真问题）
+- **遗留（合并时办）**：
+  - 3 个待用户拍板：技能目录修法（建议 `mklink /J`）、`memory/MEMORY.md` 与 `auth.lock` 入库决定、`.env` 的 `HERMES_HOME` 语义
+  - 第 0 步必须**同时提交 3 个已修改文件**（漏 `docs/BACKLOG.md` 会被 0.1 的断言卡住）
+  - 第 9 步**保留 `.upstream-mirror/`**（12 个归档脚本里 5 个依赖它）
+- **提交**：本条记录（**尚无合并提交** —— 方案见 `docs/UPSTREAM_MERGE_PLAN.md`）
+
+---
+## 2026-10-08（续）  融合方案收尾：一键执行脚本 + 结果预览 + 第 0 步 bug 修复
+- **范围**：docs / `.claude` 仅文档；**未改动任何源码**
+- **改动**：
+  1. 新增 `docs/merge_verify_tools/run-merge.ps1`（纯 ASCII、15.4 KB）：把第六节第 0~9 步做成一条命令，含**人工闸门**；`-DryRun` 可在探针仓库上演练，`-Continue` 做快进合回
+  2. 新增 `MERGED_CONTENT_PREVIEW.md`：把 4 个冲突文件**会被解成什么样**从探针合并提交导出（模型 10 条 + 默认模型、装饰器 AST 绑定、并集结果、整体改动面）
+  3. `CLAUDE.md` 顶部加入口小节（指向方案 / 预览 / 一键脚本 / BACKLOG G 组 + 待确认 3 项）
+  4. 归档 README 的坑清单补到 **10 条**（新增 `.gitignore` 忽略规则、`cmd` 吃 `^`/`--` 两条实测教训）
+  5. 第 0 步改为**动态**：不再写死"已修改文件清单"，改为 `git status --short --untracked-files=no` + `git add -u`
+- **修掉的 bug（本轮实测发现）**：
+  - `run-merge.ps1` 第 0 步原用 `git add <路径>`，在"工作树脏"路径上会被拒绝：
+    `.gitignore` 含 `.claude/`，对**尚未入索引**的路径 `git add <path>` 会判 "ignored"。
+    真实仓库"恰好"能过只因 `progress.md` 本就已跟踪（`git check-ignore` 对它退出码 1）。
+  - 改为 `git add -u` 后实测：`.gitignore` 还原 603 字节 → `add -u`/`commit` exit=0 → 提交后脏文件 0 →
+    随后真实 merge `CONFLICT ×4`（与预期一致，未 Aborting）
+  - 之所以一直没发现：`-DryRun` 每次都从干净状态起步，**第 0 步的"脏"分支从未被走到**
+- **验收**：32 条事实主张复核 0 失败；端到端流水线 `4 冲突 → resolve → verify` 全绿；13 个归档脚本哈希一致
+- **遗留**：同上一节（3 项待拍板）；第 0 步现在会自动适配文件数变化，无需再手工核对清单
+- **提交**：本条记录（**仍无合并提交** —— 执行需用户在沙箱外授权运行 `run-merge.ps1`）
+
+---
+## 2026-10-08  ★ 导师上游融合【已执行完成】
+- **范围**：用户把会话切到完全权限后执行（此前 11 轮受沙箱禁写 `.git` 阻塞）
+- **执行方式**：`docs/merge_verify_tools/run-merge.ps1` 第 0~9 步
+- **提交序列**：
+  | 提交 | 内容 |
+  |------|------|
+  | `3d646c9` | 第 0 步：提交 5 个已修改文件（`.gitignore` 先还原成 HEAD 版） |
+  | `bf725e9` | **合并提交**（父1=`3d646c9` 我方，父2=`03d838d` 导师上游） |
+  | `547a0d0` | 停止跟踪构建产物 `tsconfig.tsbuildinfo` |
+  | `7e09c8e` | 停止跟踪运行时残留 `auth.lock` |
+  | `72cf997` | 忽略上游融合临时目录（第 8 步） |
+  | `bdafd81` | 融入方案 / 复核 / 校对报告 + 13 个验证脚本归档 |
+- **执行中的实况与偏差**：
+  1. **冲突 4 个文件、与预判逐项一致**：`model_configs.json`(1) / `base_service.py`(1) / `HermesChatPanel.tsx`(3) / `CLAUDE.md`(1) = 6 处
+  2. 合并改动面 `41 files changed, +12400 −357` —— 与 `MERGED_CONTENT_PREVIEW.md` 的预测**逐字吻合**
+  3. 我方 36 个提交全部保留（`f2d83b5..bf725e9` = 40 个提交，历史未被改写）
+  4. **执行中修掉 `run-merge.ps1` 的两个 bug**（当初演练覆盖不到的分支）：
+     - git 把 CRLF 警告写到 stderr，`$ErrorActionPreference='Stop'` 下被当成终止错误 → 脚本中途退出。
+       已在 `GitEx` 内局部设为 `Continue` 并按退出码判定；其它 6 处内联 `& git` 也统一走 `GitEx`
+     - `git fetch` 递归抓子模块失败（`vendor/` 三个是无 `.git` 的普通目录）→ 退出码 1 但**上游 ref 其实已取到**。
+       已改为 `--no-recurse-submodules`，并以 **ref 是否存在**判定成功，而非只看退出码
+- **验收（合并后真实仓库）**：`probe-verify` **12 PASS / 0 FAIL**（4 SKIP 需人起服务、3 WARN 为待决/误报）
+  - `#14 .gitignore 规则齐备` 由 FAIL → PASS；`#19 tsbuildinfo 出库` PASS
+  - `#4` 装饰器 AST 绑定正确（`DELETE → do_DELETE`）；`#2` 模型 10 条、首条 `deepseek-flash`
+  - `#18` 报的 8 处"旧引用"经核实是**误报**（全在 `CHANGES_VS_SOURCE.md` / `GIT_HISTORY.md` / `TODO_RUNTIME.md` 的历史日志里）
+- **3 项决策的处置**：
+  1. 技能目录 → **已建目录联接** `Agentic Workflow\qmclaw-server\data\skills` ⇄ `<repo>\skills`；
+     实测 `rglob('SKILL.md')` 扫到**全部 7 个技能**（此前该目录不存在 → `/api/hermes/skills` 必然为空）
+  2. `auth.lock` → 已出库 + 加 `.gitignore` 精确规则（`*.lock` 会误伤 `package-lock.json`，故不用通配）；
+     `memory/MEMORY.md` → **保留入库**（内容是与图表方案一致的 `/plots/` URL 规范）
+  3. `.env` 的 `HERMES_HOME` → **保持现状**（核实：`skills.py` 根本不读该变量，改它修不了技能列表）
+- **仍待人工（约定 3：服务启停由人控制）**：验证清单第 7 项（`npm install` + 前端构建）、
+  第 8/9/10 项（起服务跑接口与端到端 t1、肉眼比图）、第 11/23 项（`/api/hermes/skills` 非空）
+- **回退点**：`backup/pre-upstream-merge-20261008-202936`（合并前状态）
+  ```powershell
+  git reset --hard backup/pre-upstream-merge-20261008-202936
+  ```
+
+---
+## 2026-10-08  融合后服务启动验收 + **修掉我引入的默认模型回归**
+- **范围**：chore（用户明确授权代启服务，同 2026-09-24 的例外）/ fix / docs
+- **服务启动（11 个，全部 UP）**：
+  - 10 个 Python 微服务 3003–3012（`scripts/start_all_services.py --all`，后台作业）
+  - Express 网关 :3002（`npm run dev`）→ `{"express":"ok","mode":"microservices"}`
+  - Next.js 前端 :8081 → HTTP 200（标题 `qmclaw - Quantum Measurement & Calibration Workflow`）
+  - **前置**：先 `npm install` 装了合并带来的 4 个前端依赖（`highlight.js`/`react-markdown`/`rehype-highlight`/`remark-gfm`，
+    装前 `require.resolve` 全部 MISSING，装后全部 OK；`package-lock.json` 未被改动，added 105 packages）
+- **★ 发现并修复一处我引入的回归（`eb65542`）**：
+  - **现象**：`/api/models` 首条不是 `deepseek-flash`，而是 `model_default_002`（GPT-4o Mini）→ 推翻 H3 验收
+  - **根因两层**：① `src/services/modelService.ts:204` 的 `listModels()` **按 `updatedAt` 倒序排序**，
+    所以"把 deepseek-flash 放 JSON 首位"根本不起作用；② 我在解 model_configs 冲突时"采纳导师字段"
+    把导师那批 `createdAt/updatedAt`(2026-09-23) 也一起采纳了，比我方的 2024-01-01/2026-09-21 新 → 排序整体翻转，
+    `deepseek-flash` 从第 1 掉到第 9
+  - **实测**：导师对同名模型**只改了时间戳**，唯一实质改动是 `MiniMax-M2.7` 的 `baseUrl → .../anthropic`
+  - **修法**：同名逻辑模型保留我方 `createdAt/updatedAt`（纯元数据），只采纳实质字段
+  - **复核**：修复 diff 只动时间戳（16 行），`baseUrl` 导师改动保留；`/api/models` 与 `/api/hermes/models` 首条均恢复 `deepseek-flash`
+- **升级校验器（`68340d3`）**：`probe-verify.py` 第 2 项原只看**文件里**首条 enabled+text，
+  而 handler 取的是**按 updatedAt 倒序后**的首条 → 盲区。已改为两项都打印、以排序后为准。
+  **反向测试**证明判据有效：修复态 PASS、回归态 FAIL（且回归态下"文件首条"仍是 deepseek-flash，正是旧判据漏判的原因）
+- **验收**：
+  - 前端构建 `npm run build` → **`✓ Compiled successfully`**，类型检查通过，4 个静态页生成（验证清单第 7 项）
+  - `/api/hermes/skills` → **非空**，返回 7 个真实技能（技能目录联接生效）
+  - `/api/agent/memory/stats` → `episodeCount:14, orphanCount:0`（我方 memory 功能可用）
+  - `POST /api/hermes/chat` → `completed:true`，回复 `OK`（挂死修复仍生效）
+  - 交付报告自身 **27 条事实核验 0 失败**
+- **交付物**：`docs/UPSTREAM_MERGE_DELIVERY.md`（对比改动前的详细交付报告）
+- **仍待人工**：浏览器验前端页面、第 9 项端到端 t1 + **肉眼比图**（`offline_data_lab.py` 被上游整份重写）、第 11/23 项页面看技能列表
+- **提交**：`eb65542`（修复回归）→ `68340d3`（升级校验）→ `c1bfd44`（交付报告）
+
+---
+## 2026-10-08  归档 dsh 工单 T11（分级记忆开工前的干净基线）
+- **范围**：chore（约定 11：动存储格式前先提交回退点）
+- **改动**：`.dsh-orders/T11.json` 入库归档（B 组线程安全改造工单，含 scouted/constraints/acceptance，无密钥）
+- **背景**：分级记忆管理方案与详细 todolist 已产出并与本文件做了差异比对（复用 Hermes 会话 UI/cron、补 `_annotate_episode` 锁外旁路、G3 schema 分叉等修订点），即将按 Phase 0 开工
+- **验证**：`git diff --cached` 仅含 T11.json；密钥扫描无命中
+- **提交**：本条记录 + T11 工单
+
+---
+## 2026-10-08  分级记忆管理落地（T1–T7，brain-worker-team 派单）
+- **范围**：feat(memory)（分支 `feat/c-real-machine`）
+- **架构**：五级记忆模型——L0 工作记忆 / L1 会话 / L2 情景 / L3 技能 / L4（待 G1 收敛，本期不动导师侧）；
+  召回 = 关键词+元数据打分（qubit+实验类型+失败教训+时间衰减）+ 字符预算 + `recall_meta` 可解释；存储保持 JSON 文件
+- **改动**：
+  1. T1 `services/common/memory_store.py`：`create_episode` +session_id/round_index/model/response（实体+索引原子写）；
+     `update_episode_fields`（受锁 RMW）；`list_sessions`/`get_session_episodes`（空 task 过滤、老数据单轮退化、roundIndex/timestamp 双排序）
+  2. T2 `services/agent_service/server.py`：`_annotate_episode` 直写旁路收编进受锁路径（B3 遗留清零）；
+     `POST /memory/sessions`、`GET /memory/sessions/{id}`（user/assistant 回放映射）
+  3. T3 `src/index.ts`：两条 Express 会话路由（+12 行，tsc 错误数持平）
+  4. T4 `AgentChatPanel.tsx` + `api.ts`：sessionId/round_index 状态、会话侧栏（照 Hermes 模式）、刷新恢复、老数据退化入口
+  5. T5 L0 工作记忆：`_working_memory` 窗口（保首轮+最近 10 轮）+ 中段折叠压缩（纯截断不调 LLM）+ TTL 惰性淘汰；
+     `config/system.json` 增 `memory` 块（window_size/summary_threshold/session_ttl，缺省安全）
+  6. T6 `services/common/memory_manager.py`（新）：分层召回门面，`match_skills` 命中数+成功率排序，
+     `recall_for_task` 形状兼容、`/memory/recall` 透传 `recall_meta`
+  7. T7 episode `lifecycle(active|archived|pruned)`+`promoted_to`（缺省兼容老数据）、`run_maintenance` 归档/清理
+     （实体+索引同删保 orphanCount 语义）、`POST /memory/maintenance/forget`、反思提升链收紧（仅 success 升技能，
+     回标 promoted_to，顺带修掉 skillCreated 从不落盘的老 bug）、**G3**：`scripts/memory_store.py` 收敛为转发层（单实现）
+- **验证**：pytest 全量 **59 passed**（基线 21 → 59；新增 5 个测试文件 37 用例，含 10 线程并发不丢索引）；
+  web `tsc --noEmit` **EXIT=0**；server tsc 错误数不增（32 持平）；真实 `config/memory` 14 episode 全程未动；
+  Lead 对 7 单逐单 `git diff` 逐行审 + 亲自实跑 acceptance（1 个 must-fix 已打回闭环：空 task 过滤口径）
+- **施工方式**：brain-worker-team——Lead 拆单/侦察/对抗式审查，deepseek-flash 打手经 `workflow.agent()` 派单。
+  **实测结论**：`spawn_teammate`/`subagent` 均无 model 字段且子代理继承主模型（mimo），`agent-default-model` 无效；
+  `workflow.agent()` 的 provider/model 覆盖是本构建唯一便宜打手路由（子代理自报 deepseek-flash 验证）
+- **遗留（已登记 BACKLOG H 组）**：summary_threshold 语义空挂；update_episode_fields 不回写 index 摘要；
+  单轮退化种子消息仅前端内存；42 个 pytest-cache-files-* 空目录删不掉（目录授权表异常，ACL 技能判定 NOT_THIS_CLASS）
+- **待人工**：端到端验收需重启服务（约定 3）——当前全部服务未运行（0 监听）
+- **提交**：`feat(memory)` ×2 + `docs(memory)` ×1
+
+---
+## 2026-10-13  分级记忆端到端验收（全绿）+ 记忆目录权限修复
+- **范围**：fix / chore（用户授权启动服务验收）
+- **验收结果**：
+  1. **会话分组（F 验收核心判据）**：2 轮对话 = 1 会话 2 轮（`rounds=2`，不是 2 个单轮）；`roundIndex` 1→2 连续；回放 4 条消息（user/assistant ×2）
+  2. `/memory/stats` 带 lifecycle、`/memory/recall` 带 recall_meta（tiers/预算/截断）、`/memory/maintenance/forget` 经网关安全空转——全通过
+  3. 前端 :8081 HTTP 200；验收测试 episode 已归档清理（14→16→14，orphan 0）
+- **e2e 抓到并修掉两个问题**：
+  1. **Express 缺 `/api/agent/memory/maintenance/forget` 代理路由**（T7 工单 write_scope 不含 index.ts 的集成缝隙）→ Lead 3 行微调补上、重启网关复验通过
+  2. **`config/memory` 目录树对所有人不可写**（手工交付拷贝的权限残留：`memory`/`config`/`qmclaw-server`/`Agentic Workflow` 四层缺「完全控制」授权，
+     episode 落盘链断在索引写入 `[Errno 13]`）→ `diagnose-windows-sandbox-acl` 技能定点诊断 PRECONDITION → 补 4 条授权并验证
+     （备份/还原命令存 `D:\semester4\.acl-recovery\`）；对照探针确认**非受限可写、沙箱受限 token 仍受限** → 微服务改以非受限方式启动后落盘正常
+  3. 同一权限修复顺带解决 BACKLOG H4：42 个 pytest-cache-files-* 积灰目录 **42/42 删除**
+- **服务状态**：10 微服务（非受限）+ Express :3002 + Next.js :8081 全部运行中
+- **提交**：`fix(gateway)` + 本条记录
+
+---
+## 2026-10-14  Hermes 技能接线 + agent 图表修复（brain-worker-team 派单）
+- **范围**：feat / fix（分支 `feat/c-real-machine`）
+- **诊断方式**：两个用户报障 → 派 **4 个只读子代理**（每个问题各 1 静态链路 + 1 运行时实证），Lead 逐条复核关键代码行
+  1. **Hermes 技能**：Web 读 `<repo>/skills`（Express `getHermesSkillsDir()` / `data/skills` 联接），agent 读 `$HERMES_HOME/skills` = `data/hermes/skills`（**空目录**）→ 对话里 0 技能；`agent.log` 里 `skills_list completed (101 chars)`（= 空结果 JSON）
+  2. **agent 无图**：**断点①**（当轮）agent 侧写闸门在调用服务**之前**拦死（`execution.py:88/:267`），而服务端 `quantum_service/server.py:865` 明确豁免离线；**断点②**（回放）10-13 分级记忆的会话回放链路 `charts` **三层全缺**
+  3. **推翻 G7 假设**：`offline_data_lab.py` 重写**不是**原因——今天生成的 `temp_*.png` 与 09-23 参考图 **SHA256 逐字节相同**
+- **改动（7 个文件 + 4 个测试文件）**：
+  1. **A1** `scripts/setup_hermes_skills.py`（新，340 行）：幂等自举——把 `<repo>/skills` 写进 `$HERMES_HOME/config.yaml` 的 `skills.external_dirs`（vendor 原生机制，external 技能**只读**），并修复 `data/skills` 联接；不碰 vendor/上游
+  2. **A2** `scripts/start_all_services.py`（+59）：启动前调用自举，失败不阻断；`QMCLAW_BOOTSTRAP_ONLY=1` 可只跑自举；**Lead 微调**：不再打印 API Key 值（改 `(set)/(not set)`）
+  3. **B1** `quantum_tools/execution.py` + `agent_service/adapter.py`：两个工具加 `is_offline`（**默认 False 保真机安全**），adapter 用 `/health` 的 `data_source` 注入；**在线+闸门关仍 FORBIDDEN**
+  4. **B2** `agent_service/server.py` + `AgentChatPanel.tsx`：episode 用 `update_episode_fields` 补写 `charts`+`dataset_id`；回放 assistant 消息带 `charts`；前端 `sessionToMessages` 两分支映射
+  5. **B3** `agent_service/server.py`：`_experiment_outcome()` 纯函数 + `metrics.experiment_executed`/`blocked_reason`（**status 语义不变**）
+  6. 测试：新增 `tests/test_agent_offline_gate.py`(14) / `tests/test_agent_episode_charts.py`(9)；`tests/test_agent_sessions.py` 一处「metrics 精确等值」改**按键断言**（Lead 修，顺带覆盖新键）
+- **验证（Lead 亲跑，不信打手自述）**：
+  - pytest 全量 **82 passed / 0 failed / 0 skipped**；web `tsc --noEmit --incremental false` **EXIT=0**
+  - **live**：Hermes 对话 **12 秒列出全部 7 个技能**（含 description）；agent 离线跑 t1 → **`charts=1`（80KB PNG）** + `dataset_id=20251103_00398` + `metrics T1(µs)=8`，且**闸门仍关闭**（离线豁免生效）；回放 assistant `charts=1`、episode 落盘一致
+  - 自举脚本：真实路径 `no change` + `junction ok`（幂等）、短路模式 EXIT=0 且**不启动任何服务**
+- **新发现（已登记 BACKLOG I5，P1）**：**并发 `/execute` 使服务挂死**——19:56 两个并发离线实验服务端都跑完出图，但响应双双未回，此后 quantum `:3003` 与 hermes `:3012` 全无响应（TCP 可连、HTTP 无响应），重启后恢复；**与 B1（单线程 HTTPServer）不同源**
+- **施工方式**：brain-worker-team（Lead 拆单/侦察/对抗式审查/亲自 live 验收；打手为 deepseek-flash——本机 `settings.yaml` 缺失使 `subagent` 显式模型选择被禁用，靠「Lead=flash → 子代继承」达成，见 BACKLOG I6）
+- **提交**：`feat(hermes)` + `fix(agent)` ×2 + `docs`

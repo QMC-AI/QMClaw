@@ -19,10 +19,8 @@ Agentic Workflow/qmclaw-server/dist/
 Agentic Workflow/qmclaw-server/data/
 Agentic Workflow/qmclaw-server/logs/
 Agentic Workflow/qmclaw-web/public/plots/
-Agentic Workflow/qmclaw-server/config/memory/episodes/
-Agentic Workflow/qmclaw-server/config/memory/skills/
+Agentic Workflow/qmclaw-server/config/memory/
 .claude/
-CLAUDE.md
 build/
 dist/
 offline_data/
@@ -53,3 +51,16 @@ Thumbs.db
 *.bak
 *.tmp
 .pytest_cache/
+
+# local-only upstream merge artifacts (mirror is a reusable cache - keep it)
+.upstream-mirror/
+.merge-scratch/
+.analysis/
+
+
+# 运行时残留（上游误提交的空文件，2026-10-08 融合时出库）
+auth.lock
+
+# 服务运行日志（start-services-quiet.ps1 写到这里；含 services-status.json 里的 PID）
+.runtime-logs/
+

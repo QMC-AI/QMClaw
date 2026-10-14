@@ -13,13 +13,22 @@ pyopenssl>=24.0.0  # Required: older versions incompatible with cryptography>=50
 pywin32>=300  # Windows API for LabRAD GUI
 
 # QMClaw framework (private package)
-lqms @ git+https://github.com/...@main#egg=lqms
+# lqms 是私有包，没有公开索引。安装方式（见 docs/TODO_RUNTIME.md 决策 D4）：
+#   当前环境已装 0.3.1，且项目 30+ 处 `from lqms...` 已实测可用 —— 保持不升级。
+#   如需重装/升级，用本地轮子：
+#     pip install --force-reinstall D:\semester4\deploy\lqms-0.3.3-cp311-cp311-win_amd64.whl
+# 原先这里写的是不可安装的占位 URL（git+https://github.com/...@main#egg=lqms），已移除以免误导。
+# lqms @ git+https://github.com/...@main#egg=lqms
 
 # Configuration management
 python-dotenv>=1.0.0  # Load .env files
 
 # Data processing
-envelopes-qc>=0.1.0
+# 注意：deploy 只交付了 envelopes_qc-0.0.6，而此处原先写 >=0.1.0，无法满足；
+# 且全仓库 grep 不到任何 `import envelopes`，属声明与实际脱节。
+# 这里放宽到实际可安装的 0.0.6，保留依赖声明以备将来使用。
+# 若确实需要 0.1.0+，请补交付对应轮子后再收紧下限（见 docs/TODO_RUNTIME.md 待办 21）。
+envelopes-qc>=0.0.6
 
 # QCA Service - Deep Agent dependencies
 # Install from vendor's local package for development

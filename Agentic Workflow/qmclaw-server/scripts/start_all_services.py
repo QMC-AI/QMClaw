@@ -5,6 +5,12 @@ Usage:
     python start_all_services.py [service1, service2, ...]
     python start_all_services.py --all  # 启动所有服务
     python start_all_services.py llm quantum  # 只启动指定服务
+
+    # 只跑 Hermes 技能自举、不启动任何服务（验证用）：
+    QMCLAW_BOOTSTRAP_ONLY=1 python start_all_services.py --all
+
+启动任何服务之前，会先幂等执行同目录下的 setup_hermes_skills.py
+（换机后跑一次启动即完成 Hermes 技能接线）；自举失败只告警，不阻断服务启动。
 """
 
 import subprocess
@@ -17,20 +23,33 @@ import threading
 import queue
 from pathlib import Path
 
+# Windows 控制台/管道默认可能是 GBK。本脚本会打印 ✅/⏳/⚠️ 等字符，
+# 一旦 stdout 编码不是 UTF-8，print 会抛 UnicodeEncodeError，
+# 进而让整个启动流程异常退出并连带杀掉已经起来的子服务。
+# 这里显式把两个流切到 UTF-8，避免"服务其实起得来、却被收尾逻辑干掉"。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # 加载 .env 文件
 try:
     from dotenv import load_dotenv
     env_path = Path(__file__).parent.parent / ".env"
 
-    # 调试：打印加载前的值
+    # 只打印「是否已设置」，绝不打印密钥值（密钥不进日志/终端/报告）
+    def _key_state(name: str) -> str:
+        return "(set)" if os.environ.get(name) else "(not set)"
+
     print(f"[start_all] Before load_dotenv:")
-    print(f"[start_all]   MINIMAX_API_KEY = '{os.environ.get('MINIMAX_API_KEY', '(not set)')}'")
+    print(f"[start_all]   MINIMAX_API_KEY = {_key_state('MINIMAX_API_KEY')}")
 
     if env_path.exists():
         load_dotenv(env_path, override=True)  # 添加 override=True 确保覆盖
         print(f"[start_all] Loaded .env from {env_path}")
         print(f"[start_all] After load_dotenv:")
-        print(f"[start_all]   MINIMAX_API_KEY = '{os.environ.get('MINIMAX_API_KEY', '(not set)')}'")
+        print(f"[start_all]   MINIMAX_API_KEY = {_key_state('MINIMAX_API_KEY')}")
     else:
         print(f"[start_all] .env file not found at {env_path}")
 except ImportError:
@@ -328,6 +347,54 @@ def wait_for_services(timeout: int = 60):
     return False
 
 
+def run_hermes_skills_bootstrap():
+    """启动服务前自举 Hermes 技能接线（幂等；失败不阻断）。
+
+    用同一个解释器（sys.executable）运行同目录下的 setup_hermes_skills.py：
+    确保 $HERMES_HOME/config.yaml 的 skills.external_dirs 含 <repo>/skills，
+    并确保 <server>/data/skills 是指向 <repo>/skills 的目录联接。
+    子脚本的 stdout/stderr 逐行加 [bootstrap] 前缀转发，便于终端确认结果。
+
+    任何异常 / 非 0 退出 / 超时都只打印 [bootstrap] WARNING ...，然后继续。
+
+    Returns:
+        bool: True 表示 QMCLAW_BOOTSTRAP_ONLY 为真值，调用方应跳过服务启动。
+    """
+    print("[bootstrap] Running Hermes skills bootstrap (setup_hermes_skills.py) ...")
+    script = Path(__file__).with_name("setup_hermes_skills.py")
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        print("[bootstrap] WARNING: setup_hermes_skills.py timed out after 60s (continuing)")
+    except Exception as exc:
+        print(f"[bootstrap] WARNING: could not run setup_hermes_skills.py: {exc!r} (continuing)")
+    else:
+        for stream in (completed.stdout, completed.stderr):
+            if not stream:
+                continue
+            for line in stream.splitlines():
+                print(f"[bootstrap] {line}")
+        if completed.returncode == 0:
+            print("[bootstrap] OK: Hermes skills wiring verified")
+        else:
+            print(
+                "[bootstrap] WARNING: setup_hermes_skills.py exited with code "
+                f"{completed.returncode} (continuing)"
+            )
+
+    return os.environ.get("QMCLAW_BOOTSTRAP_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def main():
     global processes, to_start, process_info
 
@@ -352,6 +419,11 @@ def main():
     if not to_start:
         print("No services to start. Use --all or specify service names.")
         print(f"Available services: {', '.join(SERVICES.keys())}")
+        return
+
+    # 启动任何服务之前先自举 Hermes 技能接线（幂等、失败不阻断）
+    if run_hermes_skills_bootstrap():
+        print("[bootstrap] QMCLAW_BOOTSTRAP_ONLY is set - skipping service startup")
         return
 
     print("=" * 60)

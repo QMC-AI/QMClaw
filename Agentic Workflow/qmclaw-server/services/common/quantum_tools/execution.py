@@ -37,14 +37,24 @@ class RunCodeTool(QuantumTool):
         self,
         executor: Callable[[str], Dict[str, Any]],
         is_connected: Callable[[], bool] = None,
+        actuation_flags: Callable[[], Dict[str, bool]] = None,
+        is_offline: Optional[Callable[[], bool]] = None,
     ):
         """
         Args:
             executor: 代码执行函数，签名为 (code: str) -> Dict[str, Any]
             is_connected: 连接检查函数，签名为 () -> bool
+            actuation_flags: 写闸门查询，签名为 () -> {"allow_execute": bool, ...}
+            is_offline: 离线模式查询，签名为 () -> bool。默认 False（按在线处理），
+                即不传该参数时写闸门行为与改动前完全一致。
         """
         self._executor = executor
         self._is_connected = is_connected or (lambda: True)
+        self._actuation_flags = actuation_flags or (lambda: {"allow_execute": True, "allow_set_params": True})
+        # 离线豁免：与 quantum_service/server.py 的离线判定口径对齐
+        # （服务端先判 `if self._is_offline_mode: return self._execute_offline_simulation(...)`，
+        # 离线模拟不碰硬件、不受写闸门限制）。真机在线仍严格受闸门约束。
+        self._is_offline = is_offline or (lambda: False)
 
     @property
     def name(self) -> str:
@@ -82,6 +92,19 @@ Returns the experiment result or error message."""
 
     def execute(self, code: str, timeout: int = 300, **kwargs) -> ToolResult[Dict[str, Any]]:
         """执行代码"""
+        # 写闸门：仅在非离线时强制。离线模拟不碰硬件，与服务端
+        # quantum_service/server.py 的离线优先判定保持同一口径；
+        # 真机在线（_is_offline() 为 False）闸门文案/错误码/status 一字未改。
+        if not self._actuation_flags().get("allow_execute", True) and not self._is_offline():
+            return ToolResult.err(
+                "当前为只读联调，禁止向真机下发实验",
+                error_code=ErrorCode.FORBIDDEN.value,
+                hint="服务端写闸门 actuation.allow_execute 已关闭。只读阶段仅允许查询；"
+                     "如需执行请人工翻开闸门并记录。",
+                status="read_only",
+                actuation_allowed=False,
+            )
+
         if not self._is_connected():
             return ToolResult.err(
                 "Not connected to LabRAD",
@@ -100,6 +123,17 @@ Returns the experiment result or error message."""
         try:
             result = self._executor(code)
             elapsed = time.time() - start_time
+
+            # 服务端结构化拒绝（只读/卡死）原样透传，保留 hint 供 agent 解释
+            if isinstance(result, dict) and result.get("status") in ("read_only", "stuck"):
+                return ToolResult.err(
+                    result.get("error") or result.get("status"),
+                    error_code=ErrorCode.VALIDATION_ERROR.value,
+                    hint=result.get("hint"),
+                    status=result.get("status"),
+                    actuation_allowed=result.get("actuation_allowed"),
+                    stuck=result.get("stuck"),
+                )
 
             return ToolResult.ok(
                 data={
@@ -154,6 +188,8 @@ class RunExperimentTool(QuantumTool):
         executor: Callable[[str], Dict[str, Any]],
         schema_getter: Callable[[str], Optional[Dict[str, Any]]] = None,
         is_connected: Callable[[], bool] = None,
+        actuation_flags: Callable[[], Dict[str, bool]] = None,
+        is_offline: Optional[Callable[[], bool]] = None,
     ):
         """
         Args:
@@ -161,11 +197,19 @@ class RunExperimentTool(QuantumTool):
             executor: 代码执行函数，签名为 (code: str) -> Dict[str, Any]
             schema_getter: 实验 schema 获取函数，签名为 (name: str) -> Optional[Dict]
             is_connected: 连接检查函数，签名为 () -> bool
+            actuation_flags: 写闸门查询，签名为 () -> {"allow_execute": bool, ...}
+            is_offline: 离线模式查询，签名为 () -> bool。默认 False（按在线处理），
+                即不传该参数时写闸门行为与改动前完全一致。
         """
         self._code_builder = code_builder
         self._executor = executor
         self._schema_getter = schema_getter
         self._is_connected = is_connected or (lambda: True)
+        self._actuation_flags = actuation_flags or (lambda: {"allow_execute": True, "allow_set_params": True})
+        # 离线豁免：与 quantum_service/server.py 的离线判定口径对齐
+        # （服务端先判 `if self._is_offline_mode: return self._execute_offline_simulation(...)`，
+        # 离线模拟不碰硬件、不受写闸门限制）。真机在线仍严格受闸门约束。
+        self._is_offline = is_offline or (lambda: False)
 
     @property
     def name(self) -> str:
@@ -237,6 +281,16 @@ Returns experiment results including measured data and parameters."""
                 error_code=ErrorCode.VALIDATION_ERROR.value,
             )
 
+        if not self._actuation_flags().get("allow_execute", True) and not self._is_offline():
+            return ToolResult.err(
+                "当前为只读联调，禁止向真机下发实验",
+                error_code=ErrorCode.FORBIDDEN.value,
+                hint="服务端写闸门 actuation.allow_execute 已关闭。只读阶段仅允许查询；"
+                     "如需执行请人工翻开闸门并记录。",
+                status="read_only",
+                actuation_allowed=False,
+            )
+
         if not self._is_connected():
             return ToolResult.err(
                 "Not connected to LabRAD",
@@ -261,25 +315,80 @@ Returns experiment results including measured data and parameters."""
             result = self._executor(code)
             elapsed = time.time() - start_time
 
+            # 服务端结构化拒绝（只读/卡死）原样透传
+            if isinstance(result, dict) and result.get("status") in ("read_only", "stuck"):
+                return ToolResult.err(
+                    result.get("error") or result.get("status"),
+                    error_code=ErrorCode.FORBIDDEN.value,
+                    hint=result.get("hint"),
+                    status=result.get("status"),
+                    actuation_allowed=result.get("actuation_allowed"),
+                    stuck=result.get("stuck"),
+                )
+
             # 解析结果
-            success = result.get("status") == "success"
+            # 离线模式返回 status="offline_simulated"，与在线 "success" 一样视为执行成功。
+            # 原实现只认 "success"，导致离线跑通的实验被报成 failed。
+            status = result.get("status", "failed")
+            success = status in ("success", "offline_simulated")
+
+            # 结果字段：在线走 result，离线走 metrics
+            if result.get("result"):
+                results = result["result"]
+            else:
+                results = result.get("metrics") or {}
+
+            # 曲线数据 -> arrays；绘图路径 -> plots（沿用 ExperimentResult 既有字段）
+            offline_data = result.get("data") or {}
+            arrays: Dict[str, List[float]] = {}
+            if isinstance(offline_data, dict) and offline_data.get("x") is not None:
+                arrays = {
+                    "x": offline_data.get("x", []),
+                    "y": offline_data.get("y", []),
+                }
+            plots: List[Dict[str, Any]] = []
+            if result.get("plotPath"):
+                plots = [{
+                    "path": result["plotPath"],
+                    "title": result.get("exp_type", experiment_name),
+                }]
+
+            # 离线链路命中的历史数据集：模拟器已经产出（offline_simulator.simulate
+            # 里 result["dataset_id"] / result["source_data"]），quantum_service 也
+            # 原样透传了，但这里重建 ExperimentResult 时会丢，必须显式带回 ——
+            # 上层要靠它去 analysis_service 复现 experiments 页的那张图。
+            dataset_id = result.get("dataset_id")
+            source_data = result.get("source_data")
+            synthetic = bool(result.get("synthetic"))
+
             experiment_result = ExperimentResult(
                 id=exp_id,
                 experiment_name=experiment_name,
                 status="success" if success else "failed",
                 started_at=now.isoformat().replace("+00:00", "Z"),
                 completed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                target=target,
+                target=result.get("qubit") or target,
                 params=params,
-                results=result.get("result", {}),
+                results=results,
+                arrays=arrays,
+                plots=plots,
                 error=result.get("error"),
                 notes=notes,
+                dataset_id=dataset_id,
+                source_data=source_data,
+                synthetic=synthetic,
             )
 
             return ToolResult.ok(
                 data=experiment_result.to_dict(),
                 execution_time=elapsed,
-                source="labrad",
+                source="offline" if result.get("simulated") else "labrad",
+                simulated=bool(result.get("simulated")),
+                synthetic=synthetic,
+                dataset_id=dataset_id,
+                source_data=source_data,
+                stdout=result.get("stdout", ""),
+                code=code,
             )
 
         except QMClawError:

@@ -223,6 +223,11 @@ class ExperimentResult:
     plots: List[Dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
     notes: str = ""
+    # 离线链路：命中的历史数据集。有了它才能让 analysis_service 用
+    # /plot/offline/v2 复现 experiments 页那张图（同源同版式）。
+    dataset_id: Optional[str] = None
+    source_data: Optional[str] = None
+    synthetic: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -238,6 +243,9 @@ class ExperimentResult:
             "plots": self.plots,
             "error": self.error,
             "notes": self.notes,
+            "dataset_id": self.dataset_id,
+            "source_data": self.source_data,
+            "synthetic": self.synthetic,
         }
 
 

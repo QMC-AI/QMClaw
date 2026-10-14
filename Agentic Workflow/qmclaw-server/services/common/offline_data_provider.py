@@ -340,16 +340,33 @@ class OfflineDataProvider:
                     for key in f.keys():
                         try:
                             arr = np.array(f[key])
+
+                            # DataVault 复合数据集（本仓库离线数据的实际格式）：
+                            # 根下只有 'DataVault'，每个元素是一行多列记录 f0/f1/f2/...
+                            # 约定：f0 是扫描轴（x），f1 起是测量列（y）。
+                            # 必须先于 ndim==1 分支判断，否则复合数组会被整块塞进 x，
+                            # 下游模拟器找不到 y，就永远走合成数据 —— 真实数据从未生效。
+                            if arr.dtype.names:
+                                names = list(arr.dtype.names)
+                                cols = {n: np.asarray(arr[n]).tolist() for n in names}
+                                data['columns'] = names
+                                data['x'] = cols[names[0]]
+                                if len(names) >= 2:
+                                    data['y'] = cols[names[1]]
+                                if len(names) > 2:
+                                    data['series'] = {n: cols[n] for n in names[1:]}
+                                break
+
+                            if arr.ndim == 2 and arr.shape[1] >= 2:
+                                data['x'] = arr[:, 0].tolist()
+                                data['y'] = arr[:, 1].tolist()
+                                break
                             if arr.ndim == 1 and len(arr) > 0:
                                 if 'x' not in data:
                                     data['x'] = arr.tolist()
                                 else:
                                     data['y'] = arr.tolist()
-                            elif arr.ndim == 2 and arr.shape[1] >= 2:
-                                data['x'] = arr[:, 0].tolist()
-                                data['y'] = arr[:, 1].tolist()
-                                break
-                        except:
+                        except Exception:
                             continue
 
                 # 读取元数据
@@ -408,7 +425,7 @@ def generate_offline_index(data_path: str, output_path: Optional[str] = None) ->
 
     Args:
         data_path: 离线数据目录路径
-        output_path: 输出目录路径（默认 data/offline）
+        output_path: 输出目录路径（默认与 data_path 相同）
 
     Returns:
         索引摘要
@@ -420,8 +437,11 @@ def generate_offline_index(data_path: str, output_path: Optional[str] = None) ->
         return {"success": False, "error": "Failed to load offline data"}
 
     # 生成输出目录
+    # 读取端 OfflineDataProvider.load() 从 <data_path>/qubits.json 读取索引，
+    # 所以默认输出目录必须就是 data_path 本身；写成 data_path/../offline
+    # 会导致生成的索引永远不会被读到。
     if output_path is None:
-        output_path = Path(data_path).parent / "offline"
+        output_path = Path(data_path)
     else:
         output_path = Path(output_path)
 

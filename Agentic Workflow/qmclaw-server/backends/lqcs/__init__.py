@@ -66,6 +66,10 @@ class LQCSBackend:
         if not default_root.exists():
             default_root = Path(__file__).parent.parent.parent.parent
 
+        server_dir = Path(__file__).resolve().parent.parent.parent  # .../qmclaw-server
+        if str(server_dir) not in sys.path:
+            sys.path.insert(0, str(server_dir))
+
         measure_scripts = os.environ.get(
             "MEASURE_SCRIPTS",
             default_root / "measure_scripts" / "measure_scripts",
@@ -142,9 +146,6 @@ class LQCSBackend:
 
         try:
             # Import lqms components
-            print("[LQCS Backend] Importing labrad...", file=sys.stderr, flush=True)
-            import labrad
-            print("[LQCS Backend] labrad imported", file=sys.stderr, flush=True)
             print("[LQCS Backend] Importing lqms modules...", file=sys.stderr, flush=True)
             from lqms.utils.save_path import get_info_path
             from lqms.data_process import dataAnalysisCore as dc, QubitUpdater
@@ -167,7 +168,9 @@ class LQCSBackend:
             sys.stderr.flush()
             print("[LQCS Backend] Calling labrad.connect() now...", file=sys.stderr, flush=True)
             sys.stderr.flush()
-            self._cxn = labrad.connect()
+            from services.common.config import labrad_connect
+
+            self._cxn = labrad_connect()
             print("[LQCS Backend] LabRAD connected! Connection ID:", self._cxn.ID if hasattr(self._cxn, 'ID') else 'unknown', file=sys.stderr, flush=True)
             print("[LQCS Backend] Calling util.setWiringInfo()...", file=sys.stderr, flush=True)
             util.setWiringInfo(self._cxn)

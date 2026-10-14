@@ -15,7 +15,12 @@ import json
 import sys
 import time
 import random
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+_SERVER_DIR = Path(__file__).resolve().parent.parent.parent  # .../qmclaw-server
+if str(_SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVER_DIR))
 
 from .model import (
     QubitMetrics,
@@ -95,11 +100,12 @@ class QuantumWorker:
             }
 
         try:
-            import labrad
             from lqms.pyle.workflow import switchSession
             from lqms.measure.basic import BasicTuner
 
-            self.cxn = labrad.connect()
+            from services.common.config import labrad_connect
+
+            self.cxn = labrad_connect()
             self.s = switchSession(self.cxn, user=user)
             BasicTuner._sample = self.s
             self._qubits = self._discover_qubits()

@@ -10,6 +10,89 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
+def _server_dir() -> Path:
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def load_system_config() -> Dict[str, Any]:
+    """读取 config/system.json，不存在或损坏时返回空 dict。"""
+    config_file = _server_dir() / "config" / "system.json"
+    if not config_file.exists():
+        return {}
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[Config] Failed to load {config_file}: {e}")
+        return {}
+
+
+def get_labrad_params() -> Dict[str, Any]:
+    """LabRAD 连接参数。
+
+    优先级：环境变量 LABRADHOST / LABRADPORT / LABRADTIMEOUT
+           → config/system.json 的 lqcs.connection
+           → 默认 localhost:7682 / 30s
+    """
+    connection = load_system_config().get("lqcs", {}).get("connection") or {}
+    host = os.environ.get("LABRADHOST") or connection.get("host") or "localhost"
+    port = int(os.environ.get("LABRADPORT") or connection.get("port") or 7682)
+    timeout = int(os.environ.get("LABRADTIMEOUT") or connection.get("timeout") or 30)
+    return {"host": host, "port": port, "timeout": timeout}
+
+
+def labrad_connect():
+    """按配置连接 LabRAD（host/port/timeout 可指向远程测控机）。"""
+    import labrad
+
+    params = get_labrad_params()
+    return labrad.connect(
+        host=params["host"], port=params["port"], timeout=params["timeout"]
+    )
+
+
+def get_labrad_paths() -> Dict[str, Optional[str]]:
+    """config/system.json 的 lqcs.paths；值为 null 表示未显式配置。"""
+    paths = load_system_config().get("lqcs", {}).get("paths") or {}
+    return {
+        "measure_scripts": paths.get("measure_scripts") or None,
+        "backend_dir": paths.get("backend_dir") or None,
+    }
+
+
+def _load_fallback_service_config(service_name: str) -> Dict[str, Any]:
+    config_file = _server_dir() / "config" / "fallback_config.json"
+    if not config_file.exists():
+        return {}
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            return json.load(f).get(service_name, {})
+    except Exception as e:
+        print(f"[Config] Failed to load {config_file}: {e}")
+        return {}
+
+
+def get_actuation_flags(service_name: str = "quantum_service") -> Dict[str, bool]:
+    """写闸门：是否允许执行实验 / 改 qubit 参数。
+
+    优先级：环境变量 QMCLAW_ALLOW_EXECUTE / QMCLAW_ALLOW_SET_PARAMS
+           → fallback_config.json 的 {service}.actuation
+           → 默认全部 false（只读联调）
+    """
+    actuation = _load_fallback_service_config(service_name).get("actuation") or {}
+
+    def _flag(env_key: str, config_key: str) -> bool:
+        env_val = os.environ.get(env_key)
+        if env_val is not None:
+            return env_val.strip().lower() in ("1", "true", "yes", "on")
+        return bool(actuation.get(config_key, False))
+
+    return {
+        "allow_execute": _flag("QMCLAW_ALLOW_EXECUTE", "allow_execute"),
+        "allow_set_params": _flag("QMCLAW_ALLOW_SET_PARAMS", "allow_set_params"),
+    }
+
+
 class Config:
     """配置管理类"""
 
@@ -27,6 +110,15 @@ class Config:
 
     def _load_config(self):
         """加载配置"""
+        # 先加载 qmclaw-server/.env（与 Express / hermes_service 同一文件），
+        # 否则 Python 子进程只看得到系统环境变量，.env 里的 Key 会读不到。
+        server_dir = Path(__file__).parent.parent.parent
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(server_dir / ".env")
+        except Exception as e:
+            print(f"[Config] load_dotenv failed: {e}")
+
         # 从环境变量加载
         self._config = {
             # LLM API Keys

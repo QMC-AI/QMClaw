@@ -11,6 +11,7 @@ Agent Service 适配器
 import json
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..common.quantum_tools import (
@@ -27,6 +28,151 @@ from ..common.quantum_tools import (
 
 # quantum_service 地址
 QUANTUM_SERVICE_URL = "http://localhost:3003"
+
+# analysis_service 地址：用于复现 experiments 页那张图
+# （/plot/offline/v2 由 offline_data_lab.OfflineQubitUpdater.fitData 绘图）
+ANALYSIS_SERVICE_URL = "http://localhost:3004"
+
+# 服务根：<qmclaw-server>（本文件在 services/agent_service/ 下）
+_SERVER_ROOT = Path(__file__).resolve().parents[2]
+
+# experiment_configs.json 的 defaultCommand 模板缓存
+_EXPERIMENT_TEMPLATES: Dict[str, str] = {}
+_EXPERIMENT_TEMPLATES_LOADED = False
+
+
+def _load_experiment_templates() -> Dict[str, str]:
+    """读取 config/experiment_configs.json 的 defaultCommand 模板（带缓存）
+
+    返回 {experiment_key: "sq.t1({qubit}, do_plot=True)"}。
+    这是该配置文件里的权威调用约定；配置 key 与真实函数名可能不同
+    （例如 ramsey -> sq.ramsey_df），以模板为准可自动修正。
+    读取失败时返回空 dict，由 build_experiment_code 回退。
+    """
+    global _EXPERIMENT_TEMPLATES_LOADED
+    if _EXPERIMENT_TEMPLATES_LOADED:
+        return _EXPERIMENT_TEMPLATES
+    _EXPERIMENT_TEMPLATES_LOADED = True
+    try:
+        cfg = _SERVER_ROOT / "config" / "experiment_configs.json"
+        with open(cfg, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for key, info in (data.get("experiments") or {}).items():
+            cmd = (info or {}).get("defaultCommand")
+            if cmd:
+                _EXPERIMENT_TEMPLATES[key] = cmd
+    except Exception:
+        pass
+    return _EXPERIMENT_TEMPLATES
+
+
+# experiment_configs.json 的 defaultPlotCommand 模板缓存
+_EXPERIMENT_PLOT_COMMANDS: Dict[str, str] = {}
+_EXPERIMENT_PLOT_COMMANDS_LOADED = False
+
+
+def _load_experiment_plot_commands() -> Dict[str, str]:
+    """读取 config/experiment_configs.json 的 defaultPlotCommand（带缓存）
+
+    返回 {experiment_key: "qter.fitData({exp_num})"}。
+    experiments 页画图用的就是这个字段，agent 要出"同款图"必须读同一份配置，
+    否则两边各写一套版式、迟早漂移。
+    """
+    global _EXPERIMENT_PLOT_COMMANDS_LOADED
+    if _EXPERIMENT_PLOT_COMMANDS_LOADED:
+        return _EXPERIMENT_PLOT_COMMANDS
+    _EXPERIMENT_PLOT_COMMANDS_LOADED = True
+    try:
+        cfg = _SERVER_ROOT / "config" / "experiment_configs.json"
+        with open(cfg, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for key, info in (data.get("experiments") or {}).items():
+            cmd = (info or {}).get("defaultPlotCommand")
+            if cmd:
+                _EXPERIMENT_PLOT_COMMANDS[key] = cmd
+    except Exception:
+        pass
+    return _EXPERIMENT_PLOT_COMMANDS
+
+
+def fetch_experiment_plot(
+    dataset_id: str,
+    experiment_name: str = "",
+    analysis_service_url: str = ANALYSIS_SERVICE_URL,
+    quantum_service_url: str = QUANTUM_SERVICE_URL,
+) -> Optional[str]:
+    """向 analysis_service 取"experiments 页同款"的实验图。
+
+    数据源切换（C6）：
+    - data_source == "labrad"（已连真机）→ 走在线绘图端点 /plot 或 /plot/historical，
+      避免"已连上真机、agent 却仍在展示离线/合成图"。
+    - 其余（offline / fallback）→ 走 /plot/offline/v2，与 experiments 页逐字节同源。
+
+    Args:
+        dataset_id: 本次实验命中的离线数据集 id（离线链路）；在线链路可为空
+        experiment_name: 实验 key，用于取 defaultPlotCommand
+
+    Returns:
+        Base64 data URL 或 /plots/*.png 路径；任何失败都返回 None。
+    """
+    source = _get_data_source(quantum_service_url)
+
+    if source == "labrad":
+        return _fetch_online_plot(experiment_name, analysis_service_url)
+
+    if not dataset_id:
+        return None
+
+    # 命令取自已确认的配置。模板里的 {exp_num} 是 DataVault 序号，
+    # 而这里只有 dataset_id，v2 会先 loadDatasetById 再执行命令，
+    # 所以把 {exp_num} 参数整个去掉（qter.fitData({exp_num}) -> qter.fitData()）。
+    # xeb 那种命令里 {exp_num} 出现在列表参数中，去掉后会语法错误，
+    # 这种情形回退到 v2 自己的默认命令。
+    command = _load_experiment_plot_commands().get(experiment_name or "", "")
+    if "{exp_num}" in command:
+        candidate = command.replace("({exp_num})", "()").replace("({exp_num},", "(")
+        command = candidate if "{exp_num}" not in candidate else ""
+    if not command:
+        command = "qter.fitData(do_plot=True)"
+
+    result = _http_call(
+        f"{analysis_service_url}/plot/offline/v2",
+        {"dataset_id": dataset_id, "command": command},
+        "POST",
+    )
+    if not result.get("success"):
+        return None
+    image = result.get("image")
+    return image if isinstance(image, str) and image.startswith("data:image") else None
+
+
+def _get_data_source(quantum_service_url: str = QUANTUM_SERVICE_URL) -> str:
+    """查询 quantum_service 当前数据来源：labrad / offline / fallback。"""
+    result = _http_call(f"{quantum_service_url}/health")
+    return result.get("data_source") or "offline"
+
+
+def _fetch_online_plot(
+    experiment_name: str,
+    analysis_service_url: str,
+) -> Optional[str]:
+    """在线绘图：走 analysis_service 的在线端点，返回 /plots/*.png 路径。"""
+    command = _load_experiment_plot_commands().get(experiment_name or "", "")
+    if "{exp_num}" in command:
+        candidate = command.replace("({exp_num})", "()").replace("({exp_num},", "(")
+        command = candidate if "{exp_num}" not in candidate else ""
+    if not command:
+        command = "qter.fitData(do_plot=True)"
+
+    result = _http_call(
+        f"{analysis_service_url}/plot",
+        {"command": command},
+        "POST",
+    )
+    if not result.get("success") and not result.get("plotUrl"):
+        return None
+    url = result.get("plotUrl") or result.get("image")
+    return url if isinstance(url, str) and url else None
 
 
 def _http_call(url: str, data: dict = None, method: str = "GET") -> dict:
@@ -46,9 +192,18 @@ def _http_call(url: str, data: dict = None, method: str = "GET") -> dict:
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        return {"error": f"HTTP {e.code}: {e.reason}"}
+        # 必须把响应体带出来 —— 服务的 500 里通常写了真实原因（base_service 会
+        # send_json_response(500, {"error": str(e)})），只报状态码会让问题无法定位。
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        detail = f"HTTP {e.code}: {e.reason}"
+        if body:
+            detail += f" | body={body[:800]}"
+        return {"error": detail}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def setup_agent_tools(
@@ -71,6 +226,27 @@ def setup_agent_tools(
         """检查 quantum_service 是否可用"""
         result = _http_call(f"{quantum_service_url}/health")
         return result.get("labrad_connected", False) or result.get("status") == "healthy"
+
+    def actuation_flags() -> Dict[str, bool]:
+        """读与 quantum_service 同一份写闸门配置"""
+        from ..common.config import get_actuation_flags
+
+        return get_actuation_flags("quantum_service")
+
+    def is_offline() -> bool:
+        """quantum_service 当前是否处于离线模式。
+
+        离线豁免口径与 quantum_service/server.py 的 `if self._is_offline_mode:
+        return self._execute_offline_simulation(...)` 对齐：离线模拟不碰硬件、
+        不受写闸门限制；真机在线仍严格受闸门约束。
+
+        仅在写闸门关闭、且 agent 侧工具即将拒绝时才会被调用（开销可忽略）。
+        任何查询失败都视为「非离线」，即退回改动前的严格闸门行为。
+        """
+        try:
+            return _get_data_source(quantum_service_url) == "offline"
+        except Exception:
+            return False
 
     def get_qubits() -> List[Dict[str, Any]]:
         """获取量子比特列表"""
@@ -104,30 +280,40 @@ def setup_agent_tools(
             {"code": code},
             "POST"
         )
-        if result.get("status") == "success":
+        # 透传只读/卡死等结构化拒绝，保留 status + hint，让 agent 能解释
+        if result.get("status") in ("read_only", "stuck"):
             return result
-        return {"error": result.get("error", "Unknown error")}
+        # 离线模式返回 offline_simulated，同样视为执行成功
+        if result.get("status") in ("success", "offline_simulated"):
+            return result
+        return {"error": result.get("error", "Unknown error"), "status": result.get("status")}
 
-    def run_experiment(name: str, params: Dict, notes: str = "") -> Dict[str, Any]:
-        """执行命名实验"""
-        # 构建代码
-        func_name = f"sq.{name}"
-        param_str = ", ".join(f"{k}={repr(v)}" for k, v in params.items())
-        code = f"{func_name}({param_str})"
+    def build_experiment_code(name: str, target: str, params: Dict[str, Any]) -> str:
+        """按 config/experiment_configs.json 的 defaultCommand 模板生成实验代码。
 
-        result = _http_call(
-            f"{quantum_service_url}/execute",
-            {"code": code},
-            "POST"
-        )
+        模板形如 "sq.t1({qubit}, do_plot=True)"，是该配置文件里的权威调用约定。
+        旧实现生成的是 "sq.t1(target='q10lu12')"，有两个问题：
+          1. qubit 传成了关键字参数，而离线模拟器的解析正则期望**位置参数**，
+             会把 "target='q10lu12'" 整串当成 qubit 名
+          2. 函数名硬拼 "sq.<name>"，对 ramsey 是错的（模板里是 sq.ramsey_df）
+        """
+        template = _load_experiment_templates().get(name)
+        qubit_arg = target or ""
+        if not template:
+            # 模板缺失时回退，仍保持位置参数 + do_plot 的形式
+            template = f"sq.{name}({{qubit}}, do_plot=True)"
 
-        # 包装结果
-        return {
-            "id": result.get("task_id", ""),
-            "status": result.get("status", "failed"),
-            "results": result.get("result", {}),
-            "error": result.get("error"),
+        code = template.replace("{qubit}", qubit_arg)
+
+        # 追加调用方额外传入的参数（模板里已出现的键不重复加）
+        extra = {
+            k: v for k, v in (params or {}).items()
+            if k != "target" and f"{k}=" not in code
         }
+        if extra and code.endswith(")"):
+            arg_str = ", ".join(f"{k}={v!r}" for k, v in extra.items())
+            code = code[:-1] + f", {arg_str})"
+        return code
 
     def list_history(last_n: int, type: str = None) -> List[Dict[str, Any]]:
         """查询实验历史"""
@@ -138,11 +324,25 @@ def setup_agent_tools(
     registry.register_tool(GetQubitsTool(get_qubits))
     registry.register_tool(GetQubitParamsTool(get_qubit_params, get_qubits))
     registry.register_tool(ListExperimentsTool(list_experiments))
-    registry.register_tool(RunCodeTool(execute_code, is_connected))
+    registry.register_tool(RunCodeTool(
+        execute_code, is_connected, actuation_flags, is_offline=is_offline
+    ))
+    # 注意 RunExperimentTool 的契约是：
+    #   code_builder(name, params) -> 代码字符串
+    #   executor(代码字符串) -> 执行结果
+    # 旧实现把 run_experiment 当成 code_builder 传进来，而它返回的是结果 dict，
+    # 于是 executor 把 dict 当代码 POST 给 quantum_service，服务端 code[:100]
+    # 直接抛 "unhashable type: 'slice'"。
+    # 现在传真正的代码构造器，由 RunExperimentTool 负责把执行结果包装成
+    # ExperimentResult（离线字段映射见 quantum_tools/execution.py）。
     registry.register_tool(RunExperimentTool(
-        lambda name, params: run_experiment(name, params),
+        lambda name, params: build_experiment_code(
+            name, (params or {}).get("target"), params or {}
+        ),
         execute_code,
-        is_connected=is_connected
+        is_connected=is_connected,
+        actuation_flags=actuation_flags,
+        is_offline=is_offline,
     ))
     registry.register_tool(ListHistoryTool(list_history))
 

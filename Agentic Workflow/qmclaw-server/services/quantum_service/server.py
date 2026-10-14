@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 from ..base import BaseService, ServiceConfig, run_service, _safe_print
 from ..common import setup_logging, config, FallbackManager, ConnectionState
 from ..common.offline_data_provider import OfflineDataProvider
+from ..common.plotting import serialized_plot
 from .offline_simulator import ExperimentSimulator
 
 
@@ -60,6 +61,9 @@ class QuantumService(BaseService):
         self._busy = threading.Event()
         self._busy_lock = threading.Lock()
         self._current_task_id: Optional[str] = None
+
+        # 执行超时后标记卡死：守护线程可能仍在真机上跑，必须拒绝后续写操作
+        self._exec_stuck: Optional[str] = None
 
         # 执行中的任务
         self._running_tasks: Dict[str, Dict[str, Any]] = {}
@@ -275,6 +279,57 @@ class QuantumService(BaseService):
         with self._mode_lock:
             return self._mode
 
+    def _actuation_flags(self) -> Dict[str, bool]:
+        """写闸门状态（allow_execute / allow_set_params）"""
+        from services.common.config import get_actuation_flags
+
+        return get_actuation_flags("quantum_service")
+
+    def _data_source(self) -> str:
+        """当前数据来源：labrad / offline / fallback"""
+        if self._labrad is not None and self._labrad.connected:
+            return "labrad"
+        if self._is_offline_mode:
+            return "offline"
+        return "fallback"
+
+    def _connection_fields(self) -> Dict[str, Any]:
+        """健康/状态接口共用的连接与闸门字段"""
+        from services.common.config import get_labrad_params
+
+        params = get_labrad_params()
+        flags = self._actuation_flags()
+        return {
+            "data_source": self._data_source(),
+            "actuation_allowed": flags["allow_execute"] or flags["allow_set_params"],
+            "allow_execute": flags["allow_execute"],
+            "allow_set_params": flags["allow_set_params"],
+            "labrad_host": params["host"],
+            "labrad_port": params["port"],
+        }
+
+    @staticmethod
+    def _json_safe(obj: Any) -> Any:
+        """把结果里的 numpy 类型递归转成可 JSON 序列化的原生类型。
+
+        防御性措施：一旦结果里混进 ndarray/np.float64，base_service 的
+        json.dumps 会抛 "Object of type ndarray is not JSON serializable"，
+        整个响应退化成 500 —— 而错误信息还带在响应体里，排查起来很绕。
+        """
+        try:
+            import numpy as _np
+        except ImportError:
+            return obj
+        if isinstance(obj, dict):
+            return {k: QuantumService._json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [QuantumService._json_safe(v) for v in obj]
+        if isinstance(obj, _np.ndarray):
+            return obj.ravel().tolist()
+        if isinstance(obj, _np.generic):
+            return obj.item()
+        return obj
+
     def _execute_offline_simulation(self, code: str, task_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         离线模式模拟执行
@@ -315,7 +370,7 @@ class QuantumService(BaseService):
                  f"exp_type={result.get('exp_type')}, "
                  f"qubit={result.get('qubit')}")
 
-            return result
+            return self._json_safe(result)
 
         except Exception as e:
             _log(f"[OFFLINE SIM] Error: {e}\n{traceback.format_exc()}")
@@ -328,6 +383,7 @@ class QuantumService(BaseService):
                 "simulated": True,
             }
 
+    @serialized_plot
     def _generate_simulation_plot(self, result: Dict[str, Any]) -> Optional[str]:
         """生成模拟实验的绘图"""
         try:
@@ -336,6 +392,12 @@ class QuantumService(BaseService):
             import matplotlib.pyplot as plt
             from io import BytesIO
             import base64
+
+            # 标题里带中文（"(合成数据)"），必须先配 CJK 字体，
+            # 否则 matplotlib 渲染成方框。与实验室自己的脚本
+            # measure_scripts/.../sq_workflow/backend.py 用的是同一组字体。
+            plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+            plt.rcParams['axes.unicode_minus'] = False
 
             plot_data = result.get("data")
             if not plot_data:
@@ -367,7 +429,7 @@ class QuantumService(BaseService):
             # 设置标签
             ax.set_xlabel(plot_data.get("xlabel", "X"))
             ax.set_ylabel(plot_data.get("ylabel", "Y"))
-            ax.set_title(plot_data.get("title", f"{result.get('exp_type', 'Unknown')} (Offline Sim)"))
+            ax.set_title(plot_data.get("title", f"{result.get('qubit') or 'unknown'}: {result.get('exp_type', 'Unknown')} (合成数据)"))
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
 
@@ -388,13 +450,22 @@ class QuantumService(BaseService):
     def _ensure_connected(self) -> bool:
         """确保 LabRAD 已连接
 
-        在降级模式下直接返回 False。
+        离线模式或永久降级时返回 False；客户端未创建时懒创建后再连。
         """
+        if self._mode == self.Mode.OFFLINE:
+            return False
+
         if self._fallback.is_permanently_degraded:
             return False
 
         if self._labrad is None:
-            return False
+            try:
+                from .labrad_client import LabRADClient
+                self._labrad = LabRADClient()
+            except Exception as e:
+                _log(f"Failed to create LabRAD client: {e}")
+                self._fallback.on_connection_failed(str(e))
+                return False
 
         if self._labrad.connected:
             return True
@@ -404,6 +475,7 @@ class QuantumService(BaseService):
         success = self._labrad.initialize()
         if success:
             _log("LabRAD connected successfully")
+            self._init_started = True
             self._fallback.on_connection_success()
         else:
             _log(f"LabRAD connection failed: {self._labrad._init_error}")
@@ -462,15 +534,23 @@ class QuantumService(BaseService):
             "running_tasks": len(self._running_tasks),
             "mode": self._get_mode(),
             "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
+            "stuck": self._exec_stuck is not None,
+            "stuck_reason": self._exec_stuck,
+            **self._connection_fields(),
         }
 
     def _handle_mode(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理模式切换请求"""
+        """处理模式切换请求
+
+        切到 online/auto 时清掉永久降级并实际尝试连接，响应带 connected 与失败原因，
+        不再静默假成功。
+        """
         # GET 请求（无 mode 参数）返回当前状态
         if "mode" not in data:
             return {
                 "success": True,
                 "mode": self._get_mode(),
+                "connected": self._labrad is not None and self._labrad.connected,
                 "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
             }
 
@@ -482,11 +562,28 @@ class QuantumService(BaseService):
                 "current_mode": self._get_mode(),
             }
 
-        return {
+        result: Dict[str, Any] = {
             "success": True,
             "mode": self._get_mode(),
             "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
         }
+
+        if mode == self.Mode.OFFLINE:
+            result["connected"] = False
+            return result
+
+        # 清掉 DEGRADED_PERMANENT，否则 _ensure_connected 第一行就 return False
+        if self._fallback.is_degraded:
+            self._fallback.reset()
+
+        connected = self._ensure_connected()
+        result["connected"] = connected
+        if not connected:
+            result["success"] = False
+            result["error"] = self._labrad._init_error if self._labrad and self._labrad._init_error else (
+                self._fallback.last_error or "LabRAD connection failed"
+            )
+        return result
 
     def _get_fallback_message(self) -> str:
         """获取降级模式提示信息"""
@@ -506,6 +603,13 @@ class QuantumService(BaseService):
                 session_path = json.loads(session_path)
 
         timeout = data.get("timeout", 60)
+
+        # 人工确认现场安全后，允许清除卡死标记
+        if data.get("reset_stuck"):
+            if self._exec_stuck:
+                _log(f"[STUCK] Cleared by operator request: {self._exec_stuck}")
+                self._exec_stuck = None
+            self._release_busy()
 
         with self._labrad_lock:
             # 如果已经连接且用户没有指定新路径，直接返回成功
@@ -555,6 +659,7 @@ class QuantumService(BaseService):
     def _handle_status(self) -> Dict[str, Any]:
         """获取连接状态"""
         fallback_info = self._fallback.get_status_info()
+        extra = self._connection_fields()
         if self._labrad is None:
             return {
                 "connected": False,
@@ -564,6 +669,7 @@ class QuantumService(BaseService):
                 "fallback_mode": self._fallback.is_degraded,
                 "fallback_state": fallback_info["state"],
                 "last_error": self._fallback.last_error,
+                **extra,
             }
 
         return {
@@ -575,6 +681,8 @@ class QuantumService(BaseService):
             "fallback_mode": self._fallback.is_degraded,
             "fallback_state": fallback_info["state"],
             "last_error": self._fallback.last_error,
+            "ray_ready": self._labrad.ray_ready,
+            **extra,
         }
 
     def _handle_qubits(self) -> Dict[str, Any]:
@@ -744,8 +852,7 @@ class QuantumService(BaseService):
         """执行实验代码
 
         带 busy 锁，防止并发执行。
-        如果正在执行，返回 busy 状态（降级服务）。
-        离线模式下执行模拟实验。
+        离线模拟不碰硬件、不受写闸门限制；在线执行受 actuation.allow_execute 约束。
         """
         code = data.get("code")
         task_id = data.get("task_id", f"task_{int(time.time() * 1000)}")
@@ -754,9 +861,30 @@ class QuantumService(BaseService):
         if not code:
             return {"error": "code is required"}
 
-        # 离线模式下执行模拟实验
+        # 离线模式下执行模拟实验（不碰硬件，不受闸门限制）
         if self._is_offline_mode:
             return self._execute_offline_simulation(code, task_id, data)
+
+        # 上次执行超时后守护线程可能仍在跑，拒绝后续执行
+        if self._exec_stuck:
+            return {
+                "task_id": task_id,
+                "status": "stuck",
+                "error": self._exec_stuck,
+                "hint": "上一次执行超时后工作线程可能仍在真机上运行，已拒绝并发下发。"
+                        "请人工确认现场安全后重启服务，或调用 /connect 并带 reset_stuck=true。",
+            }
+
+        # 写闸门：在线执行需显式翻开 allow_execute
+        if not self._actuation_flags()["allow_execute"]:
+            return {
+                "task_id": task_id,
+                "status": "read_only",
+                "error": "当前为只读联调，禁止向真机下发实验",
+                "hint": "如需执行请将 fallback_config.json 的 quantum_service.actuation.allow_execute 设为 true，"
+                        "或设置环境变量 QMCLAW_ALLOW_EXECUTE=1（须人工确认并记录）",
+                "actuation_allowed": False,
+            }
 
         # 降级模式下拒绝执行实验
         if self._fallback.is_degraded:
@@ -883,8 +1011,23 @@ class QuantumService(BaseService):
         if exec_thread.is_alive():
             result_container["status"] = "timeout"
             result_container["error"] = f"Execution timed out after {timeout}s"
+            # 标记卡死并保留 busy：守护线程仍在真机上跑，绝不能放行第二条指令
+            self._exec_stuck = (
+                f"Task {task_id} timed out after {timeout}s; "
+                "worker thread may still be running on hardware"
+            )
+            _log(f"[STUCK] {self._exec_stuck}")
+            return {
+                "task_id": task_id,
+                "status": "timeout",
+                "stdout": result_container["stdout"],
+                "stderr": result_container["stderr"],
+                "error": result_container["error"],
+                "stuck": True,
+                "hint": "服务已标记卡死，后续执行/改参将被拒绝，直到人工 reset_stuck 或重启。",
+            }
 
-        # 释放 busy 锁
+        # 释放 busy 锁（仅正常结束时）
         self._release_busy()
 
         # 打印执行结果摘要
@@ -1218,6 +1361,25 @@ class QuantumService(BaseService):
         if not qname:
             return {"success": False, "error": "Qubit name required"}
 
+        # 写闸门：只读联调期间禁止改参
+        if not self._actuation_flags()["allow_set_params"]:
+            return {
+                "success": False,
+                "status": "read_only",
+                "error": "当前为只读联调，禁止修改 qubit 参数",
+                "hint": "如需改参请将 fallback_config.json 的 quantum_service.actuation.allow_set_params 设为 true，"
+                        "或设置环境变量 QMCLAW_ALLOW_SET_PARAMS=1（须人工确认并记录）",
+                "actuation_allowed": False,
+            }
+
+        if self._exec_stuck:
+            return {
+                "success": False,
+                "status": "stuck",
+                "error": self._exec_stuck,
+                "hint": "上一次执行超时后工作线程可能仍在真机上运行，已拒绝改参。",
+            }
+
         if self._fallback.is_degraded:
             return {
                 "success": False,
@@ -1295,6 +1457,9 @@ class QuantumService(BaseService):
             "session_path": self._labrad.session_path if self._labrad else None,
             "fallback_message": self._get_fallback_message(),
             "mode": self._get_mode(),
+            "stuck": self._exec_stuck is not None,
+            "stuck_reason": self._exec_stuck,
+            **self._connection_fields(),
         }
 
     def shutdown(self):
