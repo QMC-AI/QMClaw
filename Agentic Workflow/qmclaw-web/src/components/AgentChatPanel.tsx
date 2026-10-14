@@ -91,6 +91,8 @@ function sessionToMessages(payload: any): ChatMessage[] {
           content: String(m.content ?? ""),
           steps: Array.isArray(m.steps) ? m.steps : [],
           results: m.results || {},
+          // 历史图随消息回放（与当轮 :charts 同字段名，:402）；老数据无 charts → []
+          charts: Array.isArray(m.charts) ? m.charts : [],
           status: "done",
         });
       }
@@ -108,6 +110,8 @@ function sessionToMessages(payload: any): ChatMessage[] {
       content: ep?.response || "执行完成",
       steps: Array.isArray(ep?.steps) ? ep.steps : [],
       results: ep?.results || ep?.metrics || {},
+      // 老数据（分级记忆前的 episode）没有 charts 键 → []
+      charts: Array.isArray(ep?.charts) ? ep.charts : [],
       status: "done",
     });
   }

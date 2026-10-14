@@ -13,7 +13,7 @@ import time
 import threading
 import sys
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -518,6 +518,8 @@ class AgentService(BaseService):
         # 汇集给前端的结果（steps 已在 task.steps 里，这里收数值与图表）
         collected_metrics: Dict[str, Any] = {}
         collected_charts: List[str] = []
+        # 命中离线数据集时的 dataset_id：随 episode 落盘，事后可复原"这轮用的是哪份数据"
+        collected_dataset_id: Optional[str] = None
         saw_synthetic = False
         saw_simulated = False
 
@@ -530,6 +532,7 @@ class AgentService(BaseService):
                              if m.get("role") in ("user", "assistant")],
                 "metrics": collected_metrics,
                 "charts": collected_charts,
+                "dataset_id": collected_dataset_id,
                 "synthetic": saw_synthetic,
                 "simulated": saw_simulated,
                 **extra,
@@ -605,6 +608,8 @@ class AgentService(BaseService):
                 if payload.get("success"):
                     d = payload.get("data") or {}
                     meta = payload.get("metadata") or {}
+                    if isinstance(meta, dict) and meta.get("dataset_id"):
+                        collected_dataset_id = meta.get("dataset_id")
                     if isinstance(d, dict):
                         metrics = d.get("results")
                         if isinstance(metrics, dict) and metrics:
@@ -817,6 +822,9 @@ class AgentService(BaseService):
                 "steps": task.steps,
                 "results": self._to_display_results(result.get("metrics") or {}),
                 "charts": result.get("charts") or [],
+                # 本轮命中的离线数据集（合成数据/未命中为 None）：_record_episode
+                # 把它写进 episode，回放时才知道这轮用的是哪份数据
+                "dataset_id": result.get("dataset_id"),
             }
 
             # 记录这一轮对话到记忆（失败不影响返回）
@@ -1012,6 +1020,9 @@ class AgentService(BaseService):
                     "content": ep.get("response"),
                     "steps": ep.get("steps") or [],
                     "results": ep.get("metrics") or {},
+                    # 图表随消息回放（string 数组，老数据无此键 → []），
+                    # 前端 sessionToMessages 直接映射，刷新/切会话后历史图不丢
+                    "charts": ep.get("charts") or [],
                     "timestamp": ts,
                 })
             _log(f"Memory: session {session_id} replayed ({len(episodes)} episodes)")
@@ -1111,6 +1122,105 @@ class AgentService(BaseService):
 
         return {"success": False, "error": f"Unknown memory path: {path}"}
 
+    @staticmethod
+    def _extract_dataset_id(steps: List[Dict[str, Any]]) -> Optional[str]:
+        """从本轮 steps 里尽力捞出离线数据集 id（找不到返回 None，绝不抛异常）。
+
+        steps 目前是 {tool, input, observation}，其中 observation 是给人看的字符串
+        摘要，所以多数轮次捞不到 —— 返回 None 是正常结果，不视为错误。
+        将来若把 metadata（dict）或 dict 形态的 observation / result 记进 steps，
+        这里无需改动即可取到。
+        """
+        try:
+            for step in steps or []:
+                if not isinstance(step, dict):
+                    continue
+                for key in ("metadata", "observation", "result"):
+                    blob = step.get(key)
+                    if isinstance(blob, dict) and blob.get("dataset_id"):
+                        return str(blob["dataset_id"])
+                inp = step.get("input")
+                if isinstance(inp, dict) and inp.get("dataset_id"):
+                    return str(inp["dataset_id"])
+        except Exception:
+            pass
+        return None
+
+    # 实验/执行类工具名的识别关键字（判断本轮"有没有尝试下发实验"）
+    # 只认**执行类**工具（run_experiment / run_code / execute_*）：名字里出现这些片段
+    # 才算"尝试下发"。只读查询（list_experiments / get_experiment_schema 等 list_/get_ 前缀）
+    # 只是问了一句，压根没尝试执行，不能算。
+    _EXEC_TOOL_HINTS = ("run_experiment", "run_code", "execute")
+    # 工具结果里"确实放行执行"的迹象
+    _EXEC_SUCCESS_HINTS = ("status=success", "offline_simulated")
+    # 工具结果里"被写闸门/只读联调拦下"的迹象
+    _EXEC_BLOCKED_HINTS = ("只读联调", "FORBIDDEN", "read_only")
+
+    @classmethod
+    def _experiment_outcome(cls, steps: Any, charts: Any) -> Tuple[bool, Optional[str]]:
+        """本轮实验到底有没有真的执行 —— 只补口径字段，不动 status 语义。
+
+        返回 (executed, blocked_reason)：
+
+        * 本轮没有实验/执行类步骤（tool 名不含 run_experiment/run_code/execute）
+          -> ``(False, None)`` —— 压根没尝试，不算被拦
+        * 有实验类步骤 + 命中放行迹象（observation 含 ``status=success`` /
+          ``offline_simulated``，或 charts 非空）-> ``(True, None)``
+        * 有实验类步骤 + 命中被拦迹象（observation 含 ``只读联调`` /
+          ``FORBIDDEN`` / ``read_only``）-> ``(False, "FORBIDDEN")``
+        * 有尝试但判不出成功也判不出被拦 -> ``(False, "UNKNOWN")``
+
+        判定顺序照上面四条：放行迹象优先于被拦迹象（两者同时命中时按"执行过"算，
+        因为 charts 非空只可能是真跑出了图）。blocked_reason 为 None 的两种含义
+        由 executed 区分：``(False, None)`` = 没尝试，``(True, None)`` = 跑成了。
+
+        动机：写闸门关闭时 agent 侧的 run_experiment/run_code 在调用服务前就被
+        拒掉，而该轮 status 仍是 success（agent 轮次确实成功结束了），metrics 里
+        又只有 iterations/duration_ms —— 用户会看到"实验成功"却没有图。这里把
+        "有没有真执行"单独记成一个字段，status 的取值逻辑一字未改。
+
+        纯函数 + 全程兜底：steps / charts / observation 是脏数据时不抛异常，
+        一律按"判不出"处理（返回 UNKNOWN，不影响已落盘的主干字段）。
+        """
+        try:
+            has_exec_step = False
+            saw_success = False
+            saw_blocked = False
+
+            for step in steps if isinstance(steps, (list, tuple)) else []:
+                if not isinstance(step, dict):
+                    continue
+                tool = step.get("tool")
+                if not isinstance(tool, str):
+                    continue
+                if not any(h in tool.lower() for h in cls._EXEC_TOOL_HINTS):
+                    continue
+
+                has_exec_step = True
+                obs = step.get("observation")
+                if not isinstance(obs, str):
+                    # observation 非字符串（脏数据，或将来换成 dict）-> 不参与判定
+                    continue
+                if any(h in obs for h in cls._EXEC_BLOCKED_HINTS):
+                    saw_blocked = True
+                if any(h in obs for h in cls._EXEC_SUCCESS_HINTS):
+                    saw_success = True
+
+            if not has_exec_step:
+                return (False, None)
+
+            has_charts = isinstance(charts, (list, tuple)) and any(
+                isinstance(c, str) and c for c in charts
+            )
+            if saw_success or has_charts:
+                return (True, None)
+            if saw_blocked:
+                return (False, "FORBIDDEN")
+            return (False, "UNKNOWN")
+        except Exception:
+            # 判不出来就报 UNKNOWN，绝不因脏数据把这一轮的落盘带崩
+            return (False, "UNKNOWN")
+
     def _record_episode(self, task: "AgentTask", result: Dict[str, Any]) -> Optional[str]:
         """把一轮对话写入记忆。
 
@@ -1131,6 +1241,10 @@ class AgentService(BaseService):
             except Exception:
                 pass
 
+            # 本轮"实验到底有没有真的执行"的口径字段（status 语义不变）：
+            # 追加进 metrics，用户就不会再看到 status=success 却既没图也没解释。
+            executed, blocked_reason = self._experiment_outcome(steps, result.get("charts"))
+
             # 会话字段（sessionId / roundIndex / model / response）随实体+索引一次写入，
             # 由 memory_store 在 _INDEX_LOCK 内原子落盘 —— 不再事后 open() 补写。
             episode = memory_store.create_episode(
@@ -1140,6 +1254,8 @@ class AgentService(BaseService):
                 metrics={
                     "iterations": result.get("iterations", 0),
                     "duration_ms": result.get("duration_ms", 0),
+                    "experiment_executed": executed,
+                    "blocked_reason": blocked_reason,
                 },
                 qubit=qubit,
                 tags=[],
@@ -1152,6 +1268,24 @@ class AgentService(BaseService):
             )
 
             episode_id = episode.get("id")
+
+            # 图表 / 数据集随 episode 自包含落盘：create_episode 的签名不接受这两个
+            # 字段，所以用受锁的读-改-写补写。charts 保持 string 数组契约
+            # （离线 data:image/png;base64,...，在线 /plots/xxx.png），供
+            # GET /memory/sessions/{id} 回放与前端 sessionToMessages 复原。
+            try:
+                raw_charts = result.get("charts")
+                if not isinstance(raw_charts, (list, tuple)):
+                    raw_charts = []          # 脏数据（字符串/None/dict）当空处理，别按字符拆
+                charts = [c for c in raw_charts if isinstance(c, str)]
+                dataset_id = result.get("dataset_id") or self._extract_dataset_id(steps)
+                memory_store.update_episode_fields(
+                    episode_id, charts=charts, dataset_id=dataset_id,
+                )
+            except Exception as e:
+                # 补写失败只丢图表，不影响已落盘的主干字段与对话返回
+                _log(f"Memory: failed to backfill charts for {episode_id}: {e}")
+
             _log(f"Memory: recorded episode {episode_id} (status={status}, steps={len(steps)})")
             return episode_id
         except Exception as e:

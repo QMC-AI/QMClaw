@@ -170,7 +170,13 @@ def test_record_episode_passes_session_fields(env):
     assert on_disk["model"] == "deepseek-flash"
     assert on_disk["response"] == "done"
     assert on_disk["steps"] == [{"action": "x"}]
-    assert on_disk["metrics"] == {"iterations": 1, "duration_ms": 5}
+    # 按键断言（不再用精确等值：B3 起 metrics 还会带轮次口径键，等值断言属变更检测器）
+    metrics = on_disk["metrics"]
+    assert metrics["iterations"] == 1
+    assert metrics["duration_ms"] == 5
+    # B3 轮次口径：本用例 steps 无实验工具 → 未尝试执行，也未被拦
+    assert metrics["experiment_executed"] is False
+    assert metrics["blocked_reason"] is None
 
     # 索引条目同样带 sessionId / roundIndex
     index = json.loads(Path(memory_store.INDEX_FILE).read_text(encoding="utf-8"))
