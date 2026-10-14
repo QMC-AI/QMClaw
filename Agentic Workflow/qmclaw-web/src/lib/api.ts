@@ -1199,6 +1199,22 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
+  hermesUpdateSkill: async (name: string, updates: { description?: string }) => {
+    const res = await fetch(`${API_BASE}/api/hermes/skills/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    });
+    return res.json();
+  },
+
+  hermesDeleteSkill: async (name: string) => {
+    const res = await fetch(`${API_BASE}/api/hermes/skills/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    });
+    return res.json();
+  },
+
   exportSkills: async () => {
     // 获取所有 skills
     const data = await api.hermesGetSkills();
@@ -1253,6 +1269,30 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
   hermesRunCronJob: async (jobId: string) => {
     const res = await fetch(`${API_BASE}/api/hermes/cron/${encodeURIComponent(jobId)}/run`, {
       method: "POST",
+    });
+    return res.json();
+  },
+
+  hermesUpdateCronJob: async (jobId: string, updates: {
+    name?: string;
+    schedule?: string;
+    prompt?: string;
+    skills?: string[];
+    model?: string;
+    provider?: string;
+    enabled?: boolean;
+    deliver?: string;
+    script?: string;
+    workdir?: string;
+    continuity?: boolean;
+    no_agent?: boolean;
+    monitor_script?: string;
+    monitor_url?: string;
+  }) => {
+    const res = await fetch(`${API_BASE}/api/hermes/cron/${encodeURIComponent(jobId)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
     });
     return res.json();
   },

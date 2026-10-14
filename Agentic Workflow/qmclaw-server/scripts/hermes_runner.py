@@ -133,6 +133,24 @@ else:
     if os.path.exists(vendor_dir):
         print(f"[Hermes] Contents of {vendor_dir}: {os.listdir(vendor_dir)}", file=sys.stderr, flush=True)
 
+# ── Set HERMES_HOME ────────────────────────────────────────────────────────────
+# Must be set BEFORE importing AIAgent to use project's skills directory
+try:
+    from dotenv import load_dotenv
+    env_path = os.path.join(_SERVER_DIR, ".env")
+    if os.path.exists(env_path):
+        load_dotenv(env_path, override=True)
+        print(f"[Hermes] Loaded .env from {env_path}", file=sys.stderr, flush=True)
+except ImportError:
+    print(f"[Hermes] python-dotenv not installed, skipping .env load", file=sys.stderr, flush=True)
+
+if os.environ.get("HERMES_HOME"):
+    print(f"[Hermes] HERMES_HOME from .env: {os.environ.get('HERMES_HOME')}", file=sys.stderr, flush=True)
+else:
+    # Default to QMClaw root, making skills/ available to Hermes
+    os.environ["HERMES_HOME"] = _QMCLAW_ROOT
+    print(f"[Hermes] Set HERMES_HOME to QMClaw root: {_QMCLAW_ROOT}", file=sys.stderr, flush=True)
+
 # Import Hermes Agent components - root-level modules (run_agent, model_tools, etc.)
 # are available as top-level imports after adding HERMES_AGENT_PATH to sys.path
 print(f"[Hermes] Attempting to import run_agent, sys.path[0]={sys.path[0] if sys.path else 'empty'}", file=sys.stderr, flush=True)

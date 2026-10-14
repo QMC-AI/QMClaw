@@ -9,6 +9,9 @@ Agentic Workflow/images/train/bad/*.png
 Agentic Workflow/images/train/bad/*.png
 Agentic Workflow/images/train/good/*.png
 *.bat
+
+cache/
+*.db*
 # Build output
 Agentic Workflow/qmclaw-web/.next/
 
