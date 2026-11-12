@@ -1,0 +1,47 @@
+# 范例 05 —— goal 有界自主循环（达标就停）
+
+# 要点：
+#   - goal 是顶层块，lowering 成 repeat + if/else + assert
+#   - success 里的 metric 必须是某次 read 出来的字段（r1.contrast）
+#   - max_rounds 是硬上限：即使一直不达标，也只跑 max_rounds 轮
+#   - 每一轮都会消耗一次 experiments 额度 → task 的 budgets.experiments 要 ≥ max_rounds
+
+workflow ex05_goal_loop {
+  meta {
+    name        "ex05_goal_loop"
+    description "goal：对比度达到阈值就停，最多 3 轮"
+    tags        ["goal", "loop"]
+  }
+
+  env {
+    qubit   "q2ld3"
+    session "20251103_LD_SQ"
+  }
+
+  budget {
+    max_wall     20m
+    max_writes   6
+    max_datasets 6
+  }
+
+  goal {
+    objective   "把态区分对比度拉到 0.6 以上"
+    success {
+      metric     r1.contrast
+      operator   >=
+      value      0.6
+    }
+    max_rounds  3
+    on_achieved "continue"
+  }
+
+  measure as c1 {
+    fn      sq.iqraw
+    qubit   $env.qubit
+    timeout 120
+  }
+
+  read c1 as r1 { kind IQraw  threshold 0.4 }
+
+  say "dataset=${c1.dataset} contrast=${r1.contrast}"
+}

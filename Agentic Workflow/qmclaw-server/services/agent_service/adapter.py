@@ -9,6 +9,7 @@ Agent Service 适配器
 """
 
 import json
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -206,6 +207,48 @@ def _http_call(url: str, data: dict = None, method: str = "GET") -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _poll_job(job_id: str, base_url: str = QUANTUM_SERVICE_URL,
+              timeout_s: float = 300.0, interval_s: float = 1.0) -> dict:
+    """轮询 `GET /jobs/{id}` 到终态，返回 job 的 result（阶段 16a 的兜底路径）。
+
+    - 只读、不碰设备；异常/超时回结构化错误，绝不抛给上层；
+    - 终态集合与 `dsl/backends/lqcs.py` 的 `submit_and_wait` 保持一致，
+      避免同一套 job 在两处被判成不同状态。
+    """
+    deadline = time.time() + max(1.0, float(timeout_s))
+    last: dict = {}
+    while time.time() < deadline:
+        time.sleep(interval_s)
+        last = _http_call(f"{base_url}/jobs/{job_id}", None, "GET")
+        if not isinstance(last, dict):
+            continue
+        # 传输层错误（连不上/读超时）没有 status：`_http_call` 只回 {"error": ...}，
+        # 这种情况继续轮询；但**带 status 的失败**（job 真的失败了）要立刻返回，
+        # 否则会把 "status:failed + error:boom" 一直当成"还没好"等到超时。
+        if not last.get("status") and last.get("error"):
+            continue
+        status = str(last.get("status") or "").lower()
+        if status in ("success", "completed"):
+            result = last.get("result")
+            if isinstance(result, dict):
+                return result
+            return {"status": "completed", "job_id": job_id, "stdout": str(result or "")}
+        if status in ("error", "failed", "cancelled", "abandoned", "timeout"):
+            result = last.get("result")
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            return {
+                "status": status,
+                "error": last.get("error") or f"job {job_id} {status}",
+                "job_id": job_id,
+            }
+    return {
+        "status": "timeout",
+        "error": f"job {job_id} did not finish within {timeout_s:.0f}s",
+        "job_id": job_id,
+    }
+
+
 def setup_agent_tools(
     registry: ToolRegistry,
     quantum_service_url: str = QUANTUM_SERVICE_URL
@@ -274,14 +317,30 @@ def setup_agent_tools(
         return []
 
     def execute_code(code: str) -> Dict[str, Any]:
-        """执行代码"""
+        """执行代码。
+
+        阶段 16a 起 `/execute` 默认改成异步（提交即回 job_id），但 agent 这条链路是
+        "调一次拿结果"的交互路径，所以**显式**带 `wait=True` 保持旧契约；
+        万一上游仍回了 `queued`（例如中间层又塞了 async），这里自己轮询到底，
+        绝不把 job_id 当结果丢给 agent。
+        """
         result = _http_call(
             f"{quantum_service_url}/execute",
-            {"code": code},
+            {"code": code, "wait": True},
             "POST"
         )
+        if (
+            isinstance(result, dict)
+            and result.get("job_id")
+            and str(result.get("status") or "").lower() == "queued"
+        ):
+            result = _poll_job(str(result["job_id"]), quantum_service_url)
         # 透传只读/卡死等结构化拒绝，保留 status + hint，让 agent 能解释
-        if result.get("status") in ("read_only", "stuck"):
+        # 阶段 6：服务端已把 status 归一成规范值（read_only→blocked、stuck→degraded），
+        # 旧值留在 legacyStatus 里，两种都认。
+        _status = result.get("status")
+        _legacy = result.get("legacyStatus")
+        if _status in ("read_only", "stuck", "blocked", "degraded") or _legacy in ("read_only", "stuck"):
             return result
         # 离线模式返回 offline_simulated，同样视为执行成功
         if result.get("status") in ("success", "offline_simulated"):
@@ -291,17 +350,21 @@ def setup_agent_tools(
     def build_experiment_code(name: str, target: str, params: Dict[str, Any]) -> str:
         """按 config/experiment_configs.json 的 defaultCommand 模板生成实验代码。
 
-        模板形如 "sq.t1({qubit}, do_plot=True)"，是该配置文件里的权威调用约定。
+        模板形如 "sq.t1({qubit})"，是该配置文件里的权威调用约定。
         旧实现生成的是 "sq.t1(target='q10lu12')"，有两个问题：
           1. qubit 传成了关键字参数，而离线模拟器的解析正则期望**位置参数**，
              会把 "target='q10lu12'" 整串当成 qubit 名
           2. 函数名硬拼 "sq.<name>"，对 ramsey 是错的（模板里是 sq.ramsey_df）
+
+        注意：服务端下发的命令**不带 do_plot**。微服务跑在无显示环境里，
+        do_plot=True 会在工作线程拉起 GUI 把服务卡死（2026-11-03 iqraw 实测），
+        画图统一由 analysis_service 的 /plot 负责。
         """
         template = _load_experiment_templates().get(name)
         qubit_arg = target or ""
         if not template:
-            # 模板缺失时回退，仍保持位置参数 + do_plot 的形式
-            template = f"sq.{name}({{qubit}}, do_plot=True)"
+            # 模板缺失时回退，保持位置参数、不加 do_plot
+            template = f"sq.{name}({{qubit}})"
 
         code = template.replace("{qubit}", qubit_arg)
 

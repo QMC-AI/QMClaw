@@ -222,6 +222,12 @@ def _load_model_configs() -> List[Dict[str, Any]]:
     try:
         with open(config_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
+            # 保证以脚本方式启动时也能 import services 包
+            _server_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            if _server_dir not in sys.path:
+                sys.path.insert(0, _server_dir)
+            from services.common.env_expand import expand_model_configs
+            expand_model_configs(data)
             return data.get("models", [])
     except Exception as e:
         _log(f"Failed to load model configs: {e}")

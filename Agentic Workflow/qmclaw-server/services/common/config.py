@@ -90,7 +90,54 @@ def get_actuation_flags(service_name: str = "quantum_service") -> Dict[str, bool
     return {
         "allow_execute": _flag("QMCLAW_ALLOW_EXECUTE", "allow_execute"),
         "allow_set_params": _flag("QMCLAW_ALLOW_SET_PARAMS", "allow_set_params"),
+        # 治理闸门（可热切）：要求真机执行必须带 task_id，走 task_queue 的额度/票据/审计。
+        # 默认 false = 保持现状（直发可用）；打开后 /execute 不带 task_id 一律拒绝。
+        # 见 docs/ARCHITECTURE_ROADMAP.md §2.1 单写者原则。
+        "require_task": _flag("QMCLAW_REQUIRE_TASK", "require_task"),
+        # 单写者模式（可热切）：off / shadow / enforce。
+        # 默认 shadow —— 只观测不改变执行路径，不打断用户正在跑的真机实验。
+        # 见 docs/ARCHITECTURE_ROADMAP.md §2.1 单写者原则。
+        "writer_mode": _writer_mode(),
+        # 回放层自动录制（可热切）：off / code_only / full。
+        # 默认 off —— 不额外读设备、不增加延迟，不打断用户正在跑的真机实验。
+        # 见 docs/ARCHITECTURE_ROADMAP.md §2.6 回放层。
+        "replay_auto_record": _replay_auto_record(),
     }
+
+
+# 回放层自动录制的三种模式
+REPLAY_RECORD_MODES = ("off", "code_only", "full")
+
+DEFAULT_REPLAY_RECORD_MODE = "off"
+
+
+def _replay_auto_record() -> str:
+    """解析回放层自动录制模式：环境变量 → config → 默认 off。
+
+    - off：完全不录（默认）
+    - code_only：只录代码/比特/数据集号，不读设备
+    - full：额外采 registry 前后快照（会增加 LabRAD 读，需评估对真机实验的影响）
+    """
+    env_val = os.environ.get("QMCLAW_REPLAY_AUTO_RECORD")
+    if env_val is not None and env_val.strip():
+        mode = env_val.strip().lower()
+        return mode if mode in REPLAY_RECORD_MODES else DEFAULT_REPLAY_RECORD_MODE
+    actuation = _load_fallback_service_config("quantum_service").get("actuation") or {}
+    mode = str(actuation.get("replay_auto_record") or DEFAULT_REPLAY_RECORD_MODE).strip().lower()
+    return mode if mode in REPLAY_RECORD_MODES else DEFAULT_REPLAY_RECORD_MODE
+
+
+def _writer_mode() -> str:
+    """解析单写者模式：环境变量 QMCLAW_WRITER_MODE → config → 默认 shadow。"""
+    from services.quantum_service.writer import WRITER_MODES, DEFAULT_WRITER_MODE
+
+    env_val = os.environ.get("QMCLAW_WRITER_MODE")
+    if env_val is not None and env_val.strip():
+        mode = env_val.strip().lower()
+        return mode if mode in WRITER_MODES else DEFAULT_WRITER_MODE
+    actuation = _load_fallback_service_config("quantum_service").get("actuation") or {}
+    mode = str(actuation.get("writer_mode") or DEFAULT_WRITER_MODE).strip().lower()
+    return mode if mode in WRITER_MODES else DEFAULT_WRITER_MODE
 
 
 class Config:
@@ -137,6 +184,9 @@ class Config:
             try:
                 with open(config_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                    # baseUrl 里的 ${VAR} 在加载时展开，配置入库存占位符即可
+                    from .env_expand import expand_model_configs
+                    expand_model_configs(data)
                     self._config.update(data)
             except Exception as e:
                 print(f"[Config] Failed to load {config_file}: {e}")

@@ -12,10 +12,12 @@ import WorkflowFlow from '../canvas/WorkflowFlow';
 import NodeConfigPanel from '../panels/NodeConfigPanel';
 import NodeSearch from '../canvas/controls/NodeSearch';
 import DebugToolbar from '../canvas/controls/DebugToolbar';
+import QwfInfoPanel from '../panels/QwfInfoPanel';
 import { useWorkflowStore } from '../../store/workflowStore';
 import { useAutoLayout } from '../../store/useAutoLayout';
 import { useModelStore } from '../../store/modelStore';
 import { api } from '../../lib/api';
+import { toBackendCanvas, fromBackendCanvas, contextFromNodes } from '../../lib/qwfBridge';
 
 interface Props {
   onLog: (msg: string, isError?: boolean) => void;
@@ -24,6 +26,7 @@ interface Props {
 export default function WorkflowCanvas({ onLog }: Props) {
   const [configNodeId, setConfigNodeId] = useState<string | null>(null);
   const [showSearch, setShowSearch] = useState(false);
+  const [showQwfInfo, setShowQwfInfo] = useState(false);
   const { computeLayout } = useAutoLayout();
 
   // Store state
@@ -110,25 +113,47 @@ export default function WorkflowCanvas({ onLog }: Props) {
     onLog("▶ Running workflow: " + workflowName);
     console.log('[Frontend] handleRunWorkflow called, workflowName:', workflowName);
     onLog(`📦 Context: ${JSON.stringify(context)}`);
-    onLog(`📋 Submitting nodes: ${JSON.stringify(currentNodes.map(n => ({ id: n.id, type: n.data.type })))}`);
+    onLog(`📋 画布节点：${currentNodes.length} 个 → 转成 IR 提交`);
     resetExecution();
     setWorkflowMeta(workflowId, workflowName);
 
     try {
-      const submitData = {
-        name: workflowName,
-        nodes: currentNodes.map((n) => ({
-          id: n.id,
-          type: n.data.type,
-          depends: useWorkflowStore.getState().edges
-            .filter((e) => e.target === n.id)
-            .map((e) => e.source),
-          config: n.data.config,
-        })),
-        context,
+      // 画布 → IR（`.qwf` 的语义表示），运行统一走 IR 执行器
+      const st = useWorkflowStore.getState();
+      const doc = toBackendCanvas(st.nodes, st.edges, {
+        id: st.workflowId || undefined,
+        name: st.workflowName,
+        workflow: st.dsl.workflow,
+        context: contextFromNodes(st.nodes),
+      });
+      const conv = await api.canvasToQwf(doc) as {
+        ok: boolean;
+        errors?: string[];
+        ir?: unknown;
+        stable?: boolean;
+        unstableDiff?: string[];
       };
-      console.log('[Frontend] submitWorkflow data:', JSON.stringify(submitData));
-      const res = await api.submitWorkflow(submitData) as { workflowId: string };
+      if (!conv.ok) {
+        setExecutionComplete('failed');
+        onLog("❌ 画布无法转换为可执行的 IR：" + ((conv.errors || []).join('; ')), true);
+        return;
+      }
+      if (conv.stable === false) {
+        onLog("⚠️ 画布 → IR 存在转换损失，运行结果可能与画布不完全一致", true);
+        (conv.unstableDiff || []).slice(0, 5).forEach((d) => onLog("   · " + d, true));
+      }
+      const res = await api.runIr({ ir: conv.ir, context }) as {
+        ok: boolean;
+        workflowId?: string;
+        error?: string;
+        warnings?: string[];
+      };
+      if (!res.ok || !res.workflowId) {
+        setExecutionComplete('failed');
+        onLog("❌ IR 提交失败：" + (res.error || 'unknown'), true);
+        return;
+      }
+      (res.warnings || []).forEach((w) => onLog("⚠️ " + w, true));
 
       setWorkflowMeta(res.workflowId, workflowName);
 
@@ -321,7 +346,7 @@ export default function WorkflowCanvas({ onLog }: Props) {
 
   // ── Export workflow ──────────────────────────────────────────────────────────
 
-  const handleExport = useCallback(() => {
+  const handleExport = useCallback(async () => {
     // Force sync from React Flow to store before export
     // This ensures any pending changes are flushed
     const canvasEl = document.querySelector('.react-flow');
@@ -329,47 +354,69 @@ export default function WorkflowCanvas({ onLog }: Props) {
       // Dispatch a custom event to trigger sync
       window.dispatchEvent(new CustomEvent('qmclaw:sync-edges'));
     }
+    await new Promise((resolve) => setTimeout(resolve, 80));
 
-    const workflowData = {
-      version: '1.0',
-      exportedAt: new Date().toISOString(),
-      name: workflowName,
-      nodes: nodes.map((n) => ({
-        id: n.id,
-        type: n.data.type,
-        position: n.position,
-        config: n.data.config,
-      })),
-      edges: edges.map((e) => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        sourceHandle: e.sourceHandle,
-        type: e.data?.type || 'dependency',
-      })),
-    };
+    const st = useWorkflowStore.getState();
+    const doc = toBackendCanvas(st.nodes, st.edges, {
+      id: st.workflowId || undefined,
+      name: st.workflowName,
+      workflow: st.dsl.workflow,
+      context: contextFromNodes(st.nodes),
+    });
 
-    const jsonStr = JSON.stringify(workflowData, null, 2);
-    const blob = new Blob([jsonStr], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
+    try {
+      const res = await api.canvasToQwf({
+        ...doc,
+        baseIr: st.dsl.baseIr ?? undefined,
+      }) as {
+        ok: boolean;
+        errors?: string[];
+        qwf?: string;
+        stable?: boolean;
+        unstableDiff?: string[];
+        changed?: boolean;
+        diff?: string[];
+        error?: string;
+      };
 
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${workflowName.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}.qmclaw.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+      if (!res.ok) {
+        onLog("❌ 导出失败：" + ((res.errors || [res.error]).filter(Boolean).join('; ')), true);
+        return;
+      }
+      // 语义等价：画布 → IR → 画布 → IR 必须稳定，否则导出会丢语义
+      if (res.stable === false) {
+        onLog("❌ 导出被阻止：画布无法无损表达当前工作流（导出会丢语义）", true);
+        (res.unstableDiff || []).slice(0, 10).forEach((d) => onLog("   · " + d, true));
+        return;
+      }
+      if (res.changed) {
+        onLog(`ℹ️ 相对打开时的工作流有 ${res.diff?.length ?? 0} 处改动`);
+      }
 
-    onLog(`📤 Exported: ${workflowName}.qmclaw.json`);
-  }, [workflowName, nodes, edges, onLog]);
+      const text = res.qwf || '';
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${(st.workflowName || 'workflow').replace(/[^a-zA-Z0-9_.-]/g, '_')}.qwf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      onLog(`📤 Exported: ${a.download}`);
+    } catch (e: any) {
+      onLog("❌ Export failed: " + e.message, true);
+    }
+  }, [onLog]);
 
   // ── Import workflow ──────────────────────────────────────────────────────────
 
   const handleImport = useCallback(() => {
     const input = document.createElement('input');
     input.type = 'file';
-    input.accept = '.json,.qmclaw.json';
+    input.accept = '.qwf,.json,.qmclaw.json';
 
     input.onchange = async (e: Event) => {
       const file = (e.target as HTMLInputElement).files?.[0];
@@ -377,6 +424,42 @@ export default function WorkflowCanvas({ onLog }: Props) {
 
       try {
         const text = await file.text();
+
+        // ── `.qwf`（新格式）：文本 → IR → 画布 ──────────────────────────────
+        if (file.name.toLowerCase().endsWith('.qwf') || /^\s*workflow\s/.test(text)) {
+          const res = await api.qwfToCanvas({ text }) as {
+            ok: boolean;
+            error?: string;
+            canvas?: any;
+            ir?: unknown;
+            qwf?: string;
+          };
+          if (!res.ok || !res.canvas) {
+            throw new Error(res.error || '解析 .qwf 失败');
+          }
+          const { nodes: storeNodes, edges: storeEdges } = fromBackendCanvas(res.canvas);
+          const unsupported: string[] = res.canvas.unsupported || [];
+          loadWorkflow(
+            storeNodes as any,
+            storeEdges as any,
+            res.canvas.id || undefined,
+            res.canvas.name || file.name.replace(/\.qwf$/i, ''),
+            {
+              baseIr: res.ir ?? null,
+              qwf: res.qwf ?? text,
+              source: 'import',
+              workflow: res.canvas.workflow || {},
+              unsupported,
+            }
+          );
+          if (unsupported.length > 0) {
+            onLog(`ℹ️ ${unsupported.length} 类语句画布暂不支持（已按原文保留）：${unsupported.join(', ')}`);
+          }
+          onLog(`📥 Imported .qwf: ${res.canvas.name || file.name}`);
+          return;
+        }
+
+        // ── 老画布快照 JSON（兼容）──────────────────────────────────────────
         const workflowData = JSON.parse(text);
 
         // Validate structure
@@ -440,49 +523,38 @@ export default function WorkflowCanvas({ onLog }: Props) {
     onLog(`📂 Loading workflow ${workflowId}...`);
 
     try {
-      const workflow = await api.getWorkflow(workflowId) as {
+      const res = await api.getWorkflow(workflowId) as {
+        ok: boolean;
         id: string;
         name: string;
-        nodes: Array<{
-          id: string;
-          type: string;
-          position: { x: number; y: number };
-          config: Record<string, unknown>;
-        }>;
-        edges: Array<{
-          id: string;
-          source: string;
-          target: string;
-          sourceHandle?: string;
-          type?: string;
-        }>;
+        text?: string;
+        ir?: unknown;
+        canvas?: any;
+        source?: string;
+        error?: string;
       };
-
-      // Convert to store format
-      const storeNodes = workflow.nodes.map((n) => ({
-        id: n.id,
-        type: 'workflowNode' as const,
-        position: n.position,
-        data: {
-          label: '',
-          type: n.type,
-          config: n.config || {},
-          status: 'idle' as const,
-        },
-      }));
-
-      const storeEdges = (workflow.edges || []).map((e) => ({
-        id: e.id || `e_${e.source}_${e.target}`,
-        source: e.source,
-        target: e.target,
-        sourceHandle: e.sourceHandle,
-        type: 'smoothstep' as const,
-        animated: false,
-        data: { type: e.type || 'dependency' },
-      }));
-
-      loadWorkflow(storeNodes as any, storeEdges as any, workflow.id, workflow.name);
-      onLog(`✅ Loaded workflow: ${workflow.name}`);
+      if (!res.ok || !res.canvas) {
+        throw new Error(res.error || '存档读取失败');
+      }
+      const { nodes: storeNodes, edges: storeEdges } = fromBackendCanvas(res.canvas);
+      const unsupported: string[] = res.canvas.unsupported || [];
+      loadWorkflow(
+        storeNodes as any,
+        storeEdges as any,
+        res.id,
+        res.name,
+        {
+          baseIr: res.ir ?? null,
+          qwf: res.text ?? null,
+          source: res.source || 'saved',
+          workflow: res.canvas.workflow || {},
+          unsupported,
+        }
+      );
+      if (unsupported.length > 0) {
+        onLog(`ℹ️ ${unsupported.length} 类语句画布暂不支持（已按原文保留）：${unsupported.join(', ')}`);
+      }
+      onLog(`✅ Loaded workflow: ${res.name}`);
     } catch (e: any) {
       onLog(`❌ Load failed: ${e.message}`, true);
     }
@@ -493,16 +565,28 @@ export default function WorkflowCanvas({ onLog }: Props) {
   const handleSave = useCallback(async () => {
     onLog("💾 Saving workflow...");
 
-    const workflowData = {
-      id: workflowId || undefined,
-      name: workflowName,
-      nodes: nodes.map((n) => ({
+    const st = useWorkflowStore.getState();
+    // 存档是 `.qwf`（语义），不是画布快照 —— 节点必须带上 `dsl`（原语句）
+    const doc = toBackendCanvas(st.nodes, st.edges, {
+      id: st.workflowId || undefined,
+      name: st.workflowName,
+      workflow: st.dsl.workflow,
+      context: contextFromNodes(st.nodes),
+    });
+    const payload = { ...doc, baseIr: st.dsl.baseIr ?? undefined };
+    // 本地备份（老 JSON 快照，仅作草稿兜底）
+    const backup = {
+      id: st.workflowId || undefined,
+      name: st.workflowName,
+      nodes: st.nodes.map((n) => ({
         id: n.id,
         type: n.data.type,
         position: n.position,
         config: n.data.config,
+        // dsl（原语句）必须存进本地草稿，否则从草稿恢复后导出会丢语义
+        dsl: n.data.dsl,
       })),
-      edges: edges.map((e) => ({
+      edges: st.edges.map((e) => ({
         id: e.id,
         source: e.source,
         target: e.target,
@@ -512,25 +596,37 @@ export default function WorkflowCanvas({ onLog }: Props) {
     };
 
     try {
-      const result = await api.saveWorkflow(workflowData) as { id: string; name: string; version: number };
+      const result = await api.saveWorkflow(payload) as {
+        ok: boolean;
+        id: string;
+        name: string;
+        version: number;
+        error?: string;
+        unstableDiff?: string[];
+      };
+      if (!result.ok) {
+        onLog("❌ Save failed: " + (result.error || 'unknown'), true);
+        (result.unstableDiff || []).slice(0, 10).forEach((d) => onLog("   · " + d, true));
+        return;
+      }
       setWorkflowMeta(result.id, result.name);
       onLog(`✅ Saved workflow: ${result.name} (v${result.version})`);
 
       // Also save to localStorage as backup
       const key = `qmclaw_workflow_${result.id}`;
-      localStorage.setItem(key, JSON.stringify({ ...workflowData, savedAt: new Date().toISOString() }));
+      localStorage.setItem(key, JSON.stringify({ ...backup, id: result.id, name: result.name, savedAt: new Date().toISOString() }));
     } catch (e: any) {
       onLog("❌ Save failed: " + e.message, true);
       // Fallback to localStorage
       try {
         const key = `qmclaw_workflow_${workflowId || 'draft'}`;
-        localStorage.setItem(key, JSON.stringify({ ...workflowData, savedAt: new Date().toISOString() }));
+        localStorage.setItem(key, JSON.stringify({ ...backup, savedAt: new Date().toISOString() }));
         onLog("✅ Saved to localStorage (offline mode)");
       } catch (e2: any) {
         onLog("❌ LocalStorage save also failed: " + e2.message, true);
       }
     }
-  }, [workflowName, nodes, edges, workflowId, onLog, setWorkflowMeta]);
+  }, [workflowId, onLog, setWorkflowMeta]);
 
   // ── Config node ─────────────────────────────────────────────────────────────
 
@@ -555,6 +651,7 @@ export default function WorkflowCanvas({ onLog }: Props) {
         type: n.data.type,
         position: n.position,
         config: n.data.config,
+        dsl: n.data.dsl,
       })),
       edges: edges.map((e) => ({
         id: e.id,
@@ -594,52 +691,71 @@ export default function WorkflowCanvas({ onLog }: Props) {
     if (nodes.length > 0 || workflowId === null) return;
 
     // Check if there's a saved workflow in localStorage
+    // 注意：草稿快照可能来自旧版本（没有 nodes/edges），逐个校验后再用，
+    // 直接 `workflow.nodes.map` 会在老快照上抛 "Cannot read properties of undefined"。
     const keys = Object.keys(localStorage).filter((k) => k.startsWith('qmclaw_workflow_'));
-    if (keys.length > 0) {
+    // 优先用当前 workflowId 对应的那份，其余按写入顺序兜底
+    const preferred = `qmclaw_workflow_${workflowId}`;
+    const ordered = [preferred, ...keys.filter((k) => k !== preferred)];
+
+    for (const key of ordered) {
+      const saved = localStorage.getItem(key);
+      if (!saved) continue;
+      let workflow: any = null;
       try {
-        const saved = localStorage.getItem(keys[0]);
-        if (saved) {
-          const workflow = JSON.parse(saved);
-          // Convert to store format
-          const storeNodes = workflow.nodes.map((n: {
-            id: string;
-            type: string;
-            position: { x: number; y: number };
-            config: Record<string, unknown>;
-          }) => ({
-            id: n.id,
-            type: 'workflowNode' as const,
-            position: n.position,
-            data: {
-              label: '',
-              type: n.type,
-              config: n.config,
-              status: 'idle',
-            },
-          }));
+        workflow = JSON.parse(saved);
+      } catch {
+        console.warn('[workflow] 跳过无法解析的本地草稿:', key);
+        continue;
+      }
+      if (!workflow || !Array.isArray(workflow.nodes) || !Array.isArray(workflow.edges)) {
+        console.warn('[workflow] 跳过格式不完整的本地草稿:', key);
+        continue;
+      }
+      try {
+        // Convert to store format
+        const storeNodes = workflow.nodes.map((n: {
+          id: string;
+          type: string;
+          position: { x: number; y: number };
+          config: Record<string, unknown>;
+          dsl?: unknown;
+        }) => ({
+          id: n.id,
+          type: 'workflowNode' as const,
+          position: n.position,
+          data: {
+            label: '',
+            type: n.type,
+            config: n.config,
+            // dsl（原语句）必须一起恢复，否则导出 .qwf 会丢语义
+            dsl: n.dsl as any,
+            status: 'idle',
+          },
+        }));
 
-          const storeEdges = workflow.edges.map((e: {
-            id: string;
-            source: string;
-            target: string;
-            sourceHandle?: string;
-            type?: string;
-          }) => ({
-            id: e.id,
-            source: e.source,
-            target: e.target,
-            sourceHandle: e.sourceHandle,
-            type: 'smoothstep' as const,
-            animated: false,
-            data: { type: e.type || 'dependency' },
-          }));
+        const storeEdges = workflow.edges.map((e: {
+          id: string;
+          source: string;
+          target: string;
+          sourceHandle?: string;
+          type?: string;
+        }) => ({
+          id: e.id,
+          source: e.source,
+          target: e.target,
+          sourceHandle: e.sourceHandle,
+          type: 'smoothstep' as const,
+          animated: false,
+          data: { type: e.type || 'dependency' },
+        }));
 
-          loadWorkflow(storeNodes as any, storeEdges as any, keys[0].replace('qmclaw_workflow_', ''), workflow.name);
-          onLog("📂 Loaded workflow: " + workflow.name);
-        }
+        loadWorkflow(storeNodes as any, storeEdges as any, key.replace('qmclaw_workflow_', ''), workflow.name);
+        onLog("📂 Loaded workflow: " + workflow.name);
       } catch (e) {
         console.error('Failed to load workflow:', e);
       }
+      return;
     }
   }, [loadWorkflow, onLog, nodes.length, workflowId]);
 
@@ -675,6 +791,7 @@ export default function WorkflowCanvas({ onLog }: Props) {
           onExport={handleExport}
           onImport={handleImport}
           onLoad={handleLoadWorkflow}
+          onToggleQwfInfo={() => setShowQwfInfo(!showQwfInfo)}
           onLog={onLog}
         />
       </div>
@@ -709,6 +826,9 @@ export default function WorkflowCanvas({ onLog }: Props) {
           }}
         />
       )}
+
+      {/* .qwf 信息面板 */}
+      {showQwfInfo && <QwfInfoPanel onClose={() => setShowQwfInfo(false)} />}
 
       {/* Node Search */}
       {showSearch && <NodeSearch onClose={() => setShowSearch(false)} />}

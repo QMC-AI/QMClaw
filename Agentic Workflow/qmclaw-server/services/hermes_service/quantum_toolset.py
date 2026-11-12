@@ -101,8 +101,8 @@ def setup_hermes_tools(registry: ToolRegistry, quantum_service_url: str = QUANTU
         return []
 
     def execute_code(code: str) -> Dict[str, Any]:
-        """执行代码"""
-        result = _http_call(f"{quantum_service_url}/execute", {"code": code}, "POST")
+        """执行代码（显式同步：阶段 16a 起 /execute 默认异步，工具调用要的是结果）"""
+        result = _http_call(f"{quantum_service_url}/execute", {"code": code, "wait": True}, "POST")
         if result.get("status") == "success":
             return result
         return {"error": result.get("error", "Unknown error")}
@@ -114,7 +114,9 @@ def setup_hermes_tools(registry: ToolRegistry, quantum_service_url: str = QUANTU
         param_str = ", ".join(f"{k}={repr(v)}" for k, v in params.items())
         code = f"{func_name}({param_str})"
 
-        result = _http_call(f"{quantum_service_url}/execute", {"code": code}, "POST")
+        result = _http_call(
+            f"{quantum_service_url}/execute", {"code": code, "wait": True}, "POST"
+        )
 
         # 包装结果
         return {

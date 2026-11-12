@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional
 
 from ..base import BaseService, ServiceConfig, run_service, _safe_print
 from ..common import setup_logging, config, FallbackManager, ConnectionState
+from ..common.errors import error_envelope
+from ..common.availability import build_availability, derive_legacy_status
 from ..common.offline_data_provider import OfflineDataProvider
 from ..common.offline_data_lab import OfflineDataLab, OfflineQubitUpdater
 from ..common.offline_variant_generator import VariantGenerator
@@ -216,43 +218,52 @@ class AnalysisService(BaseService):
             self._data = dc.DataLab(self._session_path, self._dv, dv_type="data_vault")
             _log(f"DataLab initialized")
 
-            # 初始化 InfoBase
-            try:
-                info_path = get_info_path(self._s)
-                self._info = dc.InfoBase(info_path)
-                _log("InfoBase loaded")
-            except Exception as e:
-                _log(f"InfoBase not available: {e}")
-                self._info = None
-
-            # 初始化 QubitUpdater（参考 dp_config.py 第58行）
-            try:
-                self._qter = QubitUpdater(self._data, self._info)
-                _log("QubitUpdater initialized")
-            except Exception as e:
-                _log(f"QubitUpdater not available: {e}")
-                self._qter = None
+            # InfoBase / QubitUpdater 是可选组件：info 文件缺失时 DataLab 仍能出图
+            self._init_info_optional(dc, QubitUpdater, get_info_path)
 
             _log(f"Analysis service ready for session: {'/'.join(self._session_path)}")
             self._fallback.on_connection_success()
 
         except Exception as e:
-            _log(f"Failed to connect to LabRAD: {e}")
+            _log(f"Failed to connect to LabRAD: {type(e).__name__}: {e}")
             traceback.print_exc()
-            self._fallback.on_connection_failed(str(e))
+            self._fallback.on_connection_failed(f"{type(e).__name__}: {e}")
             self._fallback.start_reconnect_timer(self._do_reconnect)
 
+    def _init_info_optional(self, dc, QubitUpdater, get_info_path):
+        """初始化 InfoBase 与 QubitUpdater（两者都可缺失，不影响 DataLab 出图）。
+
+        info 文件（registry 的 info path，本机为 D:/exp_log/test.hdf5）可能不存在：
+        此时 QubitUpdater 不可用，绘图命令里的 qter.fitData 会退化为原始数据绘图。
+        之前在 _do_reconnect / _handle_connect 里这一步没有单独兜底，导致
+        "LabRAD 明明连上了，却仍被判定为连接失败"。
+        """
+        try:
+            info_path = get_info_path(self._s)
+            self._info = dc.InfoBase(info_path)
+            _log("InfoBase loaded")
+        except Exception as e:
+            _log(f"InfoBase not available: {type(e).__name__}: {e}")
+            self._info = None
+
+        try:
+            self._qter = QubitUpdater(self._data, self._info) if self._data is not None else None
+            _log("QubitUpdater initialized")
+        except Exception as e:
+            _log(f"QubitUpdater not available: {type(e).__name__}: {e}")
+            self._qter = None
+
     def _do_reconnect(self) -> bool:
-        """执行重连"""
-        # 离线模式或自动模式下 LabRAD 不可用时，跳过重连
+        """执行重连
+
+        AUTO 模式下也允许重试：服务启动瞬间 LabRAD 常被 quantum_service 的
+        重初始化占用，首次连接会超时；此前"从未成功连接过就跳过重连"会让
+        analysis 永久停在 offline，只能重启进程（2026-11-02 实测）。
+        重试上限由 FallbackManager.max_retry_attempts 控制（默认 5 次）。
+        """
         with self._mode_lock:
             if self._mode == self.Mode.OFFLINE:
                 _log("Skipping reconnect: offline mode enabled")
-                self._fallback._cancel_retry_timer()
-                return False
-            if self._mode == self.Mode.AUTO and self._data is None and not self._fallback.is_connected:
-                # AUTO 模式下且从未成功连接过，跳过重连
-                _log("Skipping reconnect: auto mode, no previous successful connection")
                 self._fallback._cancel_retry_timer()
                 return False
 
@@ -268,13 +279,13 @@ class AnalysisService(BaseService):
             self._session_path = self._load_session_config()
             self._s = registry_wrapper2.RegistryWrapper(self._cxn, self._session_path)
             self._data = dc.DataLab(self._session_path, self._dv, dv_type="data_vault")
-            info_path = get_info_path(self._s)
-            self._info = dc.InfoBase(info_path)
-            self._qter = QubitUpdater(self._data, self._info)
+            self._init_info_optional(dc, QubitUpdater, get_info_path)
             self._load_fallback_data()
+            _log(f"Reconnected to LabRAD, session: {'/'.join(self._session_path)}")
             return True
         except Exception as e:
-            self._fallback._last_error = str(e)
+            self._fallback._last_error = f"{type(e).__name__}: {e}"
+            _log(f"Reconnect failed: {type(e).__name__}: {e}")
             return False
 
     def _load_fallback_data(self):
@@ -360,21 +371,11 @@ class AnalysisService(BaseService):
         }
 
     def _load_session_config(self) -> List[str]:
-        """加载会话配置"""
-        config_path = Path(__file__).parent.parent.parent / "config" / "session.json"
+        """加载会话配置（唯一实现在 services/common/session.py）"""
+        from ..common.session import load_session_config
 
-        if config_path.exists():
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-                session = config.get("session", {})
-                user = session.get("user", "LQHL")
-                path = session.get("path", ["test", "20260324"])
-                return ["", user] + path
-            except Exception:
-                pass
-
-        return ["", "LQHL", "test", "20260324"]
+        session_path, _source = load_session_config()
+        return session_path
 
     def _switch_session(self, session_path: List[str]):
         """切换会话（参考 dp_config.py switch_session 函数）"""
@@ -440,6 +441,8 @@ class AnalysisService(BaseService):
             return self._handle_plot_offline(data)
         elif path == "/plot/offline/v2":
             return self._handle_plot_offline_v2(data)
+        elif path == "/plot/online/v2":
+            return self._handle_plot_online_v2(data)
         elif path == "/variants/types":
             return self._handle_variant_types()
         elif path == "/variants/generate":
@@ -452,26 +455,12 @@ class AnalysisService(BaseService):
             raise ValueError(f"Unknown path: {path}")
 
     def _handle_health(self) -> Dict[str, Any]:
-        """健康检查"""
-        has_data = self._data is not None
-        fallback_info = self._fallback.get_status_info()
-        return {
-            "status": "healthy" if has_data else "degraded",
-            "service": "analysis_service",
-            "datalab_connected": has_data,
-            "fallback_mode": self._fallback.is_degraded,
-            "fallback_state": fallback_info["state"],
-            "fallback_message": self._get_fallback_message(),
-            "ready": not self._busy.is_set(),
-            "busy": self._busy.is_set(),
-            "current_task": self._current_task_id,
-            "session_path": self._session_path,
-            "mode": self._get_mode(),
-            "offline_available": self._offline_provider is not None and self._offline_provider.is_available,
-            "stuck": self._exec_stuck is not None,
-            "stuck_reason": self._exec_stuck,
-            **self._connection_fields(),
-        }
+        """健康检查（HTTP 层通常已被 base_service 拦下，这里只做委托）。
+
+        早前这里另写了一份判据（不认 stuck / offline_provider），与
+        ``get_health`` 不一致。现在只有 ``get_health`` 一份。
+        """
+        return self.get_health()
 
     def _handle_mode(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """处理模式切换请求
@@ -537,15 +526,13 @@ class AnalysisService(BaseService):
                 self._session_path = self._load_session_config()
                 self._s = registry_wrapper2.RegistryWrapper(self._cxn, self._session_path)
                 self._data = dc.DataLab(self._session_path, self._dv, dv_type="data_vault")
-                info_path = get_info_path(self._s)
-                self._info = dc.InfoBase(info_path)
-                self._qter = QubitUpdater(self._data, self._info)
+                self._init_info_optional(dc, QubitUpdater, get_info_path)
                 self._load_fallback_data()
                 self._fallback.on_connection_success()
                 return True
             except Exception as e:
-                _log(f"Failed to connect to LabRAD: {e}")
-                self._fallback.on_connection_failed(str(e))
+                _log(f"Failed to connect to LabRAD: {type(e).__name__}: {e}")
+                self._fallback.on_connection_failed(f"{type(e).__name__}: {e}")
                 return False
 
     def _handle_datasets_offline(self, query: Dict[str, List[str]]) -> Dict[str, Any]:
@@ -807,6 +794,200 @@ class AnalysisService(BaseService):
             _log(f"Offline v2 plot error: {e}\n{traceback.format_exc()}")
             return {"error": str(e), "success": False}
 
+    @serialized_plot
+    def _handle_plot_online_v2(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        在线（活数据）拟合接口，形状与 /plot/offline/v2 一致。
+
+        离线接口只认 HDF5 索引里的 id（形如 "20251103_00485"），
+        真机刚跑出来的数据集 id 是纯数字实验编号（如 "894"），两者对不上，
+        所以活数据必须走这个在线端点（self._data = LabRAD DataLab）。
+
+        请求: {"dataset_id": "894", "command": "qter.fitData(do_plot=False)"}
+        返回: {"success": true, "image": "data:image/png;base64,...", "fit_metrics": {...}}
+        """
+        dataset_id = str(data.get("dataset_id") or "").strip()
+        command = str(data.get("command") or "qter.fitData(do_plot=True)")
+
+        if not dataset_id:
+            return {"error": "dataset_id is required", "success": False}
+        if self._data is None:
+            return {
+                "error": "DataLab not connected：analysis_service 未连上 LabRAD（可 POST /mode {\"mode\":\"online\"} 重连）",
+                "success": False,
+            }
+        try:
+            dataset_num = int(dataset_id)
+        except (TypeError, ValueError):
+            return {
+                "error": f"在线接口只接受纯数字实验编号，收到 {dataset_id!r}",
+                "success": False,
+            }
+
+        self._setup_paths()
+
+        try:
+            self._data.loadDataset(dataset_num)
+        except Exception as e:
+            _log(f"Online v2 loadDataset({dataset_num}) failed: {e}")
+            return {"error": f"loadDataset({dataset_num}) failed: {e}", "success": False}
+
+        # QubitUpdater 按需初始化（info 缺失时保持 None，命令退化为原始绘图）
+        if self._qter is None and self._info is not None:
+            try:
+                from lqms.data_process import QubitUpdater
+                self._qter = QubitUpdater(self._data, self._info)
+                _log("QubitUpdater initialized on demand (online v2)")
+            except Exception as e:
+                _log(f"QubitUpdater initialization failed: {e}")
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import numpy as np
+            from io import BytesIO
+
+            plt.close('all')
+
+            # fitData 默认 collect=False 不返回结果，这里强制补上 collect=True
+            cmd = command
+            if "collect=" not in cmd:
+                cmd = re.sub(r"qter\.fitData\(([^)]*)\)", r"qter.fitData(collect=True, \1)", cmd, count=1)
+
+            cmd_result = None
+            try:
+                cmd_result = self._execute_plot_command(cmd, {
+                    "qter": self._qter,
+                    "data": self._data,
+                    "plt": plt,
+                    "np": np,
+                    "collect": True,
+                    "do_plot": True,
+                })
+                _log(f"Online v2 plot command executed on dataset {dataset_num}: {cmd_result}")
+            except Exception as plot_err:
+                _log(f"Online v2 plot command error: {plot_err}")
+
+            metrics = self._extract_fit_metrics(cmd_result)
+            dataset_name = str(getattr(self._data, "dataset_name", "") or "")
+            if "T1_us" not in metrics:
+                # 厂商 fit 的键名/单位不可控（data_process 是编译好的 .pyd），
+                # T1 缺指标时用与离线实现同样的指数衰减拟合兜底，单位统一为 µs
+                est = self._estimate_t1_us(getattr(self._data, "data", None))
+                if est:
+                    metrics["T1_us"] = est
+
+            # 没有图（do_plot=False）时补一张原始数据图，保证前端有图可看
+            fig_nums = plt.get_fignums()
+            if not fig_nums:
+                plt.figure()
+                arr = getattr(self._data, "data", None)
+                if arr is not None:
+                    arr = np.asarray(arr)
+                    if arr.ndim == 2 and arr.shape[1] >= 2:
+                        plt.plot(arr[:, 0], arr[:, 1], 'b.-')
+                        plt.xlabel("X")
+                        plt.ylabel("Y")
+                    else:
+                        plt.plot(arr.flatten(), 'b.-')
+                        plt.xlabel("Index")
+                        plt.ylabel("Y")
+                    plt.title(f"Dataset {dataset_num} (raw)")
+                    plt.grid(True)
+                fig_nums = plt.get_fignums()
+
+            fig = plt.figure(fig_nums[-1] if fig_nums else 1)
+            plt.tight_layout()
+
+            buffer = BytesIO()
+            fig.savefig(buffer, format='png', dpi=self._default_dpi, bbox_inches='tight')
+            buffer.seek(0)
+            base64_image = base64.b64encode(buffer.read()).decode('utf-8')
+
+            import uuid
+            plots_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+                                      "qmclaw-web", "public", "plots")
+            os.makedirs(plots_dir, exist_ok=True)
+            filename = f"online_v2_{uuid.uuid4().hex[:8]}.png"
+            filepath = os.path.join(plots_dir, filename)
+            fig.savefig(filepath, format='png', dpi=self._default_dpi, bbox_inches='tight')
+            plt.close(fig)
+
+            return {
+                "success": True,
+                "image_url": f"/plots/{filename}",
+                "image": f"data:image/png;base64,{base64_image}",
+                "dataset_id": dataset_id,
+                "dataset_name": dataset_name,
+                "qubit": "",
+                "experiment_type": "",
+                "fit_metrics": metrics,
+            }
+        except Exception as e:
+            _log(f"Online v2 plot error: {e}\n{traceback.format_exc()}")
+            return {"error": str(e), "success": False}
+
+    def _extract_fit_metrics(self, cmd_result: Any) -> Dict[str, float]:
+        """从 fitData 返回值里抽标量指标，并统一成 *_us 命名。"""
+        metrics: Dict[str, float] = {}
+        if isinstance(cmd_result, dict):
+            inner = cmd_result.get("metrics")
+            if isinstance(inner, dict):
+                for k, v in inner.items():
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        metrics[str(k)] = float(v)
+            else:
+                for k, v in cmd_result.items():
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        metrics[str(k)] = float(v)
+        elif isinstance(cmd_result, (tuple, list)) and cmd_result and isinstance(cmd_result[0], dict):
+            for k, v in cmd_result[0].items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    metrics[str(k)] = float(v)
+        # 单位归一：厂商 fit 常给 T1/T2（ns 量级），统一折算成 µs 键
+        for src, dst in (("T1", "T1_us"), ("t1", "T1_us"), ("T2", "T2_us"), ("t2", "T2_us")):
+            if dst not in metrics and src in metrics:
+                val = float(metrics[src])
+                metrics[dst] = val / 1000.0 if val > 1000 else val
+        return metrics
+
+    def _estimate_t1_us(self, arr: Any) -> Optional[float]:
+        """指数衰减兜底拟合 A*exp(-t/tau)+c，返回 tau（µs）。
+
+        与 services/common/offline_data_lab.py 的 T1 拟合同一套逻辑，
+        保证在线/离线两条路径给出的 T1_us 语义一致（x 轴 ns → µs）。
+        """
+        if arr is None:
+            return None
+        try:
+            import numpy as np
+            from scipy.optimize import curve_fit
+            arr = np.asarray(arr)
+            if arr.ndim == 2 and arr.shape[1] >= 2:
+                x = arr[:, 0]
+                y = arr[:, 1]
+            else:
+                x = np.arange(len(arr.flatten()))
+                y = arr.flatten()
+            if len(x) < 5:
+                return None
+
+            def _exp_decay(t, A, tau, c):
+                return A * np.exp(-t / tau) + c
+
+            A0 = float(np.max(y) - np.min(y))
+            c0 = float(np.min(y))
+            tau0 = float((np.max(x) - np.min(x)) / 3.0)
+            popt, _ = curve_fit(_exp_decay, x, y, p0=[A0, tau0, c0], maxfev=20000)
+            tau_fit = float(popt[1])
+            if tau_fit <= 0:
+                return None
+            return tau_fit / 1000.0 if tau_fit > 1000 else tau_fit
+        except Exception as e:
+            _log(f"T1 fallback fit failed: {e}")
+            return None
+
     def _execute_plot_command(self, command: str, context: Dict[str, Any]) -> Any:
         """
         执行绘图命令
@@ -1013,7 +1194,15 @@ class AnalysisService(BaseService):
         return "LabRAD 未连接"
 
     def _handle_connect(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """手动触发连接或重连"""
+        """手动触发连接或重连（可用请求里的 session_path 指定会话）"""
+        from ..common.session import parse_session_path
+
+        requested_session, session_error = parse_session_path(data.get("session_path"))
+        if session_error:
+            return {
+                **error_envelope("validation_error", session_error, success=False),
+            }
+
         with self._labrad_lock:
             try:
                 self._setup_paths()
@@ -1041,14 +1230,13 @@ class AnalysisService(BaseService):
                 self._dv = self._cxn.data_vault
                 _log("LabRAD connected")
 
-                # 设置会话
-                self._session_path = self._load_session_config()
+                # 设置会话（请求里指定了就用请求的，否则读配置）
+                self._session_path = requested_session or self._load_session_config()
                 self._s = registry_wrapper2.RegistryWrapper(self._cxn, self._session_path)
                 self._data = dc.DataLab(self._session_path, self._dv, dv_type="data_vault")
 
-                info_path = get_info_path(self._s)
-                self._info = dc.InfoBase(info_path)
-                self._qter = QubitUpdater(self._data, self._info)
+                # info 文件缺失不应判定为连接失败（否则永远连不上）
+                self._init_info_optional(dc, QubitUpdater, get_info_path)
 
                 _log(f"Analysis service connected for session: {'/'.join(self._session_path)}")
                 self._fallback.on_connection_success()
@@ -1061,9 +1249,9 @@ class AnalysisService(BaseService):
                 }
 
             except Exception as e:
-                _log(f"Connection failed: {e}")
+                _log(f"Connection failed: {type(e).__name__}: {e}")
                 traceback.print_exc()
-                self._fallback.on_connection_failed(str(e))
+                self._fallback.on_connection_failed(f"{type(e).__name__}: {e}")
                 self._fallback.start_reconnect_timer(self._do_reconnect)
                 return {
                     "success": False,
@@ -1074,12 +1262,17 @@ class AnalysisService(BaseService):
 
     def _handle_switch_session(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """切换会话"""
-        session_path = data.get("session_path")
-        if not session_path:
-            return {"success": False, "error": "session_path is required"}
+        from ..common.session import parse_session_path
 
-        if isinstance(session_path, str):
-            session_path = json.loads(session_path)
+        session_path, session_error = parse_session_path(data.get("session_path"))
+        if session_error:
+            return {
+                **error_envelope("validation_error", session_error, success=False),
+            }
+        if session_path is None:
+            return {
+                **error_envelope("validation_error", "session_path is required", success=False),
+            }
 
         with self._labrad_lock:
             try:
@@ -1111,9 +1304,8 @@ class AnalysisService(BaseService):
 
         if not get_actuation_flags("analysis_service")["allow_execute"]:
             return {
+                **error_envelope("read_only", "当前为只读联调，禁止执行分析代码"),
                 "task_id": data.get("task_id", f"task_{int(time.time() * 1000)}"),
-                "status": "read_only",
-                "error": "当前为只读联调，禁止执行分析代码",
                 "hint": "如需执行请将 fallback_config.json 的 analysis_service.actuation.allow_execute 设为 true，"
                         "或设置环境变量 QMCLAW_ALLOW_EXECUTE=1（须人工确认并记录）",
                 "actuation_allowed": False,
@@ -1121,18 +1313,16 @@ class AnalysisService(BaseService):
 
         if self._exec_stuck:
             return {
+                **error_envelope("stuck", self._exec_stuck),
                 "task_id": data.get("task_id", f"task_{int(time.time() * 1000)}"),
-                "status": "stuck",
-                "error": self._exec_stuck,
                 "hint": "上一次执行超时后工作线程可能仍在运行，已拒绝并发下发。",
             }
 
         # 降级模式下拒绝执行
         if self._fallback.is_degraded:
             return {
+                **error_envelope("degraded", "LabRAD 不可用，无法执行分析"),
                 "task_id": data.get("task_id", f"task_{int(time.time() * 1000)}"),
-                "status": "degraded",
-                "error": "LabRAD 不可用，无法执行分析",
                 "fallback_message": self._get_fallback_message(),
             }
 
@@ -1246,11 +1436,10 @@ class AnalysisService(BaseService):
             )
             _log(f"[STUCK] {self._exec_stuck}")
             return {
+                **error_envelope("timeout", result_container["error"] or "执行超时"),
                 "task_id": task_id,
-                "status": "timeout",
                 "stdout": result_container["stdout"],
                 "stderr": result_container["stderr"],
-                "error": result_container["error"],
                 "stuck": True,
                 "hint": "服务已标记卡死，后续执行将被拒绝，直到人工确认后重启服务。",
             }
@@ -1287,20 +1476,52 @@ class AnalysisService(BaseService):
 
             # 加载数据
             self._data.loadDataset(dataset_index)
+
+            # QubitUpdater 按需初始化（info 文件缺失时保持 None，命令回退到原始绘图）
+            if self._qter is None:
+                try:
+                    from lqms.data_process import QubitUpdater
+                    self._qter = QubitUpdater(self._data, self._info)
+                    _log("QubitUpdater initialized on demand")
+                except Exception as e:
+                    _log(f"QubitUpdater initialization failed: {e}")
+
+            # 前端下发的是 defaultPlotCommand（形如 qter.fitData({exp_num})），
+            # 必须把 {exp_num} 换成刚加载的数据集编号，否则 exec 会 NameError
+            exp_num = getattr(self._data, "dataset_num", dataset_index)
+            plot_command = (command or "").replace("{exp_num}", str(exp_num))
+            _log(f"Plot command: {plot_command} (dataset {exp_num})")
+
             x = self._data.data[:, 0]
             y = self._data.data[:, 1] if self._data.data.shape[1] > 1 else self._data.data[:, 0]
 
             # 创建图表
             fig = plt.figure(figsize=self._default_figsize)
 
-            if command and command.strip():
+            if plot_command.strip():
                 # 执行自定义命令
                 try:
-                    exec(command, {"plt": plt, "np": np, "x": x, "y": y, "fig": fig})
+                    exec(plot_command, {
+                        "plt": plt,
+                        "np": np,
+                        "x": x,
+                        "y": y,
+                        "fig": fig,
+                        "qter": self._qter,
+                        "data": self._data,
+                    })
                 except Exception as e:
-                    _log(f"Plot command error: {e}")
+                    _log(f"Plot command error: {type(e).__name__}: {e}")
+                    # 回退：直接画原始数据，并标出数据集名，便于人工判读
                     plt.plot(x, y, 'b.-')
                     plt.grid(True)
+                    plt.xlabel('X')
+                    plt.ylabel('Y')
+                    plt.title(f'Dataset: {getattr(self._data, "dataset_name", "Latest")} (raw)')
+                # qter.fitData 等命令会自建 figure，必须保存最后一张
+                fig_nums = plt.get_fignums()
+                if fig_nums:
+                    fig = plt.figure(fig_nums[-1])
             else:
                 plt.plot(x, y, 'b.-')
                 plt.xlabel('X')
@@ -1317,10 +1538,14 @@ class AnalysisService(BaseService):
 
             _log(f"Plot saved: {plot_path}")
 
+            # 画出的是哪个数据集要能对账：调用方传了 dataset_index(-1=最新) 时，
+            # 回包给出实际加载的编号与名字，避免"以为画的就是 2669"这类悬案。
             return {
                 "success": True,
                 "plotPath": str(plot_path),
                 "plotUrl": f"/plots/{job_id}.png",
+                "dataset_index": exp_num,
+                "dataset_name": getattr(self._data, "dataset_name", None),
             }
 
         except Exception as e:
@@ -1749,36 +1974,43 @@ class AnalysisService(BaseService):
             return {"error": str(e)}
 
     def get_health(self) -> Dict[str, Any]:
-        """获取健康状态"""
+        """获取健康状态
+
+        可用性判据只有一份：``services/common/availability.py``。历史字段
+        （``status`` / ``datalab_connected`` / …）全部保留，新增 ``availability``。
+        """
         has_data = self._data is not None
         fallback_info = self._fallback.get_status_info()
-
-        # 判断是否应该报告为健康
-        # - DataLab 已连接: healthy
-        # - 离线模式: healthy (degraded 是预期状态)
-        # - 自动模式 + 离线数据可用: healthy
-        # - 在线模式 + DataLab 未连接: degraded (真正的异常)
-        if has_data:
-            is_healthy = True
-        elif self._get_mode() == self.Mode.OFFLINE:
-            is_healthy = True  # 离线模式，degraded 是预期状态
-        elif self._get_mode() == self.Mode.AUTO and self._offline_provider is not None:
-            is_healthy = True  # 自动模式有离线数据兜底
-        else:
-            is_healthy = False  # 在线模式但 DataLab 不可用，才是异常
+        busy = self._busy.is_set()
+        stuck = self._exec_stuck is not None
+        availability = build_availability(
+            device="datalab",
+            device_connected=has_data,
+            mode=self._get_mode(),
+            fallback_state=fallback_info["state"],
+            offline_available=self._offline_provider is not None
+            and self._offline_provider.is_available,
+            stuck=stuck,
+            busy=busy,
+            session_path=self._session_path,
+        )
 
         return {
-            "status": "healthy" if is_healthy else "degraded",
+            "status": derive_legacy_status(availability),
+            "availability": availability,
             "service": "analysis_service",
             "datalab_connected": has_data,
             "fallback_mode": self._fallback.is_degraded,
             "fallback_state": fallback_info["state"],
-            "ready": not self._busy.is_set(),
-            "busy": self._busy.is_set(),
+            "ready": not busy,
+            "busy": busy,
             "current_task": self._current_task_id,
             "session_path": self._session_path,
             "fallback_message": self._get_fallback_message(),
             "mode": self._get_mode(),
+            "offline_available": availability["offlineAvailable"],
+            "stuck": stuck,
+            "stuck_reason": self._exec_stuck,
             **self._connection_fields(),
         }
 

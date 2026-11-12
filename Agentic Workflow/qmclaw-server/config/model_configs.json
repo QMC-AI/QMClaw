@@ -1,20 +1,24 @@
 {
   "models": [
     {
-      "id": "deepseek-flash",
       "name": "DeepSeek Flash",
       "provider": "deepseek",
       "modelId": "deepseek-flash",
+      "baseUrl": "${QMCLAW_DEEPSEEK_BASE_URL}",
       "enabled": true,
       "capabilities": [
-        "text"
+        "text",
+        "vision",
+        "function_calling"
       ],
       "config": {
         "temperature": 0.3,
-        "maxTokens": 4096
+        "maxTokens": 4096,
+        "systemPrompt": ""
       },
+      "id": "deepseek-flash",
       "createdAt": "2026-09-21T00:00:00.000Z",
-      "updatedAt": "2026-09-21T00:00:00.000Z"
+      "updatedAt": "2026-11-09T03:11:01.657Z"
     },
     {
       "name": "MiniMax M2.7",

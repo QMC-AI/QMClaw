@@ -1,0 +1,33 @@
+{
+  "_doc": "写清单默认幅度上界表（v1.3 §13）。键 = 寄存器键，值 = 单次允许的最大改动幅度。来源优先级：IR 顶层 bounds 块 > 本表 > 无（无 ⇒ 不可代理放行，必须人直批）。单位见各键注释。timing.* 不进本表（用户 2026-11-05 定：永不可代理）。discriminator.* 是派生键（厂商按刚采数据重算），也不进本表。",
+  "bounds": {
+    "f10": 0.05,
+    "f21": 0.05,
+    "fread": 0.002,
+    "fc_read": 0.002,
+    "PiGate.amp": 0.2,
+    "PiGate.alpha": 0.5,
+    "PiHalf.amp": 0.2,
+    "PiHalf.alpha": 0.5,
+    "ReadIn.power": 3.0,
+    "ReadIn.ring_power": 3.0,
+    "ReadIn.length": 500.0,
+    "ReadIn.ring_length": 50.0,
+    "ReadIn.zpa": 0.5
+  },
+  "_units": {
+    "f10": "GHz",
+    "f21": "GHz",
+    "fread": "GHz",
+    "fc_read": "GHz",
+    "PiGate.amp": "幅度（无量纲）",
+    "PiGate.alpha": "弧度",
+    "PiHalf.amp": "幅度（无量纲）",
+    "PiHalf.alpha": "弧度",
+    "ReadIn.power": "dB",
+    "ReadIn.ring_power": "dB",
+    "ReadIn.length": "ns",
+    "ReadIn.ring_length": "ns",
+    "ReadIn.zpa": "幅度（无量纲）"
+  }
+}

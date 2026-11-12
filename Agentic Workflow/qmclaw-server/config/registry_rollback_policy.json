@@ -1,0 +1,10 @@
+{
+  "_doc": "P3.5 副作用自愈策略表：实验前后拍 registry 快照，diff 出被改动的键，按本表决定回滚还是只报告。mode=shadow 只记录不回滚（默认）；mode=auto 才真回滚（也可用环境变量 QMCLAW_AUTO_REVERT=1 临时切换）。always_skip 是派生键（厂商按数据重算，永不回滚）；report_only 是不可代理的键（只报告）；不在 registry_bounds.json 幅度表里的键没有上界 ⇒ 只报告，等人决定。回滚本身是写操作，必须有票据覆盖（require_ticket）。",
+  "mode": "shadow",
+  "enabled": true,
+  "always_skip": ["discriminator."],
+  "report_only": ["timing."],
+  "require_ticket": true,
+  "max_keys": 32,
+  "bounds_file": "registry_bounds.json"
+}

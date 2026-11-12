@@ -125,7 +125,11 @@ Returns the experiment result or error message."""
             elapsed = time.time() - start_time
 
             # 服务端结构化拒绝（只读/卡死）原样透传，保留 hint 供 agent 解释
-            if isinstance(result, dict) and result.get("status") in ("read_only", "stuck"):
+            # 阶段 6：status 已归一（read_only→blocked、stuck→degraded），旧值在 legacyStatus
+            if isinstance(result, dict) and (
+                result.get("status") in ("read_only", "stuck", "blocked", "degraded")
+                or result.get("legacyStatus") in ("read_only", "stuck")
+            ):
                 return ToolResult.err(
                     result.get("error") or result.get("status"),
                     error_code=ErrorCode.VALIDATION_ERROR.value,
@@ -316,7 +320,11 @@ Returns experiment results including measured data and parameters."""
             elapsed = time.time() - start_time
 
             # 服务端结构化拒绝（只读/卡死）原样透传
-            if isinstance(result, dict) and result.get("status") in ("read_only", "stuck"):
+            # 阶段 6：status 已归一（read_only→blocked、stuck→degraded），旧值在 legacyStatus
+            if isinstance(result, dict) and (
+                result.get("status") in ("read_only", "stuck", "blocked", "degraded")
+                or result.get("legacyStatus") in ("read_only", "stuck")
+            ):
                 return ToolResult.err(
                     result.get("error") or result.get("status"),
                     error_code=ErrorCode.FORBIDDEN.value,

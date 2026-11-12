@@ -70,6 +70,7 @@ const nodeTypes: Omit<NodePaletteItemProps, 'onClick'>[] = [
   { type: 'context', label: 'Context', icon: '📦', description: 'Define variables' },
   { type: 'experiment', label: 'Experiment', icon: '🔬', description: 'Run sq.* experiment' },
   { type: 'quality_gate', label: 'Quality Gate', icon: '✅', description: 'Pass/fail threshold' },
+  { type: 'contrast', label: 'Contrast', icon: '🎯', description: 'IQ readout contrast gate' },
   { type: 'analyze', label: 'Analyze', icon: '📊', description: 'Parse metrics' },
   { type: 'print', label: 'Print', icon: '📝', description: 'Log a message' },
   { type: 'while', label: 'While Loop', icon: '🔄', description: 'Loop until condition' },

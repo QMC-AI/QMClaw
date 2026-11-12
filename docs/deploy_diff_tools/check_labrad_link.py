@@ -1,8 +1,11 @@
 """LabRAD 只读联调自检 — 一条命令输出全部前置条件与失败原因
 
-只读、不改状态、不下发实验。Run with the env's python:
+只读、不改状态、不下发实验。Run with the target env's python:
 
-    D:\\semester4\\deploy\\qmclaw\\qmclaw\\python.exe docs\\deploy_diff_tools\\check_labrad_link.py
+    D:\\anaconda3\\envs\\lqcs\\python.exe docs\\deploy_diff_tools\\check_labrad_link.py
+
+server 根目录按本文件位置推导（`docs/deploy_diff_tools/` → 仓库根 →
+`Agentic Workflow/qmclaw-server`），也可用第一个参数或 `QMCLAW_SERVER_ROOT` 覆盖。
 
 输出：
   1. 解析出的 host/port/timeout 及其来源（env / system.json / default）
@@ -19,7 +22,12 @@ import tempfile
 import traceback
 from pathlib import Path
 
-SERVER_ROOT = Path(r"D:\semester4\QMClaw\Agentic Workflow\qmclaw-server")
+# 本文件在 <repo>/docs/deploy_diff_tools/ 下，仓库根是上两级
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+SERVER_ROOT = Path(
+    os.environ.get("QMCLAW_SERVER_ROOT")
+    or (sys.argv[1] if len(sys.argv) > 1 else _REPO_ROOT / "Agentic Workflow" / "qmclaw-server")
+)
 if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
 

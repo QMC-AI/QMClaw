@@ -149,6 +149,21 @@ def print_output_loop(name: str, output_queue: queue.Queue):
             continue
 
 
+def is_port_in_use(port: int) -> bool:
+    """探测端口是否已被占用。
+
+    端口被占通常意味着上一次运行留下了孤儿进程：新实例会绑定失败并以
+    ``[Errno 10048]`` 退出，而调用方只会看到一句语焉不详的 "exited with code 1"。
+    提前探测可以把这种问题在启动瞬间说清楚。
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        # connect_ex() 返回 0 表示已有进程在监听
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
 def start_service(name: str, config: dict, output_queue: queue.Queue) -> subprocess.Popen:
     """启动单个服务"""
     script_path = config["script"]  # 如 "services/llm_service/server.py"
@@ -161,11 +176,23 @@ def start_service(name: str, config: dict, output_queue: queue.Queue) -> subproc
         print(f"[start_all] {name}: Script not found: {script_full_path}")
         return None
 
+    # 启动前预检端口：被占时直接跳过，而不是让新进程崩溃后刷屏
+    port = config.get("port", 3000)
+    if is_port_in_use(port):
+        print(f"[start_all] ⚠️  {name}: port {port} is already in use - skipping start")
+        print(f"[start_all]    Likely a leftover process from an earlier run.")
+        print(f"[start_all]    Inspect it with: netstat -ano | findstr :{port}")
+        return None
+
     # 设置环境变量
     env = os.environ.copy()
 
     # 设置服务端口环境变量
     env["PORT"] = str(config.get("port", 3000))
+
+    # 所有微服务都跑在后台、没有可交互的显示环境：统一禁用 matplotlib 的 GUI 后端。
+    # 否则实验函数里的 do_plot=True 会在工作线程拉起 Qt 窗口，把服务卡死。
+    env.setdefault("MPLBACKEND", "Agg")
 
     # 调试：打印相关环境变量
     if name == "llm":
@@ -258,7 +285,6 @@ def wait_for_services(timeout: int = 60):
 
     while time.time() - start_time < timeout:
         all_ready = True
-        any_running = False
 
         # 先检查 Express 网关是否可用
         express_healthy = False
@@ -290,7 +316,6 @@ def wait_for_services(timeout: int = 60):
                             service_status[name] = "ready"
                     else:
                         all_ready = False
-                        any_running = True
             except urllib.error.URLError as e:
                 all_ready = False
                 reason = str(e.reason)
@@ -316,7 +341,10 @@ def wait_for_services(timeout: int = 60):
         # 如果所有服务要么已就绪，要么被熔断器阻止（服务本身在运行），则认为成功
         non_waiting = [name for name, status in service_status.items()
                        if status in ("ready", "circuit_open")]
-        if len(non_waiting) == len(to_start) and any_running:
+        # 全部服务都已就绪（或仅被熔断器标记，服务本身在跑）即视为成功。
+        # 旧条件还要求 any_running 为真，而任何服务返回 200/503 时它都不会被置位，
+        # 于是健康启动永远走不到这里 —— 必然跑满 60s 超时并误报失败。
+        if len(non_waiting) == len(to_start):
             elapsed = time.time() - start_time
             circuit_open = [name for name, status in service_status.items() if status == "circuit_open"]
             if circuit_open:
@@ -475,12 +503,14 @@ def main():
     printer_thread.start()
 
     # 保持运行，监控进程状态
+    reported_exits = set()
     try:
         # 等待所有进程
         while True:
             for proc in processes:
-                if proc and proc.poll() is not None:
-                    # 进程已退出，检查是否有错误输出
+                if proc and proc.poll() is not None and proc.pid not in reported_exits:
+                    # 进程已退出：同一 PID 只报一次（poll() 会一直返回非 None）
+                    reported_exits.add(proc.pid)
                     returncode = proc.returncode
                     print(f"\n[start_all] ⚠️  Process {proc.pid} exited with code {returncode}")
                     print(f"[start_all] Please check the output above for errors")

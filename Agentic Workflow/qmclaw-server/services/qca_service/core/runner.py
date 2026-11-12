@@ -56,7 +56,8 @@ def run_experiment(
         import urllib.request
         import urllib.error
 
-        payload = {"code": code}
+        # 阶段 16a：/execute 默认异步，这里要的是结果，显式 wait
+        payload = {"code": code, "wait": True}
         data = json.dumps(payload).encode("utf-8")
 
         req = urllib.request.Request(
@@ -69,7 +70,8 @@ def run_experiment(
         with urllib.request.urlopen(req, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
 
-            if result.get("status") == "error":
+            # 阶段 6：quantum_service 的失败状态统一为 "failed"（旧值 "error" 仍兼容）
+            if result.get("status") in ("error", "failed"):
                 raise RuntimeError(result.get("error", "Unknown error"))
 
             return _parse_result(result)

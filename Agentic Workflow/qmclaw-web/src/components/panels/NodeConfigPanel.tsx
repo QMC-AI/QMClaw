@@ -5,6 +5,9 @@
 import { memo, useState, useEffect } from 'react';
 import { useWorkflowStore, NodeType, WorkflowNode } from '../../store/workflowStore';
 import { useModelStore } from '../../store/modelStore';
+import { api } from '../../lib/api';
+import { toBackendCanvas, contextFromNodes } from '../../lib/qwfBridge';
+import QwfFieldsEditor from './QwfFieldsEditor';
 
 interface Props {
   nodeId: string | null;
@@ -44,7 +47,7 @@ const NodeConfigPanel = memo(({ nodeId, onClose, onRunNode }: Props) => {
   });
 
   const [localConfig, setLocalConfig] = useState<Record<string, unknown>>({});
-  const [activeTab, setActiveTab] = useState<'config' | 'result'>('config');
+  const [activeTab, setActiveTab] = useState<'config' | 'result' | 'dsl'>('config');
 
   useEffect(() => {
     if (node) {
@@ -73,7 +76,10 @@ const NodeConfigPanel = memo(({ nodeId, onClose, onRunNode }: Props) => {
     while: '🔄 While Loop',
     notify: '📢 Notify',
     context: '📦 Context',
+    contrast: '🎯 Contrast',
     code: '🐍 Code',
+    llm: '💬 LLM Call',
+    dsl_unknown: '🧱 DSL（画布暂不支持）',
   };
 
   const nodeType = node.data.type;
@@ -168,6 +174,22 @@ const NodeConfigPanel = memo(({ nodeId, onClose, onRunNode }: Props) => {
         >
           Result
         </button>
+        <button
+          onClick={() => setActiveTab('dsl')}
+          style={{
+            flex: 1,
+            padding: '10px',
+            background: activeTab === 'dsl' ? '#1e293b' : 'transparent',
+            border: 'none',
+            borderBottom: activeTab === 'dsl' ? '2px solid #38bdf8' : '2px solid transparent',
+            color: activeTab === 'dsl' ? '#38bdf8' : '#64748b',
+            cursor: 'pointer',
+            fontSize: '12px',
+            fontWeight: 600,
+          }}
+        >
+          DSL
+        </button>
       </div>
 
       {/* Content */}
@@ -177,14 +199,21 @@ const NodeConfigPanel = memo(({ nodeId, onClose, onRunNode }: Props) => {
         overflowY: 'auto',
       }}>
         {activeTab === 'config' ? (
-          <ConfigForm
-            nodeType={nodeType}
-            config={localConfig}
-            allNodes={nodes}
-            onChange={handleConfigChange}
-            availableVariables={availableVariables}
-          />
-        ) : (
+          <>
+            <ConfigForm
+              nodeType={nodeType}
+              config={localConfig}
+              allNodes={nodes}
+              onChange={handleConfigChange}
+              availableVariables={availableVariables}
+            />
+            <QwfFieldsEditor
+              node={node}
+              config={localConfig}
+              onChange={handleConfigChange}
+            />
+          </>
+        ) : activeTab === 'result' ? (
           <ResultView
             nodeId={nodeId}
             nodeType={node?.data.type}
@@ -196,6 +225,8 @@ const NodeConfigPanel = memo(({ nodeId, onClose, onRunNode }: Props) => {
             nodeResult={nodeResult}
             nodeConfig={node?.data.config}
           />
+        ) : (
+          <DslView node={node} allNodes={nodes} />
         )}
       </div>
 
@@ -229,6 +260,123 @@ const NodeConfigPanel = memo(({ nodeId, onClose, onRunNode }: Props) => {
 });
 
 NodeConfigPanel.displayName = 'NodeConfigPanel';
+
+// ── DSL 标签页：这一节点在 `.qwf` 里长什么样 ──────────────────────────────
+
+const DslView = memo(({ node, allNodes }: { node: WorkflowNode; allNodes: WorkflowNode[] }) => {
+  const edges = useWorkflowStore((state) => state.edges);
+  const [text, setText] = useState<string>('');
+  const [error, setError] = useState<string>('');
+  const [loading, setLoading] = useState(false);
+
+  const nodeId = node.id;
+  const nodeType = node.data.type;
+  const dslStmt = node.data.dsl?.stmt;
+  const dslAs = node.data.dsl?.as;
+  const dslOp = node.data.dsl?.op;
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      setLoading(true);
+      setError('');
+      try {
+        // 1) 节点本身带着原语句（从 .qwf 导入的）→ 直接打印
+        if (dslStmt) {
+          const res = await api.stmtToQwf(dslStmt);
+          if (cancelled) return;
+          if (res?.ok) {
+            setText(res.text);
+          } else {
+            setError(res?.error || '无法生成 DSL 片段');
+          }
+          return;
+        }
+
+        // 2) 画布上新加的节点 → 先把整张画布转成 IR，再挑出这条语句
+        const doc = toBackendCanvas(allNodes, edges, {
+          name: 'node-preview',
+          context: contextFromNodes(allNodes),
+        });
+        const res = await api.canvasToQwf(doc);
+        if (cancelled) return;
+        if (!res?.ok) {
+          setError((res?.errors || [res?.error || '画布转 IR 失败']).join('\n'));
+          return;
+        }
+        const pipeline: Array<Record<string, any>> = (res.ir as any)?.pipeline || [];
+        const wanted = pipeline.filter((s) => {
+          if (s.as === nodeId) return true;
+          if (dslAs && s.as === dslAs) return true;
+          if (nodeType === 'context' && s.op === 'let') {
+            const vars = Object.keys((node.data.config?.variables || {}) as Record<string, unknown>);
+            return vars.includes(String(s.as));
+          }
+          return false;
+        });
+        if (wanted.length === 0) {
+          setText('（该节点暂时没有可生成的 DSL 语句）');
+          return;
+        }
+        const lines: string[] = [];
+        for (const stmt of wanted) {
+          const one = await api.stmtToQwf(stmt);
+          if (cancelled) return;
+          lines.push(one?.ok ? one.text : `// 无法生成：${one?.error || '未知错误'}`);
+        }
+        setText(lines.join('\n'));
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message || String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    run();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeId, nodeType, dslOp, dslAs, JSON.stringify(node.data.config), JSON.stringify(dslStmt)]);
+
+  return (
+    <div style={{ fontSize: '11px' }}>
+      <div style={{ color: '#94a3b8', marginBottom: '8px' }}>
+        这个节点在 <code style={{ color: '#22d3ee' }}>.qwf</code> 里的样子：
+        {dslOp && <span style={{ color: '#64748b' }}>（op: {dslOp}{dslAs ? `, as: ${dslAs}` : ''}）</span>}
+      </div>
+      {loading && <div style={{ color: '#64748b' }}>生成中…</div>}
+      {error && (
+        <pre style={{
+          margin: 0,
+          padding: '8px',
+          background: '#1e293b',
+          border: '1px solid #7f1d1d',
+          borderRadius: '6px',
+          color: '#f87171',
+          fontFamily: 'monospace',
+          whiteSpace: 'pre-wrap',
+        }}>
+          {error}
+        </pre>
+      )}
+      {!loading && !error && (
+        <pre style={{
+          margin: 0,
+          padding: '8px',
+          background: '#1e293b',
+          borderRadius: '6px',
+          color: '#e2e8f0',
+          fontFamily: 'monospace',
+          fontSize: '10px',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-all',
+        }}>
+          {text || '（暂无内容）'}
+        </pre>
+      )}
+    </div>
+  );
+});
+
+DslView.displayName = 'DslView';
 
 // ── Variable Input with autocomplete ─────────────────────────────────
 
@@ -2031,6 +2179,94 @@ const ConfigForm = memo(({ nodeType, config, allNodes, onChange, availableVariab
       );
     }
 
+    case 'contrast': {
+      const fieldStyle: React.CSSProperties = {
+        width: '100%',
+        padding: '8px 10px',
+        background: '#1e293b',
+        border: '1px solid #334155',
+        borderRadius: '6px',
+        color: '#e2e8f0',
+        fontSize: '11px',
+        fontFamily: 'monospace',
+        boxSizing: 'border-box',
+      };
+      const labelStyle: React.CSSProperties = {
+        display: 'block',
+        fontSize: '11px',
+        color: '#94a3b8',
+        marginBottom: '4px',
+      };
+      return (
+        <>
+          <div style={{
+            marginBottom: '12px',
+            padding: '8px',
+            background: '#1e293b',
+            borderRadius: '6px',
+            fontSize: '11px',
+            color: '#38bdf8',
+          }}>
+            💡 读回 IQraw 数据集算 contrast = |P(1|X) − P(1|I)|，与实验室 calibrate.py 同口径。
+            Dataset 留空则自动沿用上游 experiment 节点回报的 dataset_id。
+          </div>
+
+          <div style={{ marginBottom: '12px' }}>
+            <label style={labelStyle}>Dataset ID</label>
+            <input
+              type="text"
+              value={String(config.datasetId ?? '')}
+              placeholder="auto（沿用上游 dataset_id）"
+              onChange={(e) => onChange('datasetId', e.target.value)}
+              style={fieldStyle}
+            />
+          </div>
+
+          <div style={{ marginBottom: '12px' }}>
+            <label style={labelStyle}>Qubit</label>
+            <input
+              type="text"
+              value={String(config.qubit ?? '')}
+              placeholder="{{qubit}}"
+              onChange={(e) => onChange('qubit', e.target.value)}
+              style={fieldStyle}
+            />
+          </div>
+
+          <div style={{ marginBottom: '12px' }}>
+            <label style={labelStyle}>Dataset Kind（自动找最新时使用）</label>
+            <select
+              value={String(config.kind ?? 'IQraw')}
+              onChange={(e) => onChange('kind', e.target.value)}
+              style={fieldStyle}
+            >
+              <option value="IQraw">IQraw</option>
+              <option value="Spectroscopy">Spectroscopy</option>
+              <option value="S21">S21</option>
+              <option value="T1">T1</option>
+              <option value="Ramsey">Ramsey</option>
+            </select>
+          </div>
+
+          <div style={{ marginBottom: '12px' }}>
+            <label style={labelStyle}>Pass Threshold</label>
+            <input
+              type="number"
+              step="0.05"
+              min="0"
+              max="1"
+              value={Number(config.threshold ?? 0.4)}
+              onChange={(e) => onChange('threshold', Number(e.target.value))}
+              style={fieldStyle}
+            />
+            <div style={{ fontSize: '9px', color: '#64748b', marginTop: '4px' }}>
+              &lt;0.2 不可用 ｜ 0.2~0.4 可起步 ｜ &gt;0.4 合格 ｜ &gt;0.7 可转 T1/T2
+            </div>
+          </div>
+        </>
+      );
+    }
+
     case 'context': {
       // Parse rules for display
       let rules: Array<{
@@ -2513,6 +2749,39 @@ const ResultView = memo(({ nodeId, nodeType, lastResult, nodeStatus, nodeMetrics
   // Render based on node type
   const renderInputOutput = () => {
     switch (nodeType) {
+      case 'contrast': {
+        const m = ((nodeResult as any)?.metrics || (lastResult as any) || {}) as Record<string, unknown>;
+        const contrast = Number(m.contrast ?? NaN);
+        const threshold = Number(nodeConfig?.threshold ?? 0.4);
+        const ok = Number.isFinite(contrast) && contrast >= threshold;
+        return (
+          <>
+            <ResultSection title="Input" icon="📥" accentColor="#64748b">
+              <KeyValueRow label="dataset" value={String(nodeConfig?.datasetId || 'auto (upstream)')} />
+              <KeyValueRow label="qubit" value={String(nodeConfig?.qubit || '')} />
+              <KeyValueRow label="kind" value={String(nodeConfig?.kind || 'IQraw')} />
+            </ResultSection>
+            <ResultSection title="Contrast" icon="🎯" accentColor={ok ? '#22c55e' : '#f59e0b'}>
+              {Number.isFinite(contrast) ? (
+                <>
+                  <KeyValueRow label="contrast" value={`${contrast.toFixed(3)} (${ok ? 'passed' : 'below'} ${threshold})`} />
+                  <KeyValueRow label="P(1|prep I)" value={Number(m.p1_i ?? 0).toFixed(3)} />
+                  <KeyValueRow label="P(1|prep X)" value={Number(m.p1_x ?? 0).toFixed(3)} />
+                  <KeyValueRow label="separation" value={Number(m.separation ?? 0).toFixed(1)} />
+                  <KeyValueRow label="sigma" value={Number(m.sigma ?? 0).toFixed(1)} />
+                  <KeyValueRow label="SNR" value={Number(m.snr ?? 0).toFixed(2)} />
+                  <KeyValueRow label="shots" value={String(m.shots ?? '-')} />
+                </>
+              ) : (
+                <div style={{ fontSize: '10px', color: '#475569', fontStyle: 'italic' }}>
+                  No contrast result yet
+                </div>
+              )}
+            </ResultSection>
+          </>
+        );
+      }
+
       case 'context': {
         // Context node: input is empty, output is the defined variables
         // Variables are stored in config.variables

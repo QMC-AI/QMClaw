@@ -1,0 +1,36 @@
+# 范例 01 —— 最小的「一次测控实验 + 读结果」
+
+# 用途：拿到一份新 qwf 时的起点模板。
+# 要点：
+#   - budget 三件套必须写（max_wall / max_writes / max_datasets），真机模式强制
+#   - 测控实验不要写 do_plot：服务进程内画图会把 quantum 端点卡死
+#   - read 只能读 IQraw 形状的数据集
+
+workflow ex01_iqraw_contrast {
+  meta {
+    name        "ex01_iqraw_contrast"
+    description "一次 iqraw 测态区分，read 出对比度"
+    tags        ["iqraw", "minimal"]
+  }
+
+  env {
+    qubit   "q2ld3"
+    session "20251103_LD_SQ"
+  }
+
+  budget {
+    max_wall     5m
+    max_writes   2
+    max_datasets 2
+  }
+
+  measure as c1 {
+    fn      sq.iqraw
+    qubit   $env.qubit
+    timeout 120
+    note    "iqraw：只重写 discriminator，不动 f10/amp"
+  }
+  read c1 as r1 { kind IQraw  threshold 0.4 }
+
+  say "contrast=${r1.contrast}（数据集 ${c1.dataset}）"
+}

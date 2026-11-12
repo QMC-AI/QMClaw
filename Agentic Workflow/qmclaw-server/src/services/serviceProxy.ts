@@ -6,6 +6,41 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { AsyncLocalStorage } from 'async_hooks';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// traceId 贯穿（阶段 3）
+// 每个进入 /api 的请求生成或透传 X-Trace-Id，代理到微服务时带上同一 trace，
+// 并在响应头回写，便于把 Express → workflow → task_queue → quantum 串起来。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TRACE_HEADER = 'X-Trace-Id';
+const TRACE_MAX_LEN = 64;
+
+const traceStorage = new AsyncLocalStorage<string>();
+
+/** 清洗 trace id：只保留字母数字与 -_.:，最长 64 */
+export function normalizeTraceId(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const raw = value.trim();
+  if (!raw) return '';
+  const safe = raw.replace(/[^A-Za-z0-9\-_.:]/g, '');
+  return safe.slice(0, TRACE_MAX_LEN);
+}
+
+/** 生成新的 trace id */
+export function newTraceId(): string {
+  const hex = Array.from({ length: 12 }, () =>
+    Math.floor(Math.random() * 16).toString(16)).join('');
+  return `t-${hex}`;
+}
+
+/** 从请求头取 trace id（数组取首个） */
+export function traceIdFromRequest(req: Request): string {
+  const raw = req.headers['x-trace-id'];
+  const first = Array.isArray(raw) ? raw[0] : raw;
+  return normalizeTraceId(first);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 类型定义
@@ -124,14 +159,18 @@ async function proxyToService(
 
   const url = `http://${service.host}:${service.port}${path}`;
   const timeout = timeoutMs ?? service.defaultTimeout ?? 30000;
+  const traceId = traceStorage.getStore();
 
   try {
     const controller = new AbortController();
     const timeoutHandle = setTimeout(() => controller.abort(), timeout);
 
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (traceId) headers[TRACE_HEADER] = traceId;
+
     const response = await fetch(url, {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: body != null ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });
@@ -167,6 +206,13 @@ async function proxyToService(
 
 export function createServiceProxy() {
   const proxy = Router();
+
+  // ── traceId 中间件（必须最先注册，包裹全部 81 个路由）────────────────────
+  proxy.use((req: Request, res: Response, next: (err?: unknown) => void) => {
+    const traceId = traceIdFromRequest(req) || newTraceId();
+    res.setHeader(TRACE_HEADER, traceId);
+    traceStorage.run(traceId, () => next());
+  });
 
   // ── LLM 服务 ───────────────────────────────────────────────────────────────
 
@@ -212,6 +258,21 @@ export function createServiceProxy() {
     res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
   });
 
+  // ── 作业轮询（阶段 19：/execute 默认 producer 化后，结果从这里取）──────
+  // 后端默认返回 { status: "queued", job_id, run_id }，前端拿到 job_id 后轮询这里，
+  // 完成态的 result 已带上 dataset_ids / trace_id / execute_mode（见 OPERATIONS §3.19）。
+  proxy.get('/quantum/jobs/:id', async (req, res) => {
+    const id = encodeURIComponent(req.params.id);
+    const result = await proxyToService('quantum', `/jobs/${id}`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/quantum/jobs/:id/abandon', async (req, res) => {
+    const id = encodeURIComponent(req.params.id);
+    const result = await proxyToService('quantum', `/jobs/${id}/abandon`, 'POST', req.body ?? {});
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
   proxy.post('/quantum/switch_session', async (req, res) => {
     const result = await proxyToService('quantum', '/switch_session', 'POST', req.body);
     res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
@@ -239,6 +300,12 @@ export function createServiceProxy() {
 
   proxy.post('/quantum/qubit/set_params', async (req, res) => {
     const result = await proxyToService('quantum', '/qubit/set_params', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  /** 把数据集里记录的寄存器快照写回量子比特（实验后对齐现场 / 回滚） */
+  proxy.post('/quantum/qubit/apply_dataset', async (req, res) => {
+    const result = await proxyToService('quantum', '/qubit/apply_dataset', 'POST', req.body);
     res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
   });
 
@@ -401,6 +468,92 @@ export function createServiceProxy() {
     res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
   });
 
+  // ── DSL（IR 层）────────────────────────────────────────────────────────────
+  // validate / parse_qwf / ir_from_canvas 是纯计算，不碰硬件；
+  // run_ir 只有显式传 dryRun:true 才安全，所以这里原样透传、不替调用方改默认值。
+
+  proxy.post('/workflow/validate', async (req, res) => {
+    const result = await proxyToService('workflow', '/workflows/validate', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/workflow/parse_qwf', async (req, res) => {
+    const result = await proxyToService('workflow', '/workflows/parse_qwf', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/workflow/ir_from_canvas', async (req, res) => {
+    const result = await proxyToService('workflow', '/workflows/ir_from_canvas', 'POST', req.body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  // ── `.qwf` ⇄ 画布 ─────────────────────────────────────────────────────────
+  // qwf_examples   列出 data/workflows/examples 下的 .qwf 示例
+  // qwf_to_canvas  .qwf 文本 → 画布节点图（IR 是中表示）
+  // canvas_to_qwf  画布节点图 → .qwf 文本（带语义等价判定）
+
+  proxy.post('/workflow/qwf_examples', async (req, res) => {
+    const result = await proxyToService('workflow', '/workflows/qwf_examples', 'POST', req.body || {});
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/workflow/qwf_to_canvas', async (req, res) => {
+    const result = await proxyToService('workflow', '/workflows/qwf_to_canvas', 'POST', req.body || {});
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/workflow/canvas_to_qwf', async (req, res) => {
+    const result = await proxyToService('workflow', '/workflows/canvas_to_qwf', 'POST', req.body || {});
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/workflow/stmt_to_qwf', async (req, res) => {
+    const result = await proxyToService('workflow', '/workflows/stmt_to_qwf', 'POST', req.body || {});
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  // ── 工作流存档（`.qwf`）──────────────────────────────────────────────────
+  // 存档统一是 `.qwf` 文本（服务端 data/workflows/*.qwf），
+  // 画布快照 JSON 不再作为存档格式。
+
+  proxy.get('/workflows', async (_req, res) => {
+    const result = await proxyToService('workflow', '/workflows/saved', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.get('/workflows/:id', async (req, res) => {
+    const result = await proxyToService('workflow', `/workflows/saved/${encodeURIComponent(req.params.id)}`, 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/workflows', async (req, res) => {
+    const result = await proxyToService('workflow', '/workflows/saved', 'POST', req.body || {});
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.put('/workflows/:id', async (req, res) => {
+    const body = { ...(req.body || {}), id: req.params.id };
+    const result = await proxyToService('workflow', '/workflows/saved', 'POST', body);
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.delete('/workflows/:id', async (req, res) => {
+    const result = await proxyToService('workflow', `/workflows/saved/${encodeURIComponent(req.params.id)}`, 'DELETE');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  proxy.post('/workflow/run_ir', async (req, res) => {
+    const result = await proxyToService('workflow', '/workflows/run_ir', 'POST', req.body);
+    if (result.ok) {
+      const data: any = result.data || {};
+      // 与 /workflow/run 保持一致：前端读驼峰，后端给下划线
+      if (data.workflow_id && !data.workflowId) data.workflowId = data.workflow_id;
+      res.status(200).json(data);
+    } else {
+      res.status(502).json(result.data ?? { error: result.error });
+    }
+  });
+
   // ── 工作流历史记录 ─────────────────────────────────────────────────────────
 
   proxy.get('/workflow-runs', async (req, res) => {
@@ -456,6 +609,18 @@ export function createServiceProxy() {
 
   proxy.get('/tasks/stats', async (_req, res) => {
     const result = await proxyToService('task_queue', '/stats', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  // 硬件通道（lane）：谁占着通道、谁在排队、租约还剩多久
+  proxy.get('/tasks/lane', async (_req, res) => {
+    const result = await proxyToService('task_queue', '/lane', 'GET');
+    res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
+  });
+
+  // 强制释放租约：只在确认持有者已死/卡住时用
+  proxy.post('/tasks/lease/release', async (req, res) => {
+    const result = await proxyToService('task_queue', '/lease/release', 'POST', req.body);
     res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
   });
 

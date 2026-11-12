@@ -26,7 +26,11 @@ export type NodeType =
   | 'while'
   | 'notify'
   | 'context'
-  | 'code';
+  | 'contrast'
+  | 'code'
+  // `.qwf`（文本 DSL）里对应的两种节点
+  | 'llm'            // ask：通用 LLM 调用
+  | 'dsl_unknown';   // 画布还不支持的 DSL 语句（repeat / if / call…），灰节点
 
 export interface WorkflowNodeData {
   label: string;
@@ -36,6 +40,20 @@ export interface WorkflowNodeData {
   metrics?: Record<string, number>;
   error?: string;
   templateId?: string;
+  /**
+   * `.qwf` 载入时保留的原始语句信息（op / as 别名 / 语句本体）。
+   * 导出时用它保证语义不丢；没有它（手动画的节点）就按 config 重建。
+   */
+  dsl?: {
+    op?: string;
+    as?: string | null;
+    stmt?: unknown;
+    merged?: boolean;
+  };
+  /** 节点的 DSL 别名（`as`），画布上显示在标题旁。 */
+  alias?: string;
+  /** DSL 里的 note 字段，画布上显示在副标题。 */
+  note?: string;
   // Result fields (populated after execution)
   result?: Record<string, unknown>;
   symptom?: string;
@@ -128,6 +146,7 @@ export interface ExecutionState {
     };
     // Decision node direct fields (alternative to conversation)
     symptom?: string;
+    reasoning?: string;
     recommendations?: Array<{
       fn: string;
       qubit?: string;
@@ -135,6 +154,14 @@ export interface ExecutionState {
       reason?: string;
     }>;
     matchedRules?: string[];
+    // 实验结果直出字段（IR 运行路径会直接回传）
+    t1_us?: number;
+    decay_visible?: boolean;
+    description?: string;
+    qubit?: string;
+    dataset_id?: number;
+    experiment_type?: string;
+    dataset_name?: string;
   }>;
   lastExecutionResults: Record<string, Record<string, unknown>>;
 }
@@ -167,6 +194,28 @@ interface HistoryState {
   edges: WorkflowEdge[];
 }
 
+/**
+ * `.qwf` 相关状态：从 `.qwf` 文件（或服务端示例）载入后保留。
+ * - `workflow`：meta / env / budget / policy / defaults（工作流级字段）
+ * - `baseIr`：打开时的原始 IR，导出时用作"语义等价"的基准
+ * - `unsupported`：画布表达不了的 DSL 语句（repeat / if / call…）
+ */
+export interface DslState {
+  workflow: Record<string, unknown>;
+  baseIr: unknown | null;
+  qwf: string | null;
+  source: string | null;
+  unsupported: string[];
+}
+
+const EMPTY_DSL: DslState = {
+  workflow: {},
+  baseIr: null,
+  qwf: null,
+  source: null,
+  unsupported: [],
+};
+
 interface WorkflowStore {
   // Canvas state
   nodes: WorkflowNode[];
@@ -177,6 +226,10 @@ interface WorkflowStore {
   workflowId: string | null;
   workflowName: string;
   workflowVersion: number;
+
+  // `.qwf` 状态（导入 / 服务端示例载入后保留）
+  dsl: DslState;
+  setDsl: (dsl: Partial<DslState>) => void;
 
   // Execution state
   execution: ExecutionState;
@@ -230,7 +283,13 @@ interface WorkflowStore {
   canRedo: () => boolean;
 
   // Load workflow
-  loadWorkflow: (nodes: WorkflowNode[], edges: WorkflowEdge[], id?: string, name?: string) => void;
+  loadWorkflow: (
+    nodes: WorkflowNode[],
+    edges: WorkflowEdge[],
+    id?: string,
+    name?: string,
+    dsl?: Partial<DslState>
+  ) => void;
 
   // Reset
   resetCanvas: () => void;
@@ -252,7 +311,10 @@ const getNodeTypePrefix = (type: NodeType): string => {
     while: 'loop',
     notify: 'ntf',
     context: 'ctx',
+    contrast: 'ctr',
     code: 'code',
+    llm: 'llm',
+    dsl_unknown: 'dsl',
   };
   return prefixes[type];
 };
@@ -264,7 +326,8 @@ const getDefaultNodeConfig = (type: NodeType): Record<string, unknown> => {
     experiment: {
       fn: 'sq.iqraw',
       qubit: '{{qubit}}',
-      params: { do_plot: true },
+      // 服务端执行一律 do_plot=False：do_plot=True 会在工作线程拉起 Qt GUI 把微服务卡死
+      params: {},
       batchConfig: null,
       // Customizable plotting and analysis
       plotCommand: 'plt.show()',
@@ -290,11 +353,24 @@ const getDefaultNodeConfig = (type: NodeType): Record<string, unknown> => {
     while: { condition: '{{nodes.n1.SNR}} < 2.0', maxIterations: 10, timeout: 300 },
     notify: { channel: 'feishu', trigger: 'always', template: '' },
     context: { variables: { qubit: 'q3ld4' } },
+    contrast: {
+      // 留空则自动取上游 experiment 节点回报的 dataset_id
+      datasetId: '',
+      qubit: '{{qubit}}',
+      kind: 'IQraw',
+      threshold: 0.4,
+    },
     code: {
       code: '# Python code here\n# Available: {{variable}}, np, json, re, math\nresult = {"status": "ok"}',
       timeout: 30,
       returnVariable: 'result',
     },
+    llm: {
+      messages: [],
+      model: '',
+      temperature: 0.7,
+    },
+    dsl_unknown: {},
   };
   return configs[type];
 };
@@ -315,7 +391,10 @@ const getNodeLabel = (type: NodeType): string => {
     while: '🔄 While Loop',
     notify: '📢 Notify',
     context: '📦 Context',
+    contrast: '🎯 Contrast',
     code: '🐍 Code',
+    llm: '💬 LLM Call',
+    dsl_unknown: '🧱 DSL（画布暂不支持）',
   };
   return labels[type];
 };
@@ -331,6 +410,8 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
   workflowId: null,
   workflowName: 'Untitled Workflow',
   workflowVersion: 1,
+
+  dsl: EMPTY_DSL,
 
   execution: {
     workflowId: null,
@@ -359,7 +440,10 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
     while: 0,
     notify: 0,
     context: 0,
+    contrast: 0,
     code: 0,
+    llm: 0,
+    dsl_unknown: 0,
   },
 
   // ── Node CRUD ────────────────────────────────────────────────────────────────
@@ -594,6 +678,12 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
     set({ workflowId: id, workflowName: name });
   },
 
+  // ── `.qwf` 状态 ──────────────────────────────────────────────────────────────
+
+  setDsl: (dsl) => {
+    set((state) => ({ dsl: { ...state.dsl, ...dsl } }));
+  },
+
   // ── Templates ────────────────────────────────────────────────────────────────
 
   addTemplate: (template) => {
@@ -661,12 +751,13 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
 
   // ── Load workflow ────────────────────────────────────────────────────────────
 
-  loadWorkflow: (nodes, edges, id, name) => {
+  loadWorkflow: (nodes, edges, id, name, dsl) => {
     // Update node counters
     const counters: Record<NodeType, number> = {
       experiment: 0, quality_gate: 0, decision: 0, analyze: 0,
       adjust_params: 0, image_analysis: 0, image_classification: 0, print: 0, parallel: 0,
-      while: 0, notify: 0, context: 0, code: 0,
+      while: 0, notify: 0, context: 0, contrast: 0, code: 0,
+      llm: 0, dsl_unknown: 0,
     };
     nodes.forEach((node) => {
       const type = node.data.type;
@@ -684,6 +775,7 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
       workflowName: name || 'Untitled Workflow',
       nodeCounters: counters,
       selectedNodes: [],
+      dsl: dsl ? { ...EMPTY_DSL, ...dsl } : EMPTY_DSL,
       execution: {
         workflowId: id || null,
         status: 'idle',
@@ -707,6 +799,7 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
       workflowId: null,
       workflowName: 'Untitled Workflow',
       workflowVersion: 1,
+      dsl: EMPTY_DSL,
       execution: {
         workflowId: null,
         status: 'idle',
@@ -720,7 +813,8 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
       nodeCounters: {
         experiment: 0, quality_gate: 0, decision: 0, analyze: 0,
         adjust_params: 0, image_analysis: 0, image_classification: 0, print: 0, parallel: 0,
-        while: 0, notify: 0, context: 0, code: 0,
+        while: 0, notify: 0, context: 0, contrast: 0, code: 0,
+        llm: 0, dsl_unknown: 0,
       },
     });
   },

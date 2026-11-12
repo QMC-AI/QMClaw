@@ -1,0 +1,40 @@
+{
+  "id": "e3_tuneup18_canvas",
+  "name": "18 步单比特标定（画布写法）",
+  "version": 1,
+  "settings": {
+    "description": "实验三对照件 C：与 single_qubit_tuneup_18.qwf 等价的画布存档（nodes + depends）。",
+    "qubit": "q2ld3",
+    "budget": { "maxWrites": 60, "maxWallSeconds": 14400, "maxScanPoints": 4000 }
+  },
+  "nodes": [
+    { "id": "ctx", "type": "context", "config": { "variables": { "qubit": "q2ld3" } }, "depends": [] },
+    { "id": "s21", "type": "experiment", "config": { "fn": "sq.s21", "qubit": "{{qubit}}", "args": { "update": false }, "timeout": 180 }, "depends": ["ctx"] },
+    { "id": "power2d", "type": "experiment", "config": { "fn": "sq.s21_power2d", "qubit": "{{qubit}}", "timeout": 300 }, "depends": ["s21"] },
+    { "id": "zpa2d", "type": "experiment", "config": { "fn": "sq.s21_zpa2d", "qubit": "{{qubit}}", "timeout": 300 }, "depends": ["power2d"] },
+    { "id": "spec", "type": "experiment", "config": { "fn": "sq.spectroscopy", "qubit": "{{qubit}}", "args": { "freq": { "$arange": [4.0, 3.0, -0.002] } }, "timeout": 300 }, "depends": ["zpa2d"] },
+    { "id": "iq", "type": "experiment", "config": { "fn": "sq.iqraw", "qubit": "{{qubit}}", "timeout": 180 }, "depends": ["spec"] },
+    { "id": "r_iq", "type": "contrast", "config": { "kind": "IQraw", "qubit": "{{qubit}}", "threshold": 0.2 }, "depends": ["iq"] },
+    { "id": "g_iq", "type": "quality_gate", "config": { "metric": "contrast", "operator": ">=", "threshold": 0.3, "failWorkflow": false }, "depends": ["r_iq"] },
+    { "id": "piamp", "type": "experiment", "config": { "fn": "sq.piamp", "qubit": "{{qubit}}", "args": { "amp": 2 }, "timeout": 300 }, "depends": ["g_iq"] },
+    { "id": "pidf", "type": "experiment", "config": { "fn": "sq.pidf", "qubit": "{{qubit}}", "timeout": 300 }, "depends": ["piamp"] },
+    { "id": "ramsey_df", "type": "experiment", "config": { "fn": "sq.ramsey_df", "qubit": "{{qubit}}", "timeout": 300 }, "depends": ["pidf"] },
+    { "id": "s21_dis", "type": "experiment", "config": { "fn": "sq.s21_dis", "qubit": "{{qubit}}", "timeout": 300 }, "depends": ["ramsey_df"] },
+    { "id": "iq2", "type": "experiment", "config": { "fn": "sq.iqraw", "qubit": "{{qubit}}", "timeout": 180 }, "depends": ["s21_dis"] },
+    { "id": "r_iq2", "type": "contrast", "config": { "kind": "IQraw", "qubit": "{{qubit}}", "threshold": 0.2 }, "depends": ["iq2"] },
+    { "id": "g_iq2", "type": "quality_gate", "config": { "metric": "contrast", "operator": ">=", "threshold": 0.3, "failWorkflow": false }, "depends": ["r_iq2"] },
+    { "id": "pi_x", "type": "experiment", "config": { "fn": "sq.set_pi", "qubit": "{{qubit}}", "args": { "gate": "X" }, "timeout": 300 }, "depends": ["g_iq2"] },
+    { "id": "pi_x2", "type": "experiment", "config": { "fn": "sq.set_pi", "qubit": "{{qubit}}", "args": { "gate": "X/2" }, "timeout": 300 }, "depends": ["pi_x"] },
+    { "id": "timing", "type": "experiment", "config": { "fn": "sq.test_timing_xyz", "qubit": "{{qubit}}", "args": { "update": "xy" }, "timeout": 300 }, "depends": ["pi_x2"] },
+    { "id": "shape", "type": "experiment", "config": { "fn": "sq.pulse_shape", "qubit": "{{qubit}}", "args": { "step_height": 0.2 }, "timeout": 300 }, "depends": ["timing"] },
+    { "id": "spec_auto", "type": "experiment", "config": { "fn": "sq.spectroscopy_auto", "qubit": "{{qubit}}", "args": { "zpa_scan": { "$arange": [-0.2, 0.2, 0.002] } }, "timeout": 600 }, "depends": ["shape"] },
+    { "id": "t1", "type": "experiment", "config": { "fn": "sq.t1", "qubit": "{{qubit}}", "args": { "zpa": { "$arange": [-1.0, 0.4, 0.02] } }, "timeout": 300 }, "depends": ["spec_auto"] },
+    { "id": "a_t1", "type": "analyze", "config": { "command": "qter.fitData(do_plot=False)" }, "depends": ["t1"] },
+    { "id": "g_t1", "type": "quality_gate", "config": { "metric": "T1_us", "operator": ">=", "threshold": 20, "failWorkflow": false }, "depends": ["a_t1"] },
+    { "id": "t2star", "type": "experiment", "config": { "fn": "sq.ramsey_t2", "qubit": "{{qubit}}", "timeout": 300 }, "depends": ["g_t1"] },
+    { "id": "echo", "type": "experiment", "config": { "fn": "sq.spinecho_t2", "qubit": "{{qubit}}", "timeout": 300 }, "depends": ["t2star"] },
+    { "id": "note17", "type": "print", "config": { "message": "step 17 base slope 需在工作流外执行：set_piLen(1000,1000) → bassex.PulseShapeFreq() → ps.base_slope() → set_piLen(30,30)" }, "depends": ["echo"] },
+    { "id": "xeb", "type": "experiment", "config": { "fn": "sq.xeb", "qubit": "{{qubit}}", "args": { "gate": "reference" }, "timeout": 900 }, "depends": ["note17"] },
+    { "id": "summary", "type": "print", "config": { "message": "tune-up 结束：contrast=${r_iq2.contrast}，T1=${a_t1.T1_us}us（阈值：T1>50us、visibility>0.75、T2>1.5us）" }, "depends": ["xeb"] }
+  ]
+}

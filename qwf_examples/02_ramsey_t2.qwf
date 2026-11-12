@@ -1,0 +1,33 @@
+# 范例 02 —— 不写任何寄存器的实验（Ramsey T2*）
+
+# 要点：
+#   - sq.ramsey_t2 完全不写寄存器（WRITE_EFFECTS 里 mode=none）→ 不需要写清单/票据
+#   - T2* 的数值要用 analyze 节点（qter.fitData）拟合，不能用 read（read 只认 IQraw）
+
+workflow ex02_ramsey_t2 {
+  meta {
+    name        "ex02_ramsey_t2"
+    description "测一次 Ramsey T2*，不写任何寄存器"
+    tags        ["ramsey", "t2"]
+  }
+
+  env {
+    qubit   "q2ld3"
+    session "20251103_LD_SQ"
+  }
+
+  budget {
+    max_wall     10m
+    max_writes   0
+    max_datasets 2
+  }
+
+  measure as c1 {
+    fn      sq.ramsey_t2
+    qubit   $env.qubit
+    timeout 300
+    note    "Ramsey：delay 0-9900ns，100 点"
+  }
+
+  say "Ramsey 数据集=${c1.dataset}（用 analysis 端 /plot 画 T2*）"
+}

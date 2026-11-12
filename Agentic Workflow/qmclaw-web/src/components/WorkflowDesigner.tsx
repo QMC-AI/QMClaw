@@ -6,6 +6,7 @@ import WorkflowCanvas from "./tabs/WorkflowCanvas";
 import WorkflowListView, { StoredWorkflow as ListStoredWorkflow } from "./workflows/WorkflowListView";
 import WorkflowRunHistory from "./workflows/WorkflowRunHistory";
 import { useWorkflowStore, WorkflowNode as StoreNode, WorkflowEdge as StoreEdge } from "../store/workflowStore";
+import { normalizeStoredWorkflow } from "../lib/qwfBridge";
 
 // ── Sub-tab type ───────────────────────────────────────────────────────────────
 type WorkflowTab = "canvas" | "list" | "runs";
@@ -32,6 +33,7 @@ const NODE_TYPES = [
   { value: "image_analysis", label: "🖼 Image Analysis", desc: "LLM analysis of experiment plot" },
   { value: "image_classification", label: "🧠 Image Classification", desc: "ML classification of experiment image" },
   { value: "print", label: "📝 Print", desc: "Log a message" },
+  { value: "contrast", label: "🎯 Contrast", desc: "Read out IQ contrast from a dataset" },
 ];
 
 // ── Workflow templates based on PDF calibration flow ────────────────────────────
@@ -41,7 +43,7 @@ const TEMPLATES: Record<string, { name: string; desc: string; nodes: WorkflowNod
     name: "⚡ Quick Calibration",
     desc: "iqraw + analyze (2 min)",
     nodes: [
-      { id: "n1", type: "experiment", config: { fn: "sq.iqraw", qubit: "{{qubit}}", params: { do_plot: true } } },
+      { id: "n1", type: "experiment", config: { fn: "sq.iqraw", qubit: "{{qubit}}" } },
       { id: "n2", type: "quality_gate", depends: ["n1"], config: { ref: "n1", metric: "SNR", threshold: 1.5, direction: "above" } },
       { id: "n3", type: "analyze", depends: ["n2"], config: { ref: "n1" } },
       { id: "n4", type: "print", depends: ["n3"], config: { message: "=== Quick Results ===\nF0: {{nodes.n3.F0}}\nF1: {{nodes.n3.F1}}\nSNR: {{nodes.n3.SNR}}\nSeparation: {{nodes.n3.separation}}" } },
@@ -51,21 +53,21 @@ const TEMPLATES: Record<string, { name: string; desc: string; nodes: WorkflowNod
     name: "🎯 Full Single-Qubit Calibration",
     desc: "Complete 11-step calibration (30+ min)",
     nodes: [
-      { id: "s1", type: "experiment", config: { fn: "sq.s21", qubit: "{{qubit}}", params: { do_plot: true } } },
+      { id: "s1", type: "experiment", config: { fn: "sq.s21", qubit: "{{qubit}}" } },
       { id: "s1a", type: "quality_gate", depends: ["s1"], config: { ref: "s1", metric: "peak_count", threshold: 1, direction: "above" } },
       { id: "s1b", type: "analyze", depends: ["s1a"], config: { ref: "s1" } },
-      { id: "s5", type: "experiment", depends: ["s1b"], config: { fn: "sq.iqraw", qubit: "{{qubit}}", params: { do_plot: true } } },
+      { id: "s5", type: "experiment", depends: ["s1b"], config: { fn: "sq.iqraw", qubit: "{{qubit}}" } },
       { id: "s5a", type: "quality_gate", depends: ["s5"], config: { ref: "s5", metric: "SNR", threshold: 1.5, direction: "above" } },
       { id: "s5b", type: "analyze", depends: ["s5a"], config: { ref: "s5" } },
-      { id: "s6", type: "experiment", depends: ["s5b"], config: { fn: "sq.piamp", qubit: "{{qubit}}", params: { do_plot: true } } },
+      { id: "s6", type: "experiment", depends: ["s5b"], config: { fn: "sq.piamp", qubit: "{{qubit}}" } },
       { id: "s6a", type: "quality_gate", depends: ["s6"], config: { ref: "s6", metric: "pi_amp", threshold: 0, direction: "above" } },
       { id: "s6b", type: "analyze", depends: ["s6a"], config: { ref: "s6" } },
-      { id: "s8", type: "experiment", depends: ["s6b"], config: { fn: "sq.ramsey_df", qubit: "{{qubit}}", params: { do_plot: true } } },
+      { id: "s8", type: "experiment", depends: ["s6b"], config: { fn: "sq.ramsey_df", qubit: "{{qubit}}" } },
       { id: "s8a", type: "quality_gate", depends: ["s8"], config: { ref: "s8", metric: "T2", threshold: 0, direction: "above" } },
       { id: "s8b", type: "analyze", depends: ["s8a"], config: { ref: "s8" } },
-      { id: "s9", type: "experiment", depends: ["s8b"], config: { fn: "sq.s21_dis", qubit: "{{qubit}}", params: { do_plot: true } } },
+      { id: "s9", type: "experiment", depends: ["s8b"], config: { fn: "sq.s21_dis", qubit: "{{qubit}}" } },
       { id: "s9a", type: "analyze", depends: ["s9"], config: { ref: "s9" } },
-      { id: "s10", type: "experiment", depends: ["s9a"], config: { fn: "sq.iqraw", qubit: "{{qubit}}", params: { do_plot: true } } },
+      { id: "s10", type: "experiment", depends: ["s9a"], config: { fn: "sq.iqraw", qubit: "{{qubit}}" } },
       { id: "s10a", type: "analyze", depends: ["s10"], config: { ref: "s10" } },
       { id: "summary", type: "print", depends: ["s10a"], config: { message: "=== {{qubit}} Calibration Complete ===\nIQ SNR: {{nodes.s10a.SNR}}\nF0: {{nodes.s10a.F0}}\nF1: {{nodes.s10a.F1}}\nRamsey T2: {{nodes.s8b.T2}}us\nPiAmp: {{nodes.s6b.pi_amp}}" } },
     ],
@@ -74,7 +76,7 @@ const TEMPLATES: Record<string, { name: string; desc: string; nodes: WorkflowNod
     name: "🔬 Gate Characterization",
     desc: "XEB + CZXEB for gate fidelity",
     nodes: [
-      { id: "n1", type: "experiment", config: { fn: "sq.xeb", qubit: "{{qubit}}", params: { do_plot: true } } },
+      { id: "n1", type: "experiment", config: { fn: "sq.xeb", qubit: "{{qubit}}" } },
       { id: "n2", type: "analyze", depends: ["n1"], config: { ref: "n1" } },
       { id: "n3", type: "quality_gate", depends: ["n2"], config: { ref: "n1", metric: "gate_fidelity", threshold: 0.99, direction: "above" } },
       { id: "n4", type: "print", depends: ["n3"], config: { message: "Gate Fidelity: {{nodes.n2.gate_fidelity}}\nError per cycle: {{nodes.n2.error_per_cycle}}" } },
@@ -85,13 +87,31 @@ const TEMPLATES: Record<string, { name: string; desc: string; nodes: WorkflowNod
     desc: "Iterate until metric threshold",
     nodes: [
       { id: "init", type: "print", config: { message: "Starting auto-optimization for {{qubit}}" } },
-      { id: "e1", type: "experiment", depends: ["init"], config: { fn: "sq.iqraw", qubit: "{{qubit}}", params: { do_plot: true } } },
+      { id: "e1", type: "experiment", depends: ["init"], config: { fn: "sq.iqraw", qubit: "{{qubit}}" } },
       { id: "a1", type: "analyze", depends: ["e1"], config: { ref: "e1" } },
       { id: "g1", type: "quality_gate", depends: ["a1"], config: { ref: "e1", metric: "SNR", threshold: 2.0, direction: "above" } },
-      { id: "e2", type: "experiment", depends: ["g1"], config: { fn: "sq.ramsey_df", qubit: "{{qubit}}", params: { do_plot: true } } },
+      { id: "e2", type: "experiment", depends: ["g1"], config: { fn: "sq.ramsey_df", qubit: "{{qubit}}" } },
       { id: "a2", type: "analyze", depends: ["e2"], config: { ref: "e2" } },
       { id: "g2", type: "quality_gate", depends: ["a2"], config: { ref: "e2", metric: "T2", threshold: 500, direction: "above" } },
       { id: "final", type: "print", depends: ["g2"], config: { message: "=== Optimization Complete ===\nIQ SNR: {{nodes.a1.SNR}}\nRamsey T2: {{nodes.a2.T2}}ns" } },
+    ],
+  },
+  "contrast-tuning": {
+    name: "🎯 Readout Contrast Tuning",
+    desc: "iqraw → piamp → iqraw → pidf → iqraw → piamp with contrast gates",
+    nodes: [
+      { id: "c_e1", type: "experiment", config: { fn: "sq.iqraw", qubit: "{{qubit}}" } },
+      { id: "c_c1", type: "contrast", depends: ["c_e1"], config: { qubit: "{{qubit}}", kind: "IQraw", threshold: 0.2 } },
+      { id: "c_e2", type: "experiment", depends: ["c_c1"], config: { fn: "sq.piamp", qubit: "{{qubit}}" } },
+      { id: "c_e3", type: "experiment", depends: ["c_e2"], config: { fn: "sq.iqraw", qubit: "{{qubit}}" } },
+      { id: "c_c2", type: "contrast", depends: ["c_e3"], config: { qubit: "{{qubit}}", kind: "IQraw", threshold: 0.3 } },
+      { id: "c_e4", type: "experiment", depends: ["c_c2"], config: { fn: "sq.pidf", qubit: "{{qubit}}", params: { df: 0.05 } } },
+      { id: "c_e5", type: "experiment", depends: ["c_e4"], config: { fn: "sq.iqraw", qubit: "{{qubit}}" } },
+      { id: "c_c3", type: "contrast", depends: ["c_e5"], config: { qubit: "{{qubit}}", kind: "IQraw", threshold: 0.4 } },
+      { id: "c_e6", type: "experiment", depends: ["c_c3"], config: { fn: "sq.piamp", qubit: "{{qubit}}" } },
+      { id: "c_e7", type: "experiment", depends: ["c_e6"], config: { fn: "sq.iqraw", qubit: "{{qubit}}" } },
+      { id: "c_c4", type: "contrast", depends: ["c_e7"], config: { qubit: "{{qubit}}", kind: "IQraw", threshold: 0.4 } },
+      { id: "c_sum", type: "print", depends: ["c_c4"], config: { message: "=== {{qubit}} contrast tuning done ===\nstart: {{nodes.c_c1.contrast}}\nafter pidf: {{nodes.c_c3.contrast}}\nfinal: {{nodes.c_c4.contrast}} (threshold {{nodes.c_c4.threshold}})" } },
     ],
   },
 };
@@ -162,34 +182,29 @@ export default function WorkflowDesigner({ selectedQubit, onLog }: Props) {
 
   const handleSelectWorkflow = useCallback(async (workflow: ListStoredWorkflow) => {
     try {
-      // Load full workflow from backend
-      const full = await api.getWorkflow(workflow.id) as StoredWorkflow;
-
-      // Convert to store format (for WorkflowCanvas which uses Zustand)
-      const storeNodes: StoreNode[] = full.nodes.map(n => ({
-        id: n.id,
-        type: 'workflowNode' as const,
-        position: n.position || { x: 0, y: 0 },
-        data: {
-          label: '',
-          type: n.type as any,
-          config: n.config || {},
-          status: 'idle' as const,
-        },
-      }));
-
-      const storeEdges: StoreEdge[] = (full.edges || []).map(e => ({
-        id: e.id || `e_${e.source}_${e.target}`,
-        source: e.source,
-        target: e.target,
-        sourceHandle: e.sourceHandle,
-        type: 'smoothstep' as const,
-        animated: false,
-        data: { type: (e.type || 'dependency') as 'dependency' | 'condition-pass' | 'condition-fail' },
-      }));
+      // Load full workflow from backend.
+      // 存档现在是 `.qwf`：服务端返回 { ok, id, name, text, ir, canvas }，
+      // canvas 里才有节点/边；老 JSON 存档走 nodes/edges 分支（归一化在 qwfBridge 里）。
+      const payload = await api.getWorkflow(workflow.id);
+      const full = normalizeStoredWorkflow(payload as any, workflow.id);
+      if (!full.canvas.nodes.length && !full.canvas.edges.length) {
+        throw new Error((payload as any)?.error || '存档里没有节点');
+      }
 
       // Load into Zustand store (used by WorkflowCanvas)
-      useWorkflowStore.getState().loadWorkflow(storeNodes, storeEdges, full.id, full.name);
+      useWorkflowStore.getState().loadWorkflow(
+        full.nodes as unknown as StoreNode[],
+        full.edges as unknown as StoreEdge[],
+        full.id,
+        full.name,
+        {
+          baseIr: full.ir,
+          qwf: full.qwf,
+          source: full.source || 'saved',
+          workflow: full.workflow,
+          unsupported: full.unsupported,
+        }
+      );
 
       // Also update local state for any components using it
       setWorkflowName(full.name);
@@ -219,7 +234,7 @@ export default function WorkflowDesigner({ selectedQubit, onLog }: Props) {
   const addNode = (type: string) => {
     const id = "n" + Date.now();
     const baseConfig: Record<string, Record<string, unknown>> = {
-      experiment: { fn: "sq.s21", qubit: "{{qubit}}", params: { do_plot: true } },
+      experiment: { fn: "sq.s21", qubit: "{{qubit}}" },
       quality_gate: { ref: "", metric: "SNR", threshold: 1.5, direction: "above" },
       decision: { prompt: "Should we proceed?", context: "" },
       analyze: { ref: "", source: "realtime" },
@@ -227,6 +242,7 @@ export default function WorkflowDesigner({ selectedQubit, onLog }: Props) {
       image_analysis: { prompt: "Analyze this plot", imagePath: "" },
       image_classification: { qubit: "", experimentType: "spectroscopy", backend: "pytorch", reviewThreshold: 0.75, marginThreshold: 0.15 },
       print: { message: "Step completed" },
+      contrast: { datasetId: "", qubit: "{{qubit}}", kind: "IQraw", threshold: 0.4 },
     };
     const newNode: WorkflowNode = { id, type, config: baseConfig[type] || {} };
     setNodes(prev => [...prev, newNode]);

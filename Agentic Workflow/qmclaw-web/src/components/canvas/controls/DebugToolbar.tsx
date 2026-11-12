@@ -29,6 +29,7 @@ interface Props {
   onToggleSearch?: () => void;
   onExport?: () => void;
   onImport?: () => void;
+  onToggleQwfInfo?: () => void;
   onLoad?: (workflowId: string) => void;
   onLog?: (msg: string, isError?: boolean) => void;
 }
@@ -44,6 +45,7 @@ export default function DebugToolbar({
   onToggleSearch,
   onExport,
   onImport,
+  onToggleQwfInfo,
   onLoad,
   onLog,
 }: Props) {
@@ -55,6 +57,7 @@ export default function DebugToolbar({
     name: string;
     version: number;
     updatedAt: string;
+    source?: string;
   }>>([]);
   const [loading, setLoading] = useState(false);
   const [templates, setTemplates] = useState<NodeTemplate[]>([]);
@@ -95,6 +98,7 @@ export default function DebugToolbar({
         name: string;
         version: number;
         updatedAt: string;
+        source?: string;
       }>;
       setWorkflows(list);
     } catch (e: any) {
@@ -241,15 +245,6 @@ export default function DebugToolbar({
             boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
             zIndex: 100,
           }}>
-            <div style={{
-              padding: '8px 12px',
-              borderBottom: '1px solid #1e293b',
-              fontSize: '11px',
-              color: '#64748b',
-              fontWeight: 600,
-            }}>
-              SAVED WORKFLOWS
-            </div>
             {loading ? (
               <div style={{ padding: '16px', textAlign: 'center', color: '#64748b', fontSize: '12px' }}>
                 Loading...
@@ -259,27 +254,47 @@ export default function DebugToolbar({
                 No saved workflows
               </div>
             ) : (
-              workflows.map((wf) => (
-                <div
-                  key={wf.id}
-                  onClick={() => handleLoadWorkflow(wf.id)}
-                  style={{
-                    padding: '10px 12px',
-                    borderBottom: '1px solid #1e293b',
-                    cursor: 'pointer',
-                    transition: 'background 0.15s',
-                  }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = '#1e293b')}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-                >
-                  <div style={{ fontSize: '12px', color: '#e2e8f0', fontWeight: 500 }}>
-                    {wf.name}
-                  </div>
-                  <div style={{ fontSize: '10px', color: '#64748b', marginTop: '2px' }}>
-                    v{wf.version} · {new Date(wf.updatedAt).toLocaleString()}
-                  </div>
-                </div>
-              ))
+              <>
+                {(['saved', 'example'] as const).map((src) => {
+                  const group = workflows.filter((wf) => (wf.source || 'saved') === src);
+                  if (group.length === 0) return null;
+                  return (
+                    <div key={src}>
+                      <div style={{
+                        padding: '6px 12px',
+                        background: '#0b1220',
+                        fontSize: '10px',
+                        color: '#64748b',
+                        fontWeight: 600,
+                        letterSpacing: '0.05em',
+                      }}>
+                        {src === 'example' ? 'EXAMPLES (.qwf)' : 'SAVED WORKFLOWS (.qwf)'}
+                      </div>
+                      {group.map((wf) => (
+                        <div
+                          key={wf.id}
+                          onClick={() => handleLoadWorkflow(wf.id)}
+                          style={{
+                            padding: '10px 12px',
+                            borderBottom: '1px solid #1e293b',
+                            cursor: 'pointer',
+                            transition: 'background 0.15s',
+                          }}
+                          onMouseEnter={(e) => (e.currentTarget.style.background = '#1e293b')}
+                          onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                        >
+                          <div style={{ fontSize: '12px', color: '#e2e8f0', fontWeight: 500 }}>
+                            {wf.name}
+                          </div>
+                          <div style={{ fontSize: '10px', color: '#64748b', marginTop: '2px' }}>
+                            v{wf.version} · {new Date(wf.updatedAt).toLocaleString()}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+              </>
             )}
           </div>
         )}
@@ -425,7 +440,7 @@ export default function DebugToolbar({
           fontSize: '12px',
           fontWeight: 600,
         }}
-        title="Save workflow"
+        title="Save workflow (.qwf)"
       >
         <span>💾</span>
         <span>Save</span>
@@ -452,7 +467,7 @@ export default function DebugToolbar({
             cursor: 'pointer',
             fontSize: '12px',
           }}
-          title="Export workflow as .qmclaw.json file"
+          title="Export workflow as .qwf file"
         >
           📤 Export
         </button>
@@ -471,9 +486,28 @@ export default function DebugToolbar({
             cursor: 'pointer',
             fontSize: '12px',
           }}
-          title="Import workflow from .qmclaw.json file"
+          title="Import workflow from .qwf file (or legacy .qmclaw.json)"
         >
           📥 Import
+        </button>
+      )}
+
+      {/* .qwf 信息面板 */}
+      {onToggleQwfInfo && (
+        <button
+          onClick={onToggleQwfInfo}
+          style={{
+            padding: '6px 10px',
+            background: '#1e293b',
+            border: '1px solid #334155',
+            borderRadius: '4px',
+            color: '#94a3b8',
+            cursor: 'pointer',
+            fontSize: '12px',
+          }}
+          title="Show .qwf workflow-level info (meta / env / budget / policy / raw text)"
+        >
+          📄 .qwf
         </button>
       )}
 

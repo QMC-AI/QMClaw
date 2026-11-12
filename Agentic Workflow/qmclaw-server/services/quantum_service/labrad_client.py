@@ -315,6 +315,27 @@ class LabRADClient:
             self._s = switch_result["session"]
             print("[Quantum] Session created", flush=True)
 
+            # 把 DataVault 当前目录切到配置的 session 路径。
+            # 必须放在 switchSession **之后**：lqcs 的 switchSession 会把 DataVault
+            # 当前目录设成注册表里挂载的样本，那个样本未必等于 config/session.json。
+            # 不补这一步，实验数据会落到注册表样本目录，而不是配置里指定的目录。
+            try:
+                _dv = self._cxn.data_vault
+                _dv.cd("")  # DataVault 的 cd 是相对当前目录的，先回根
+                _clean = (
+                    session_path[1:]
+                    if session_path and session_path[0] == ""
+                    else session_path
+                )
+                if _clean:
+                    _dv.cd(_clean)
+                print(f"[Quantum] DataVault cd -> {_clean}", flush=True)
+            except Exception as e:
+                print(
+                    f"[Quantum] WARNING: DataVault cd to {session_path} failed: {e}",
+                    flush=True,
+                )
+
             # 初始化 DataLab
             print("[Quantum] Initializing DataLab...", flush=True)
             self._data = dc.DataLab(session_path, self._cxn.data_vault, dv_type="data_vault")
@@ -369,22 +390,11 @@ class LabRADClient:
             return False
 
     def _load_session_config(self) -> List[str]:
-        """加载会话配置"""
-        config_path = Path(__file__).parent.parent.parent / "config" / "session.json"
+        """加载会话配置（唯一实现在 services/common/session.py）"""
+        from ..common.session import load_session_config
 
-        if config_path.exists():
-            try:
-                import json
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-                session = config.get("session", {})
-                user = session.get("user", "LQHL")
-                path = session.get("path", ["test", "20260324"])
-                return ["", user] + path
-            except Exception:
-                pass
-
-        return ["", "LQHL", "test", "20260324"]
+        session_path, _source = load_session_config()
+        return session_path
 
     def switch_session(self, session_path: List[str]) -> bool:
         """切换会话

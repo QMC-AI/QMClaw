@@ -1,0 +1,22 @@
+{
+  "datavault_root": "D:\\DataVault\\LQHL.dir\\test.dir",
+  "model": "zpa_v2\\model.json",
+  "out": "zpa_pipeline_example_output_v2",
+  "settings": {
+    "bias_step": 0.2,
+    "visibility_threshold": 0.05,
+    "spec_start": 5.5,
+    "spec_stop": 4.0,
+    "spec_step": -0.001,
+    "spec_amp": 0.1,
+    "piamp_amp": 2.0,
+    "min_prominence_db": 1.0,
+    "min_interval_points": 3
+  },
+  "qubits": [
+    {"bit": "q23_7", "s21zpa_file": "00731 - q23_7%c S21zpa2d.hdf5"}
+  ],
+  "adapter_config": {
+    "datavault_root": "D:\\DataVault\\LQHL.dir\\test.dir"
+  }
+}

@@ -1,0 +1,50 @@
+name: checks
+
+# 只做**离线静态**检查：起服务、跑真机实验都由人控制（AGENTS.md 约定 3）。
+# 真机自检（_p3_e2e / _registry_ep_check / _apply_dataset_ep_check）不进 CI。
+
+on:
+  push:
+    branches: [main, master, feat/c-real-machine]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: 静态检查（Python 语法 / 文档漂移 / qwf lint）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests numpy pyyaml
+
+      - name: 全仓 Python 语法（ast.parse，抓"从来没能 import"的文件）
+        run: python _syntax_check.py
+
+      - name: 文档漂移（docs 路径存在性 + 自检清单与 runner 一致）
+        run: python _docs_paths_check.py
+
+      - name: 前端/Express 契约（阶段 19：排队轮询 + 作业代理，纯文件级）
+        run: python _phase19_check.py
+
+      - name: qwf 离线体检（受版本控制的产品范例，必须 0 error）
+        shell: pwsh
+        run: |
+          $files = @(git ls-files "qwf_examples/*.qwf")
+          if (-not $files -or $files.Count -eq 0) { Write-Host "没有 .qwf 文件"; exit 0 }
+          Write-Host "lint $($files.Count) 个 .qwf"
+          python qwf_lint.py @files
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

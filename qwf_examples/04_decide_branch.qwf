@@ -1,0 +1,61 @@
+# 范例 04 —— LLM 决策 + 分支（decide / if）
+
+# 要点：
+#   - decide 的 from 元素必须带 $（$r1），解析器只认 $ 前缀
+#   - mode "intent" 才会把 intent 写进模型提示词；mode "analysis" 只给结果摘要
+#   - choices 必须是模型能选的原样字符串，if 里比较的值要和 choices 一一对应
+#   - 模型给出表外 choice → choice 置空 → 分支都不跑，但流程正常结束
+#   - LLM 调用失败 → decide 节点 failed → 默认 halt（此时前面的实验已经跑过了）
+
+workflow ex04_decide_branch {
+  meta {
+    name        "ex04_decide_branch"
+    description "iqraw → decide → 按选择跑 iqraw 或 ramsey_t2"
+    tags        ["llm", "decide", "branch"]
+  }
+
+  env {
+    qubit   "q2ld3"
+    session "20251103_LD_SQ"
+  }
+
+  budget {
+    max_wall     20m
+    max_writes   4
+    max_datasets 4
+  }
+
+  measure as c1 {
+    fn      sq.iqraw
+    qubit   $env.qubit
+    timeout 120
+  }
+  read c1 as r1 { kind IQraw  threshold 0.4 }
+
+  decide "对比度偏低时，下一步做哪个实验更划算" as d1 {
+    mode    "intent"
+    choices ["iqraw", "ramsey_t2"]
+    from    ["$r1"]
+  }
+
+  if d1.choice == "iqraw" {
+    measure as c2 {
+      fn      sq.iqraw
+      qubit   $env.qubit
+      timeout 120
+    }
+    read c2 as r2 { kind IQraw  threshold 0.4 }
+    say "分支=iqraw：复测 contrast=${r2.contrast}"
+  }
+
+  if d1.choice == "ramsey_t2" {
+    measure as c3 {
+      fn      sq.ramsey_t2
+      qubit   $env.qubit
+      timeout 300
+    }
+    say "分支=ramsey_t2：数据集 ${c3.dataset}"
+  }
+
+  say "决策=${d1.choice}｜初始 contrast=${r1.contrast}"
+}

@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { api } from "../../lib/api";
+import { normalizeStoredWorkflow } from "../../lib/qwfBridge";
 
 export interface StoredWorkflow {
   id: string;
@@ -11,6 +12,13 @@ export interface StoredWorkflow {
   updatedAt: string;
   nodes?: Array<{ id: string; type: string; position?: { x: number; y: number }; config?: Record<string, unknown> }>;
   edges?: Array<{ id: string; source: string; target: string }>;
+  /** `.qwf` 存档的附加信息（服务端列表接口给的） */
+  source?: string;
+  title?: string;
+  description?: string;
+  tags?: string[];
+  nodeCount?: number;
+  ops?: string[];
 }
 
 interface Props {
@@ -32,6 +40,24 @@ const NODE_TYPE_ICONS: Record<string, string> = {
   while: "🔄",
   parallel: "⚡",
   context: "📦",
+  contrast: "🎯",
+  llm: "💬",
+  dsl_unknown: "🧱",
+};
+
+/** `.qwf` 的 op → 画布节点类型（列表页只拿到 op 种类时用它出图标）。 */
+const OP_TO_NODE_TYPE: Record<string, string> = {
+  measure: "experiment",
+  analyze: "analyze",
+  assert: "quality_gate",
+  read: "contrast",
+  say: "print",
+  let: "context",
+  apply: "adjust_params",
+  decide: "decision",
+  ask: "llm",
+  notify: "notify",
+  code: "code",
 };
 
 const CARD_COLORS = [
@@ -99,11 +125,16 @@ export default function WorkflowListView({ onSelectWorkflow, onCreateNew }: Prop
   async function handleDuplicate(e: React.MouseEvent, workflow: StoredWorkflow) {
     e.stopPropagation();
     try {
-      const full = await api.getWorkflow(workflow.id);
+      // 存档是 `.qwf`：服务端返回 canvas（节点/边在 canvas 里），
+      // 老 JSON 存档走 nodes/edges 分支——统一在 qwfBridge 里归一化。
+      const payload = await api.getWorkflow(workflow.id);
+      const full = normalizeStoredWorkflow(payload as any, workflow.id);
       await api.saveWorkflow({
         name: workflow.name + " (copy)",
-        nodes: full.nodes,
-        edges: full.edges,
+        nodes: full.canvas.nodes,
+        edges: full.canvas.edges,
+        workflow: { ...full.workflow, meta: { ...(full.workflow.meta as any), name: workflow.name + " (copy)" } },
+        baseIr: full.ir,
       });
       loadWorkflows();
     } catch (err) {
@@ -124,12 +155,15 @@ export default function WorkflowListView({ onSelectWorkflow, onCreateNew }: Prop
       return;
     }
     try {
-      const full = await api.getWorkflow(renamingId);
+      const payload = await api.getWorkflow(renamingId);
+      const full = normalizeStoredWorkflow(payload as any, renamingId);
       await api.saveWorkflow({
         id: renamingId,
         name: renameValue.trim(),
-        nodes: full.nodes,
-        edges: full.edges,
+        nodes: full.canvas.nodes,
+        edges: full.canvas.edges,
+        workflow: { ...full.workflow, meta: { ...(full.workflow.meta as any), name: renameValue.trim() } },
+        baseIr: full.ir,
       });
       setWorkflows(prev => prev.map(w =>
         w.id === renamingId ? { ...w, name: renameValue.trim() } : w
@@ -146,11 +180,18 @@ export default function WorkflowListView({ onSelectWorkflow, onCreateNew }: Prop
     }
   }
 
-  function getNodeTypes(nodes?: Array<{ type: string }>): string[] {
+  function getNodeTypes(nodes?: Array<{ type: string }>, ops?: string[]): string[] {
     const counts: Record<string, number> = {};
     nodes?.forEach(n => {
       counts[n.type] = (counts[n.type] || 0) + 1;
     });
+    if (Object.keys(counts).length === 0 && ops?.length) {
+      // `.qwf` 存档：列表接口只给 op 种类，画布节点类型按 op 映射
+      ops.forEach(op => {
+        const t = OP_TO_NODE_TYPE[op] || op;
+        counts[t] = (counts[t] || 0) + 1;
+      });
+    }
     return Object.entries(counts)
       .sort((a, b) => b[1] - a[1])
       .map(([type, count]) => `${NODE_TYPE_ICONS[type] || "📦"}${count}`);
@@ -283,7 +324,7 @@ export default function WorkflowListView({ onSelectWorkflow, onCreateNew }: Prop
             const wfStats = stats[wf.id] || { totalRuns: 0, completedRuns: 0, avgDuration: 0 };
             const color = getCardColor(wf.id);
             const isHovered = hoveredId === wf.id;
-            const nodeTypes = getNodeTypes(wf.nodes);
+            const nodeTypes = getNodeTypes(wf.nodes, wf.ops);
 
             return (
               <div
@@ -340,25 +381,41 @@ export default function WorkflowListView({ onSelectWorkflow, onCreateNew }: Prop
                       whiteSpace: "nowrap",
                       paddingRight: "8px",
                     }}>
-                      {wf.name}
+                      {wf.title || wf.name}
+                      {wf.source === 'example' && (
+                        <span style={{
+                          marginLeft: '6px',
+                          padding: '1px 5px',
+                          background: '#1e3a5f',
+                          border: '1px solid #38bdf8',
+                          borderRadius: '3px',
+                          color: '#38bdf8',
+                          fontSize: '8px',
+                          fontWeight: 600,
+                        }}>
+                          示例
+                        </span>
+                      )}
                     </div>
                   )}
                   {isHovered && !renamingId && (
                     <div style={{ display: "flex", gap: "3px", flexShrink: 0 }}>
-                      <button
-                        onClick={(e) => handleRenameClick(e, wf)}
-                        style={{
-                          padding: "2px 5px",
-                          background: "transparent",
-                          border: "1px solid #334155",
-                          borderRadius: "3px",
-                          color: "#64748b",
-                          fontSize: "9px",
-                          cursor: "pointer",
-                        }}
-                      >
-                        ✏️
-                      </button>
+                      {wf.source !== "example" && (
+                        <button
+                          onClick={(e) => handleRenameClick(e, wf)}
+                          style={{
+                            padding: "2px 5px",
+                            background: "transparent",
+                            border: "1px solid #334155",
+                            borderRadius: "3px",
+                            color: "#64748b",
+                            fontSize: "9px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          ✏️
+                        </button>
+                      )}
                       <button
                         onClick={(e) => handleDuplicate(e, wf)}
                         style={{
@@ -370,23 +427,26 @@ export default function WorkflowListView({ onSelectWorkflow, onCreateNew }: Prop
                           fontSize: "9px",
                           cursor: "pointer",
                         }}
+                        title="复制为新的存档（示例只读，可复制）"
                       >
                         📋
                       </button>
-                      <button
-                        onClick={(e) => handleDelete(e, wf.id)}
-                        style={{
-                          padding: "2px 5px",
-                          background: "transparent",
-                          border: "1px solid #334155",
-                          borderRadius: "3px",
-                          color: deleting === wf.id ? "#f87171" : "#64748b",
-                          fontSize: "9px",
-                          cursor: "pointer",
-                        }}
-                      >
-                        {deleting === wf.id ? "..." : "✕"}
-                      </button>
+                      {wf.source !== "example" && (
+                        <button
+                          onClick={(e) => handleDelete(e, wf.id)}
+                          style={{
+                            padding: "2px 5px",
+                            background: "transparent",
+                            border: "1px solid #334155",
+                            borderRadius: "3px",
+                            color: deleting === wf.id ? "#f87171" : "#64748b",
+                            fontSize: "9px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          {deleting === wf.id ? "..." : "✕"}
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -434,7 +494,7 @@ export default function WorkflowListView({ onSelectWorkflow, onCreateNew }: Prop
                         ✓ {wfStats.completedRuns}/{wfStats.totalRuns}
                       </span>
                     )}
-                    <span>{wf.nodes?.length || 0}</span>
+                    <span>{wf.nodeCount ?? wf.nodes?.length ?? 0}</span>
                   </div>
                 </div>
               </div>

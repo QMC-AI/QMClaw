@@ -17,7 +17,10 @@ import ImageAnalysisNode from './ImageAnalysisNode';
 import ImageClassificationNode from './ImageClassificationNode';
 import AdjustParamsNode from './AdjustParamsNode';
 import ContextNode from './ContextNode';
+import ContrastNode from './ContrastNode';
 import CodeNode from './CodeNode';
+import LlmNode from './LlmNode';
+import DslUnknownNode from './DslUnknownNode';
 
 export const nodeTypes = {
   experiment: ExperimentNode,
@@ -32,9 +35,12 @@ export const nodeTypes = {
   image_classification: ImageClassificationNode,
   adjust_params: AdjustParamsNode,
   context: ContextNode,
+  contrast: ContrastNode,
   code: CodeNode,
+  llm: LlmNode,
+  dsl_unknown: DslUnknownNode,
   // Fallback
   workflowNode: DefaultNode,
 };
 
-export { ExperimentNode, PrintNode, AnalyzeNode, QualityGateNode, WhileNode, ParallelNode, NotifyNode, DefaultNode, DecisionNode, ImageAnalysisNode, ImageClassificationNode, AdjustParamsNode, ContextNode, CodeNode };
+export { ExperimentNode, PrintNode, AnalyzeNode, QualityGateNode, WhileNode, ParallelNode, NotifyNode, DefaultNode, DecisionNode, ImageAnalysisNode, ImageClassificationNode, AdjustParamsNode, ContextNode, ContrastNode, CodeNode, LlmNode, DslUnknownNode };

@@ -1,0 +1,49 @@
+==========================================================
+一键启动（推荐）
+  双击 start-qmclaw.cmd
+  或：start-qmclaw.cmd -Status   只看健康状态
+      start-qmclaw.cmd -Stop     全部停掉
+      start-qmclaw.cmd -Kill     先清理占端口的残留进程
+  说明：会自动开 3 个窗口（网关 / Python 微服务 / 前端），
+        轮询健康检查后自动打开 http://localhost:8081
+==========================================================
+
+终端 1 — Express 网关 :3002  powershell
+cd "D:\qmclaw\Agentic Workflow\qmclaw-server"
+npm run dev
+
+终端 2 — 10 个 Python 微服务 :3003–3012  
+conda activate lqcs
+cd "D:\qmclaw\Agentic Workflow\qmclaw-server\scripts" 
+& "D:\anaconda3\envs\lqcs\python.exe" start_all_services.py --all
+
+终端 3 — 前端 :8081  powershell
+cd "D:\qmclaw\Agentic Workflow\qmclaw-web"
+npm run dev
+
+浏览器：http://localhost:8081
+
+
+--
+重启服务
+powershell -NoProfile -ExecutionPolicy Bypass -File "D:\qmclaw\docs\deploy_diff_tools\restart_services.ps1"
+--
+
+
+-----------------------------------------------------------
+$PY  = "D:\anaconda3\envs\lqcs\python.exe"
+$SRV = "D:\qmclaw\Agentic Workflow\qmclaw-server"
+
+# ① 终端1：Express 网关
+cd $SRV; npm run dev
+
+# ② 终端2：10 个微服务（走它会加载 .env；启动时会真连 LabRAD，约 8 秒）
+cd "$SRV\scripts"; & $PY start_all_services.py --all
+
+# ③ 终端3：前端
+cd "D:\qmclaw\Agentic Workflow\qmclaw-web"; npm run dev
+
+# ④ 只读验收：期望 data_source=labrad、actuation_allowed=false、/execute 返回 read_only
+& $PY "$SRV\scripts\check_readonly_regression.py"
+
+

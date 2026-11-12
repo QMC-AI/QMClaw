@@ -1,0 +1,143 @@
+{
+  "_doc": "指标与判据唯一真源（QMClaw Architecture Roadmap §2.5）。指标定义 = 标准算法 + 参数 + 阈值 + 置信度 + 数据列口径。goal / 脚本 / skill 一律引用这里的指标名与阈值，不在别处写死数值。改动请同时更新 .claude/progress.md。",
+  "version": "1.0.0",
+  "updated": "2026-11-09",
+  "authority": {
+    "note": "同一指标出现多个阈值时，以本文件的 thresholds 为准；历史值仅作溯源。",
+    "contrast_thresholds_history": {
+      "lab_standard_0.4": "实验室 calibrate.py stage_check 判据（2026-11-03 之前一直用）",
+      "user_2026_11_08_0.2": "用户 m13944/m14121 指定的可接受下限",
+      "observed_live_range": "活比特实测 0.25-0.40"
+    }
+  },
+
+  "metrics": {
+    "contrast": {
+      "display_name": "态区分度 (readout contrast)",
+      "algorithm": "projection_2means_on_discriminator_axis",
+      "definition": "contrast = |P(1|prep X) - P(1|prep I)|",
+      "axis": {
+        "source": "registry discriminator.center0 / discriminator.center1",
+        "formula": "u = (center1-center0)/||center1-center0|| ; thr = 0.5*(center0+center1)@u",
+        "warning": "sq.iqraw(update=True) 会用当前数据重写 center0/center1；弱对比度数据上会写出'看起来分得很开'的假中心。判读必须看 contrast，不能看中心间距。"
+      },
+      "columns": {
+        "P1_I": "prep I 分支中被判为 1 的比例（dataset columns 'P1 | I'）",
+        "P1_X": "prep X 分支中被判为 1 的比例（dataset columns 'P1 | X'）"
+      },
+      "thresholds": {
+        "unusable": 0.2,
+        "weak_but_usable": 0.4,
+        "good": 0.7
+      },
+      "threshold_semantics": {
+        "unusable": "< 0.2 不可用：先查 f10 是否偏了、π 脉冲是否在共振",
+        "weak_but_usable": "0.2-0.4 可用但弱：进入 iqraw→piamp→pidf 迭代",
+        "good": "> 0.7 良好：停止对比度调优，转 T1/T2/XEB"
+      },
+      "auxiliary": {
+        "snr": "sep/sigma，经验上 SNR≈2 对应 contrast≈0.7",
+        "dmu_sig": "|mean(I)-mean(X)|/sigma，无监督判据（不依赖 discriminator）",
+        "purity": "2-means 簇纯度，无响应比特约 0.25"
+      },
+      "reference_values": {
+        "q2ld3_2026_11_03": 0.765,
+        "q4ld3_2026_11_07": 0.7437,
+        "q7ld3_2026_11_08": 0.0283
+      },
+      "skill": "skills/qubit-contrast-tuning/SKILL.md"
+    },
+
+    "dmu_sig": {
+      "display_name": "IQ 簇分离度",
+      "algorithm": "abs(mean_I - mean_X)/sigma",
+      "thresholds": { "alive": 1.5, "ambiguous": 0.5 },
+      "reference_values": { "q2ld3_ds997": 2.05, "q4ld3_ds969": 2.338, "dead_qubits": "0.02-0.12" }
+    },
+
+    "t1": {
+      "display_name": "T1",
+      "algorithm": "exponential_with_fixed_offset",
+      "formula": "P1_X(t) = c + A*exp(-t/T1),  c 固定为 P1|I 的均值（ground floor）",
+      "notes": [
+        "三参自由拟合会让 c 漂到 0.27 附近，给出 T1≈43us 的错误值；固定 c 后得 T1≈72us；纯 log 线性得 77us。真实值 72-77us。",
+        "sq.t1 必须传固定 zpa=<值>；不传会跑 zpa×时间二维扫描（极慢）。",
+        "qter.fitData 对 1D T1 报 KeyError 'z pulse amplitude'，T1 必须自己拟合。"
+      ],
+      "unit": "us",
+      "dataset": { "independents": ["delay"], "dependents": ["P1 | I", "P1 | X"], "extra_params": ["statesQ", "zpa"] },
+      "thresholds": { "min_us": 20.0 },
+      "reference_values": { "q2ld3_ds576": "72-77 us" }
+    },
+
+    "t2_star": {
+      "display_name": "T2*",
+      "algorithm": "ramsey_damped_cosine",
+      "primary": "qter.fitData(dataset, collect=True) -> data[1][0]",
+      "pitfall": "fitData 返回 (para, data)，para 里只有 {'variables': [...]}，没有 'T2' 键；T2 数值在 data[1][0]。用 'T2' in para 判断会永远为假。",
+      "fallback": "阻尼余弦自拟合（qter 失败时）",
+      "unit": "us",
+      "dataset": { "independents": ["delay"], "dependents": ["Amplitude","Phase","I","Q","deviation","P1","time"], "shape": [100, 8] },
+      "thresholds": { "min_us": 1.0 },
+      "reference_values": { "q2ld3_ds565": 6.58, "q2ld3_ds577": 2.89 }
+    },
+
+    "xeb": {
+      "display_name": "XEB 保真度",
+      "algorithm": "lqms.data_process.xeb.process_xeb",
+      "call": "px.XEB(data, [dataset], collect=True, do_plot=True)",
+      "metrics": ["XEB_fids", "p", "error_Pauli_per_cycle", "gate_fidelity"],
+      "dataset": { "independents": ["k", "m"], "dependents": ["P0", "P1"], "shape": [270, 4] },
+      "thresholds": { "min_p": 0.99, "min_gate_fidelity": 0.99 },
+      "reference_values": { "q2ld3_ds578": { "p": 0.9965, "error_Pauli_per_cycle": 0.00266, "gate_fidelity": 0.9973 } }
+    },
+
+    "s21_dip": {
+      "display_name": "读出腔 S21 凹陷",
+      "algorithm": "argmin over freq of |S21| (power2d/auto)",
+      "thresholds": { "min_depth_db": -20.0, "max_offset_from_fread_mhz": 5.0 },
+      "reference_values": { "q2ld3_ds534": "-65.6% at 6.725331 GHz", "q7ld3": "-30.9 dB at 6.6328 / 6.7643 GHz" }
+    }
+  },
+
+  "registry_facts": {
+    "fread_is_per_qubit": {
+      "value": true,
+      "statement": "fread 是逐比特独立的（LabRAD 路径 q7ld3.fread），不是全局共享。",
+      "hazard": "实验的 auto-update 会静默回写该比特自己的 fread：q1/q3 被 s21 写成 6.7255 → 假死；q7 被 iqraw 写成 6.802。",
+      "mitigation": "所有扫描用 sq.iqraw(auto=False, do_plot=False, update=False)；每点显式钉住 fread；用数据集 parameters 快照反查实际值。"
+    },
+    "discriminator_is_derived": {
+      "value": true,
+      "statement": "discriminator.* 是派生键（厂商按刚采数据重算），不进 registry_bounds、不参与授权票据。"
+    },
+    "timing_never_delegable": {
+      "value": true,
+      "statement": "timing.* 永不可代理放行（用户 2026-11-05 定）。"
+    }
+  },
+
+  "capabilities": {
+    "lqms_available_functions": {
+      "note": "本机 lqms（lqcs 环境）实际可用的 sq_nodes 函数。.pyd 编译扩展遮蔽了更新的 .py 源码，因此新函数不可用。",
+      "available": ["iqraw","piamp","pidf","pulse_shape","pulse_shape_ramsey","ramsey_df","ramsey_t2","s21","s21_dis","s21_power2d","s21_zpa2d","set_pi","spectroscopy","spectroscopy_auto","spinecho_t2","t1","test_timing_xyz","xeb"],
+      "missing_in_pyd": ["spectroscopy_iq","time_rabi","iqcenter","impa_gain","pidf21"],
+      "missing_because": "D:/anaconda3/envs/lqcs/Lib/site-packages/lqms/measure/tuners/ 下 .pyd(2026-04-21) 遮蔽 .py(2026-09-08)；重启服务无用，需实验室重编译。"
+    },
+    "experiment_configs_unavailable": {
+      "allxy": "无同名函数；替代：iqraw + 重复对比",
+      "single_shot": "无同名函数；替代：iqraw 高 shots + 逐次判定",
+      "pulsed_spec": "替代：sq.spectroscopy_iq（当前不可用）",
+      "swap": "无同名函数",
+      "drag_calibrate": "无同名函数"
+    },
+    "vendor_pitfalls": [
+      "sq.spectroscopy 在平坦数据上会把 f10 写坏（实测 +35.7 MHz / 1.19 / 2.62 GHz）；光谱平就别信它写回的 f10。",
+      "sq.spectroscopy 必须显式传 freq=np.arange(...)；freq=None 会退化成标量并 IndexError。",
+      "服务端一律 do_plot=False：本机 matplotlib 默认 qtagg，会拉起 Qt GUI 卡死 :3003（进程仍 LISTENING 但 HTTP 000）。",
+      "sq.iqraw 的 stdout 不打印 dataset 号，数据集号要从 data_vault.dir() 解析（返回元组 (子目录, 文件列表)）。",
+      "sq.set_pi 在 tbuffer=0 时不可用于标定；sq.pidf 写回的 df 按 |IQ-median|^2 判据，与 dc.DataLab 列序不一致。",
+      "dc.DataLab 没有 fitData 方法；fitData 只在 QubitUpdater 上。"
+    ]
+  }
+}

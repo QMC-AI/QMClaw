@@ -116,8 +116,14 @@ class QuantumProxy:
 
     @staticmethod
     def execute(code: str, timeout: int = 300) -> Dict[str, Any]:
-        """执行实验代码"""
-        return _call_service("quantum", "/execute", "POST", {"code": code}, timeout=timeout)
+        """执行实验代码。
+
+        阶段 16a 起 `/execute` 默认异步（回 job_id 由调用方轮询）；这个代理是
+        "一次调用拿结果"的同步封装，所以显式 `wait=True`，行为与之前一致。
+        """
+        return _call_service(
+            "quantum", "/execute", "POST", {"code": code, "wait": True}, timeout=timeout
+        )
 
     @staticmethod
     def health() -> Dict[str, Any]:

@@ -10,6 +10,7 @@
  */
 
 import { createServiceProxy } from "./services/serviceProxy";
+import { resolveModelBaseUrl } from "./utils/envExpand";
 
 // ── Mode Configuration ────────────────────────────────────────────────────────
 // 微服务模式：Express 只做网关，/api/* 路由代理到微服务
@@ -1499,7 +1500,8 @@ app.post("/api/run-node", async (req, res) => {
           config._modelName = config.model;
           config.model = model.modelId;
           config._modelProvider = model.provider;
-          if (model.baseUrl) config._modelBaseUrl = model.baseUrl;
+          const resolvedBaseUrl = resolveModelBaseUrl(model);
+          if (resolvedBaseUrl) config._modelBaseUrl = resolvedBaseUrl;
         }
       } catch {
         // Model lookup failed, use config.model as-is
@@ -1744,7 +1746,7 @@ app.post("/api/chat/test", async (req, res) => {
     const result = await proxyToService('llm', '/chat', 'POST', {
       provider: model.provider,
       modelId: model.modelId,
-      baseUrl: model.baseUrl,
+      baseUrl: resolveModelBaseUrl(model) || undefined,
       messages,
       temperature: temperature ?? model.config.temperature ?? 0.3,
       maxTokens: maxTokens ?? model.config.maxTokens ?? 500,
@@ -1901,14 +1903,14 @@ app.post("/api/chat/analyze-plot", async (req, res) => {
     let requestBody: Record<string, unknown> = {};
 
     if (model.provider === "openai") {
-      endpoint = (model.baseUrl || "https://api.openai.com/v1") + "/chat/completions";
+      endpoint = (resolveModelBaseUrl(model) || "https://api.openai.com/v1") + "/chat/completions";
       requestBody = {
         model: model.modelId,
         messages,
         temperature: 0.3,
       };
     } else if (model.provider === "deepseek") {
-      endpoint = (model.baseUrl || "https://api.deepseek.com/v1") + "/chat/completions";
+      endpoint = (resolveModelBaseUrl(model) || "https://api.deepseek.com/v1") + "/chat/completions";
       requestBody = {
         model: model.modelId,
         messages,
@@ -3483,16 +3485,50 @@ app.get("/sessions/diagnostic", async (_req, res) => {
   }
 });
 
-/** POST /sessions/plot — plot the latest dataset with custom command (microservice) */
+/**
+ * POST /sessions/plot — plot a dataset with a custom command (microservice)
+ *
+ * body: { command?: string, dataset_index?: number, datasetIndex?: number }
+ *
+ * `dataset_index` 不传（或 -1）时画"会话里最新的数据集"；传了必须是非负整数，
+ * 直接透传给 analysis `/plot`（它按 `data.loadDataset(idx)` 加载）。以前这里只转发
+ * `command`，于是"画第 2669 号数据集"只能绕过 Express 直连 `:3004/plot` —— 两套入口、
+ * 两套行为。现在一个参数就够，且非法值在 Express 层就挡掉（回 400，不再让下游猜）。
+ */
+function coerceDatasetIndex(value: unknown): { index?: number; error?: string } {
+  if (value === undefined || value === null || value === "") return {};
+  const num = typeof value === "string" ? Number(value.trim()) : value;
+  if (typeof num !== "number" || !Number.isInteger(num) || num < 0) {
+    return { error: `dataset_index must be a non-negative integer, got ${JSON.stringify(value)}` };
+  }
+  // 0 与 -1 都是"会话里最新的数据集"（analysis 侧默认 -1），显式 0 保留原语义
+  return { index: num };
+}
+
 app.post("/sessions/plot", async (req, res) => {
+  const body = (req.body ?? {}) as {
+    command?: string;
+    dataset_index?: unknown;
+    datasetIndex?: unknown;
+    dataset_id?: unknown;
+  };
+  const picked = coerceDatasetIndex(
+    body.dataset_index !== undefined ? body.dataset_index : body.datasetIndex,
+  );
+  if (picked.error) {
+    res.status(400).json({ error: picked.error, status: "failed", reasonCode: "validation_error" });
+    return;
+  }
+  const command = body.command || "";
+  const payload: Record<string, unknown> = { command };
+  if (picked.index !== undefined) payload.dataset_index = picked.index;
+
   if (USE_MICROSERVICES) {
-    const { command } = req.body as { command?: string };
-    const result = await proxyToService('analysis', '/plot', 'POST', { command: command || "" });
+    const result = await proxyToService('analysis', '/plot', 'POST', payload);
     res.status(result.ok ? 200 : 502).json(result.data ?? { error: result.error });
   } else {
     try {
-      const { command } = req.body as { command?: string };
-      const result = await sendbackendRequest("plot_dataset", { command: command || "" }) as Record<string, unknown>;
+      const result = await sendbackendRequest("plot_dataset", payload) as Record<string, unknown>;
       res.json(result);
     } catch (err: any) {
       res.status(502).json({ error: err.message });

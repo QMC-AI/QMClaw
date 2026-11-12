@@ -5,6 +5,7 @@ services/llm_service/server.py - LLM 服务入口
 """
 
 import json
+import os
 import time
 import threading
 import sys
@@ -205,8 +206,15 @@ class LLMService(BaseService):
 
         url = "https://api.minimax.chat/v1/text/chatcompletion_v2"
 
+        # 模型名可配置：`MiniMax-Text-01` 已下线（base_resp.status_code=2069），
+        # 该端点用 `MiniMax-M2.7` 仍可正常返回。用 MINIMAX_MODEL 覆盖，
+        # 也可在 config/model_configs.json 顶层加 "minimax_model"。
+        model_name = (os.environ.get("MINIMAX_MODEL")
+                      or config.get("minimax_model")
+                      or "MiniMax-M2.7")
+
         payload = {
-            "model": "MiniMax-Text-01",
+            "model": model_name,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,

@@ -12,6 +12,7 @@ import { api, Metrics, ExperimentConfig, normalizePlotUrl } from "../lib/api";
 import CollapsibleCommand from "../components/CollapsibleCommand";
 import UnifiedResults from "../components/UnifiedResults";
 import JobsPanel from "../components/JobsPanel";
+import QueueStatusBadge from "../components/QueueStatusBadge";
 import WorkflowDesigner from "../components/WorkflowDesigner";
 import { CompactSessionManager } from "../components/SessionManager";
 import ImageClassificationPanel from "../components/ImageClassificationPanel";
@@ -161,9 +162,13 @@ export default function Dashboard() {
     name: string;
     description: string;
     function: string;
+    defaultCommand?: string;
     defaultPlotCommand: string;
     defaultAnalysisCommand?: string;
     metricsToExtract?: string[];
+    available?: boolean;
+    note?: string;
+    alternative?: { function?: string; defaultCommand?: string };
   }>>({});
 
   // Load experiment configs from backend on mount
@@ -422,11 +427,29 @@ export default function Dashboard() {
     // Update commands from configs
     if (experimentConfigs[e]) {
       const cfg = experimentConfigs[e];
-      setCurrentRunCommand(cfg.function ? `${cfg.function}({qubit}, do_plot=True)` : "");
+      // 优先用配置里的 defaultCommand（带扫参），没有才退回 fn({qubit})
+      // 不在服务端画图：do_plot 会拉起 GUI 把微服务卡死，画图统一交给 analysis 的 /plot
+      setCurrentRunCommand(
+        cfg.defaultCommand || (cfg.function ? `${cfg.function}({qubit})` : "")
+      );
       setCurrentPlotCommand(cfg.defaultPlotCommand || "");
       setCurrentAnalyzeCommand(cfg.defaultAnalysisCommand || "");
     }
   };
+
+  // 实际下发的运行命令：手改过就用 currentRunCommand，
+  // 否则优先用配置里的 defaultCommand（带扫参），最后才退回 fn({qubit})
+  // 注意：一律不带 do_plot —— 服务端画图会拉起 GUI 卡死进程，画图走 analysis 的 /plot
+  const buildRunCommand = (exp: ExpType) => {
+    const manual = exp === selectedExp ? currentRunCommand : "";
+    const raw =
+      manual ||
+      experimentConfigs[exp]?.defaultCommand ||
+      `${sqMap[exp] || exp}(${selectedQubit})`;
+    return raw.replaceAll("{qubit}", selectedQubit);
+  };
+
+  const effectiveRunCommand = () => buildRunCommand(selectedExp);
 
   // ── Add qubit ──────────────────────────────────────────────────────────
   const addQubit = () => {
@@ -484,19 +507,32 @@ export default function Dashboard() {
     if (running) return;
     setRunning(true);
     setIsRunningCommand(true);
-    addLog("▶ " + exp + " on " + selectedQubit + "...");
+    // Run 按钮走的是这里，之前硬拼 "fn(qubit, do_plot=True)"，
+    // 完全绕过了命令框和配置里的 defaultCommand（spectroscopy 因此丢 freq）
+    const code = buildRunCommand(exp);
+    addLog("▶ " + exp + " on " + selectedQubit + ": " + code);
     setPlotUrl(null);
     setPlotLoading(true);
     setAnalysisResult(null);
     setAnalysisError(null);
     setLlmSummary(null);
 
-    const sqFn = sqMap[exp] || exp;
-    const code = sqFn + "(" + selectedQubit + ", do_plot=True)";
-
     try {
-      // Use synchronous microservice endpoint
-      const result = await api.runExperiment(code, { timeout: 300 });
+      // 阶段 19：/execute 默认 producer 语义，客户端自动排队+轮询（这里只做进度提示）
+      let lastPhase = "";
+      const result = await api.runExperiment(code, {
+        timeout: 300,
+        onProgress: (job) => {
+          const phase =
+            job.status === "queued"
+              ? `queued${job.queue_position ? ` #${job.queue_position}` : ""}`
+              : job.status;
+          if (phase !== lastPhase) {
+            lastPhase = phase;
+            addLog("⏳ " + phase);
+          }
+        },
+      });
       setTaskId(result.task_id);
 
       // Check for offline mode error
@@ -600,8 +636,21 @@ export default function Dashboard() {
     addLog("▶ Custom: " + command.slice(0, 60) + "...");
 
     try {
-      // Use synchronous microservice endpoint
-      const result = await api.runExperiment(command, { timeout: 300 });
+      // 阶段 19：自定义命令同样走 producer 语义 + 客户端轮询
+      let lastPhase = "";
+      const result = await api.runExperiment(command, {
+        timeout: 300,
+        onProgress: (job) => {
+          const phase =
+            job.status === "queued"
+              ? `queued${job.queue_position ? ` #${job.queue_position}` : ""}`
+              : job.status;
+          if (phase !== lastPhase) {
+            lastPhase = phase;
+            addLog("⏳ " + phase);
+          }
+        },
+      });
       setTaskId(result.task_id);
       addLog("Task: " + result.task_id.slice(0, 12) + "...");
 
@@ -853,6 +902,8 @@ export default function Dashboard() {
           <span title="Express server" style={{ color: serverOk ? "#22c55e" : "#ef4444", fontSize: "0.75rem" }}>
             Express {serverOk ? "✅" : "❌"}
           </span>
+          {/* 硬件通道 / 任务队列 */}
+          <QueueStatusBadge />
           {/* Offline mode selector */}
           <select
             value={quantumMode}
@@ -1128,18 +1179,24 @@ export default function Dashboard() {
 
               {/* All experiment buttons */}
               <div style={{ display: "flex", gap: "0.375rem", flexWrap: "wrap" }}>
-                {expButtons.map((e) => (
-                  <button key={e} onClick={() => setSelectedExp(e)} style={{
+                {expButtons.map((e) => {
+                  const cfg = experimentConfigs[e];
+                  const unavailable = cfg?.available === false;
+                  return (
+                  <button key={e} onClick={() => setSelectedExp(e)} title={unavailable ? (cfg?.note || "该实验当前不可用") : undefined} style={{
                     padding: "0.4rem 0.875rem", borderRadius: "0.375rem",
                     border: "1px solid",
                     borderColor: selectedExp === e ? "#38bdf8" : "#334155",
                     background: selectedExp === e ? "#1e3a5f" : "#1e293b",
-                    color: "#e2e8f0", cursor: "pointer",
+                    color: unavailable ? "#64748b" : "#e2e8f0", cursor: "pointer",
+                    opacity: unavailable ? 0.6 : 1,
+                    textDecoration: unavailable ? "line-through" : "none",
                     textTransform: "capitalize", fontSize: "0.8rem",
                   }}>
                     {e.replace(/_/g, " ")}
                   </button>
-                ))}
+                  );
+                })}
               </div>
 
               {/* Experiment description */}
@@ -1153,6 +1210,14 @@ export default function Dashboard() {
               }}>
                 <span style={{ color: "#38bdf8", fontWeight: 600 }}>sq.{sqMap[selectedExp]?.split(".")[1]}: </span>
                 {expDescriptions[selectedExp]}
+                {experimentConfigs[selectedExp]?.available === false && (
+                  <div style={{ marginTop: "0.35rem", color: "#fbbf24" }}>
+                    ⚠ {experimentConfigs[selectedExp]?.note}
+                    {experimentConfigs[selectedExp]?.alternative?.function && (
+                      <> 可改用 <code>{experimentConfigs[selectedExp]?.alternative?.function}</code>。</>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Collapsible Commands */}
@@ -1160,9 +1225,16 @@ export default function Dashboard() {
                 {/* Run Command */}
                 <CollapsibleCommand
                   type="command"
-                  command={(currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)").replaceAll("{qubit}", selectedQubit)}
+                  command={effectiveRunCommand()}
                   onCommandChange={setCurrentRunCommand}
-                  onRun={() => runCustom((currentRunCommand || sqMap[selectedExp] + "(" + selectedQubit + ", do_plot=True)").replaceAll("{qubit}", selectedQubit))}
+                  onRun={() => {
+                    const cfg = experimentConfigs[selectedExp];
+                    if (cfg?.available === false) {
+                      addLog(`⛔ ${selectedExp} 当前不可用：${cfg?.note || ""}`);
+                      return;
+                    }
+                    runCustom(effectiveRunCommand());
+                  }}
                   onSave={() => handleSaveRunCommand(selectedExp, currentRunCommand)}
                   disabled={running}
                   isRunning={isRunningCommand}

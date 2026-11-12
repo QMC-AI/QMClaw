@@ -40,12 +40,12 @@ from .optimizer import (
 def _mock_spectroscopy_data(n_points: int = 100) -> list:
     """Generate mock spectroscopy data (Lorentzian dip)."""
     freq = [4.0 + i * 0.0001 for i in range(n_points)]
-    amp = [0.5 - 0.4 / (1 + ((f - 4.5) ** 2 / 0.001) + random.uniform(-0.01, 0.01) for f in freq]
+    amp = [0.5 - 0.4 / (1 + ((f - 4.5) ** 2 / 0.001)) + random.uniform(-0.01, 0.01) for f in freq]
     phase = [random.uniform(-0.1, 0.1) for _ in freq]
     i_data = [random.gauss(0, 0.05) for _ in freq]
     q_data = [random.gauss(0, 0.05) for _ in freq]
     # Flatten as [freq, amp, phase, I, Q, prob]
-    prob = [0.1 + 0.8 / (1 + ((f - 4.5) ** 2 / 0.001) for f in freq]
+    prob = [0.1 + 0.8 / (1 + ((f - 4.5) ** 2 / 0.001)) for f in freq]
     return [[freq[i], amp[i], phase[i], i_data[i], q_data[i], prob[i]] for i in range(n_points)]
 
 
@@ -179,15 +179,15 @@ class QuantumWorker:
             elif experiment == "iqraw":
                 data = _mock_iqraw_data()
             elif experiment == "ramsey":
-                data = [[i, 0.5 + 0.3 * random.gauss(0, 1) * (1 if i % 2 == 0 else -1) + 0.1 * random.uniform(-1, 1) for i in range(50)]
+                data = [[i, 0.5 + 0.3 * random.gauss(0, 1) * (1 if i % 2 == 0 else -1) + 0.1 * random.uniform(-1, 1)] for i in range(50)]
             elif experiment == "t1":
-                data = [[i * 1000, 0.9 * (0.5 + 0.5 * (0.95 ** (i * 1000 / 10000)) + random.uniform(-0.02, 0.02) for i in range(16)]]
+                data = [[i * 1000, 0.9 * (0.5 + 0.5 * (0.95 ** (i * 1000 / 10000))) + random.uniform(-0.02, 0.02)] for i in range(16)]
             elif experiment == "s21":
-                data = [[4.0 + i * 0.0002, 0.5 - 0.3 / (1 + ((f - 4.8) ** 2 / 0.0001) + random.uniform(-0.01, 0.01) for i, f in enumerate([4.0 + i * 0.0002 for i in range(100)])]
+                data = [[4.0 + i * 0.0002, 0.5 - 0.3 / (1 + ((f - 4.8) ** 2 / 0.0001)) + random.uniform(-0.01, 0.01)] for i, f in enumerate([4.0 + i * 0.0002 for i in range(100)])]
                 data = [[d[0], d[1], random.uniform(-0.05, 0.05), random.gauss(0, 0.02), random.gauss(0, 0.02), d[1]] for d in data]
             elif experiment == "xeb":
                 m_vals = [10, 30, 50, 70, 100, 150, 200]
-                data = [[float(m), 0.9 + random.uniform(-0.05, 0.02) * (0.5 ** (m / 200)) for m in m_vals]
+                data = [[float(m), 0.9 + random.uniform(-0.05, 0.02) * (0.5 ** (m / 200))] for m in m_vals]
                 data = [[d[0], d[1]] for d in data]
             else:
                 data = [[i, random.uniform(0.3, 0.7)] for i in range(50)]

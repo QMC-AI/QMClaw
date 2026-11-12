@@ -211,6 +211,27 @@ class LQCSBackend:
                 self._s = result["session"]
             print("[LQCS Backend] switchSession done", file=sys.stderr, flush=True)
 
+            # 同 services/quantum_service/labrad_client.py：必须在 switchSession
+            # **之后**把 DataVault 切到配置的 session 路径，否则数据会落到注册表
+            # 挂载的样本目录，而不是 config/session.json 指定的目录。
+            try:
+                _dv = self._cxn.data_vault
+                _dv.cd("")  # DataVault 的 cd 是相对当前目录的，先回根
+                _clean = (
+                    session_path[1:]
+                    if session_path and session_path[0] == ""
+                    else session_path
+                )
+                if _clean:
+                    _dv.cd(_clean)
+                print(f"[LQCS Backend] DataVault cd -> {_clean}", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(
+                    f"[LQCS Backend] WARNING: DataVault cd to {session_path} failed: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
             # Initialize data lab
             print("[LQCS Backend] Initializing DataLab...", file=sys.stderr, flush=True)
             dv = self._cxn.data_vault

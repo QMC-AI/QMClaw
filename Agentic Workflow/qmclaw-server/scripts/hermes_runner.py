@@ -78,6 +78,8 @@ def load_model_configs() -> List[Dict[str, Any]]:
     try:
         with open(config_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
+            from services.common.env_expand import expand_model_configs
+            expand_model_configs(data)
             return data.get("models", [])
     except Exception as e:
         print(f"[Hermes] Failed to load model configs: {e}", file=sys.stderr, flush=True)

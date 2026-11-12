@@ -1,0 +1,38 @@
+# 范例 03 —— T1（必须固定 zpa）
+
+# 要点：
+#   - sq.t1 不传 zpa 会展开成 zpa×时间二维扫描（几百点），极慢
+#   - 传固定 zpa 才是 1D 时间扫描；1D 结果没法用 qter.fitData 拟合（KeyError 'z pulse amplitude'）
+#   - delay 用 range 语法：delay range 起点 终点 步长（单位 ns）
+
+workflow ex03_t1_fixed_zpa {
+  meta {
+    name        "ex03_t1_fixed_zpa"
+    description "测 T1：zpa 固定 0.0 的 1D 时间扫描"
+    tags        ["t1", "zpa"]
+  }
+
+  env {
+    qubit   "q2ld3"
+    session "20251103_LD_SQ"
+  }
+
+  budget {
+    max_wall     10m
+    max_writes   0
+    max_datasets 2
+  }
+
+  measure as c1 {
+    fn      sq.t1
+    qubit   $env.qubit
+    timeout 300
+    note    "T1：zpa=0.0，delay 0-84000ns，共 16 点"
+    args {
+      zpa 0.0
+      delay range 0 84000 6000
+    }
+  }
+
+  say "T1 数据集=${c1.dataset}"
+}

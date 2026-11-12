@@ -69,3 +69,180 @@ auth.lock
 # 服务运行日志（start-services-quiet.ps1 写到这里；含 services-status.json 里的 PID）
 .runtime-logs/
 
+
+# ---------------------------------------------------------------------------
+# 未发表的 DSL 论文材料（2026-11-05 用户要求：近期不要误上传到 GitHub）
+#
+# 范围：DSL 设计/实验文档 + 实验与评测代码 + 实验产物。
+# 论文定稿、确认可以公开后，删掉这一段即可恢复跟踪；
+# 若只想临时提交其中某个文件，用 `git add -f <path>` 显式覆盖。
+# ---------------------------------------------------------------------------
+# 设计文档
+/docs/DSL_DESIGN.md
+/docs/DSL_EXPERIMENTS.md
+/docs/BACKEND_ADAPTERS.md
+
+# 实验与评测代码（规格库 / 渲染器 / 三层判定 / 离线排查 / LLM 回路 / 变异测试）
+/docs/deploy_diff_tools/dsl_*.py
+/docs/deploy_diff_tools/exp2_*.py
+/docs/deploy_diff_tools/spec_render.py
+/docs/deploy_diff_tools/mutation_*.py
+/docs/deploy_diff_tools/expr3_expressiveness.py
+
+# 实验产物（CI 报告、LLM 轨迹 JSONL、汇总与分析表）
+/docs/reports/dsl_ci_*.json
+/docs/reports/exp2_*
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-06：一次性的探针/扫描脚本与运行产物，不进版本库
+# ---------------------------------------------------------------------------
+/_p3_e2e_tasks/
+/calib_metrics_*.json
+/_probe_*/
+/_q4_*/
+/_q7_*/
+# 同前缀的一次性脚本（不是目录）
+/_probe_*.py
+/_q4_*.py
+/_q7_*.py
+/_dsl_runs.py
+/_p1_diff_out.txt
+# lint 反例夹具：故意写坏的文件，不能进版本库（会被 lint 回归扫到）
+/_lint_fixtures/
+/_chk_*.py
+/_ds_*.py
+/_hl.py
+/_iq_diag.py
+/_fread_sweep.py
+/_lane_*.py
+/_lane_snap.json
+/_run_*.py
+/_tally_ds.py
+*.bak-*
+/bak/
+/tmp/
+/cache/
+/logs/
+/sessions/
+/memories/
+/memory/
+/audio_cache/
+/image_cache/
+/new_ctrl/
+/new_templates/
+/pairing/
+/hooks/
+/cron/
+/deepagents_cli/
+/lqcs_deploy/
+/measure_scripts/
+/skills/
+/state.db*
+/.tmp_*/
+/.deploy-logs/
+/.dsh-orders/
+/vendor/
+/_qp*/
+
+# ---------------------------------------------------------------------------
+# 2026-11-06：服务运行时产物
+# ---------------------------------------------------------------------------
+# task_queue 账本默认落盘目录（每个 task 一个 json）
+/Agentic Workflow/config/tasks/
+# Next.js 增量编译缓存
+/Agentic Workflow/qmclaw-web/tsconfig.tsbuildinfo
+# 寄存器快照（本机状态，不是源码）
+/reg_snapshots/
+/t1_fit_q5lu8.png
+# 自检脚本统一落盘目录（运行时产物）
+/_checks/
+
+# task_queue 账本实际落盘目录（自检 e2e 会生成）
+/Agentic Workflow/qmclaw-server/services/task_queue/data/tasks/
+
+# ---------------------------------------------------------------------------
+# 2026-11-09：一次性排查脚本与产物（q7ld3 / ld3 死因排查系列，不入库）
+# ---------------------------------------------------------------------------
+/_ld3_*.py
+/_ld3_*.json
+/_ld3_*.md
+/_ld3_*.png
+/_ld3_s21zpa2d/
+/_ld3_s21zpa2d_repro/
+/_q7ld3_*.py
+/_q7ld3_*.json
+/_q7ld3_*.npy
+/_q7ld3_*.csv
+/_q7ld3_*.png
+/_q7ld3_*.svg
+/_q7ld3_s21zpa2d/
+/_q4ld3_*.py
+/_q4ld3_*.json
+/_t_*.py
+/_contrast_*.py
+/_contrast_*.json
+/_dv_*.py
+/_dv_*.txt
+/_scan_df.qwf
+/_sweep_code.py
+/_checks_run.log
+
+# ---------------------------------------------------------------------------
+# 2026-11-11：版本库治理（GitHub 只留关键代码 + 运维/适配文档）
+# 说明：被忽略的已跟踪文件已用 `git rm --cached` 出库，本地文件仍在。
+# ---------------------------------------------------------------------------
+
+# 根目录一次性排查脚本（只放行 run_all_checks.py 引用的检查脚本族）
+/_*.py
+!/_phase[0-9]*_check.py
+!/_p[0-9]*_check.py
+!/_syntax_check.py
+!/_docs_paths_check.py
+!/_apply_dataset_ep_check.py
+!/_autorevert*_check.py
+!/_d2_registry_offline_check.py
+!/_derived_key_check.py
+!/_governance_check.py
+!/_registry_ep_check.py
+!/_replay_regression.py
+!/_tq_test_server.py
+!/_wf_test_server.py
+!/_qwf_gen_goal_check.py
+
+# 根目录一次性产物的数据文件
+/_*.json
+/_*.txt
+/_*.csv
+/_*.npy
+/_*.png
+/_*.svg
+/_*.log
+
+# 一次性标定/实验产物（46 MB 级）
+/q7ld3_*
+/自动化单比特标定/out/
+/自动化单比特标定/model.json
+/wfstatus.json
+/_task_data/
+/_progress_append.md
+/nul
+/docs/reports/
+
+# 根目录一次性实验 .qwf（产品范例在 qwf_examples/，不受影响）
+/*.qwf
+
+# 文档口径：只公开 README/install + 运维/适配文档；另放行 2 篇自检脚本强依赖的设计文档
+/AGENTS.md
+/CLAUDE.md
+/SOUL.md
+/Agentic Workflow/README.md
+/Agentic Workflow/qmclaw-server/README.md
+/Agentic Workflow/qmclaw-server/STATUS.md
+/docs/**/*.md
+!/docs/OPERATIONS.md
+!/docs/ADAPTER_GUIDE.md
+!/docs/DEPLOY_LOCAL.md
+!/docs/ARCHITECTURE_ROADMAP.md
+!/docs/PLAN_PRODUCER_DEFAULT.md
+

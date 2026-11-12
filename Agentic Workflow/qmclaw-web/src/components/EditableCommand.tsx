@@ -31,7 +31,8 @@ const SQ_MAP: Record<ExpType, string> = {
 
 function buildCommand(qubit: string, expType: ExpType): string {
   const fn = SQ_MAP[expType] || expType;
-  return fn + "(" + qubit + ", do_plot=True)";
+  // 不带 do_plot：服务端画图会拉起 GUI 卡死微服务，画图统一交给 analysis 的 /plot
+  return fn + "(" + qubit + ")";
 }
 
 export default function EditableCommand({ qubit, expType, onRun, onSave, initialCommand, disabled }: EditableCommandProps) {

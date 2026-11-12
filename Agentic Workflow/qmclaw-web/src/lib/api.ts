@@ -16,6 +16,22 @@
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3002";
 
+// ── task_queue 直连兜底 ──────────────────────────────────────────────────────
+// Express 改了路由要手动重启，而前端是热更新，两者会短暂不一致；
+// 代理路由缺失时直连 :3009（该服务所有响应都带 Access-Control-Allow-Origin: *）。
+// 一旦确认代理缺失就记住，避免每 1.5 s 都白打一次 404。
+let laneProxyMissing = false;
+
+function queueDirectUrl(path: string): string {
+  const envBase = process.env.NEXT_PUBLIC_QUEUE_URL;
+  if (envBase) return `${envBase.replace(/\/$/, "")}${path}`;
+  const host =
+    typeof window !== "undefined" && window.location?.hostname
+      ? window.location.hostname
+      : "127.0.0.1";
+  return `http://${host}:3009${path}`;
+}
+
 /**
  * Convert a plot path to a full URL for the browser to load.
  * Handles relative paths (/plots/...), absolute paths (D:\...), and full URLs.
@@ -28,6 +44,135 @@ export function normalizePlotUrl(path: string | undefined | null): string | null
   if (path.startsWith('/')) return `${API_BASE}${path}`;
   // Assume it's a filename in the plots directory
   return `${API_BASE}/plots/${path}`;
+}
+
+// ── 量子作业轮询（阶段 19）────────────────────────────────────────────────────
+// `/api/quantum/execute` 默认走 producer 语义：立刻返回
+// `{ status: "queued", job_id, run_id, trace_id, poll }`，结果要从
+// `GET /api/quantum/jobs/{job_id}` 取。完成态的 result 里已带
+// `dataset_ids / dataset_source / trace_id / execute_mode`。
+const QUANTUM_JOB_TERMINAL = new Set([
+  "success", "completed", "error", "failed", "timeout", "cancelled", "rejected",
+]);
+
+export interface QuantumJobState {
+  status: string;
+  job_id?: string;
+  run_id?: string;
+  trace_id?: string;
+  queue_position?: number;
+  started_at?: string | null;
+  finished_at?: string | null;
+  result?: Record<string, unknown> | null;
+  error?: string | null;
+  error_code?: string | null;
+  [key: string]: unknown;
+}
+
+/** 提交响应是不是"排队中"（producer 语义） */
+export function isQueuedJob(payload: unknown): payload is { job_id: string; status: string } {
+  if (!payload || typeof payload !== "object") return false;
+  const p = payload as Record<string, unknown>;
+  return p.status === "queued" && typeof p.job_id === "string" && p.job_id.length > 0;
+}
+
+export async function getQuantumJob(jobId: string): Promise<QuantumJobState> {
+  const res = await fetch(`${API_BASE}/api/quantum/jobs/${encodeURIComponent(jobId)}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+    throw new Error((err as { error?: string }).error || `Job query failed: HTTP ${res.status}`);
+  }
+  return (await res.json()) as QuantumJobState;
+}
+
+/**
+ * 轮询到作业终态。
+ * - 只有"没有 status 的传输层错误"才继续等（Express 重启时常见），
+ *   带 status 的失败立刻返回。
+ * - 超时抛错，不静默返回半成品。
+ */
+export async function waitForQuantumJob(
+  jobId: string,
+  options?: { timeoutMs?: number; intervalMs?: number; onProgress?: (job: QuantumJobState) => void },
+): Promise<QuantumJobState> {
+  const timeoutMs = options?.timeoutMs ?? 600_000;
+  const intervalMs = options?.intervalMs ?? 800;
+  const deadline = Date.now() + timeoutMs;
+  let lastError = "";
+
+  for (;;) {
+    try {
+      const job = await getQuantumJob(jobId);
+      options?.onProgress?.(job);
+      if (QUANTUM_JOB_TERMINAL.has(String(job.status))) return job;
+      lastError = "";
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `Job ${jobId} 轮询超时（${Math.round(timeoutMs / 1000)}s）` +
+          (lastError ? `，最后一次错误：${lastError}` : ""),
+      );
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+/**
+ * 把"提交回包 + 终态 job"摊平成调用方熟悉的结果形状
+ * （status/stdout/stderr/error/result/task_id，另加审计字段）。
+ * 老页面只读 status/stdout/result，摊平后无需改动。
+ */
+export function flattenQuantumJob(
+  submit: Record<string, unknown> | null | undefined,
+  job: QuantumJobState,
+): {
+  task_id: string;
+  job_id: string;
+  status: string;
+  stdout: string;
+  stderr: string;
+  error: string;
+  result?: unknown;
+  run_id?: string;
+  trace_id?: string;
+  dataset_ids: number[];
+  dataset_source?: string;
+  execute_mode: string;
+} {
+  const sub = (submit ?? {}) as Record<string, unknown>;
+  const inner = (job.result ?? {}) as Record<string, unknown>;
+  const pick = <T,>(...values: T[]): T | undefined =>
+    values.find((v) => v !== undefined && v !== null) as T | undefined;
+
+  return {
+    task_id: String(pick(job.job_id, sub.job_id, sub.task_id) ?? ""),
+    job_id: String(pick(job.job_id, sub.job_id) ?? ""),
+    status: String(pick(inner.status, job.status, sub.status) ?? "unknown"),
+    stdout: String(pick(inner.stdout, "") ?? ""),
+    stderr: String(pick(inner.stderr, "") ?? ""),
+    error: String(pick(inner.error, job.error, sub.error, "") ?? ""),
+    result: pick(inner.result, inner),
+    run_id: pick(job.run_id as string, inner.run_id as string, sub.run_id as string),
+    trace_id: pick(job.trace_id as string, inner.trace_id as string, sub.trace_id as string),
+    dataset_ids: (pick(inner.dataset_ids as number[], []) ?? []) as number[],
+    dataset_source: pick(inner.dataset_source as string, undefined),
+    execute_mode: String(pick(inner.execute_mode, sub.execute_mode, "async") ?? "async"),
+  };
+}
+
+/** 取消排队中的作业（尽力而为，失败不抛） */export async function abandonQuantumJob(jobId: string, reason = "user_abandon"): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/api/quantum/jobs/${encodeURIComponent(jobId)}/abandon`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -103,6 +248,38 @@ export interface TreeNode {
   name: string;
   path: string[];
   hasChildren: boolean;
+}
+
+// ── 硬件通道（task_queue lane）────────────────────────────────────────────────
+
+export interface LaneLease {
+  lease_id: string;
+  workflow_id: string;
+  priority: number;
+  status: "pending" | "active" | string;
+  created_at: number;
+  granted_at?: number | null;
+  expires_at?: number | null;
+  ttl?: number;
+  yield_between_nodes?: boolean;
+  owner?: string;
+  metadata?: { workflowName?: string; workflowId?: string; qubits?: string[] };
+  remaining_s?: number | null;
+}
+
+export interface LaneSnapshot {
+  status?: string;
+  queue_size?: number;        // 排队中的单个实验数
+  running_task?: string | null;
+  running_label?: string;     // 运行中实验的可读标签（从提交的 code 取函数名）
+  redis_available?: boolean;
+  busy: boolean;
+  active_lease: LaneLease | null;
+  pending_leases: LaneLease[];
+  expired_leases: number;
+  completed: number;
+  gated_types: string[];
+  quantum?: string;
 }
 
 // ── API Object ────────────────────────────────────────────────────────────────
@@ -206,6 +383,7 @@ export const api = {
 
   /**
    * Execute experiment code
+   * 默认 producer 语义：返回 queued 时自动轮询到终态，调用方拿到的仍是"结果"。
    */
   executeExperiment: async (code: string, timeout = 300) => {
     const res = await fetch(`${API_BASE}/api/quantum/execute`, {
@@ -213,7 +391,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code, timeout }),
     });
-    return res.json();
+    const payload = await res.json();
+    if (isQueuedJob(payload)) {
+      const job = await waitForQuantumJob(payload.job_id, { timeoutMs: timeout * 1000 });
+      return flattenQuantumJob(payload, job);
+    }
+    return payload;
   },
 
   /**
@@ -265,12 +448,14 @@ export const api = {
   // ── Jobs (Microservice Mode) ─────────────────────────────────────────────────
 
   /**
-   * Run experiment code via Quantum microservice (synchronous)
-   * Uses POST /api/quantum/execute - execution is synchronous, returns result directly
+   * Run experiment code via Quantum microservice.
+   * 阶段 19：`/execute` 默认 producer 语义（立刻回 queued），这里负责轮询到终态，
+   * 因此调用方仍按"同步返回结果"来用；`onProgress` 可选，用于排队/运行中的提示。
    */
   runExperiment: async (code: string, options?: {
     taskId?: string;
     timeout?: number;
+    onProgress?: (job: QuantumJobState) => void;
   }): Promise<{
     task_id: string;
     status: string;
@@ -278,14 +463,21 @@ export const api = {
     stderr: string;
     error: string;
     result?: unknown;
+    job_id?: string;
+    run_id?: string;
+    trace_id?: string;
+    dataset_ids?: number[];
+    dataset_source?: string;
+    execute_mode?: string;
   }> => {
+    const timeout = options?.timeout || 300;
     const res = await fetch(`${API_BASE}/api/quantum/execute`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         code,
         task_id: options?.taskId || `task_${Date.now()}`,
-        timeout: options?.timeout || 300,
+        timeout,
       }),
     });
 
@@ -294,12 +486,30 @@ export const api = {
       throw new Error(errorData.error || `Execution failed: HTTP ${res.status}`);
     }
 
-    return res.json();
+    const payload = await res.json();
+
+    // producer 语义：排队成功但没有结果 —— 轮询到终态再返回
+    if (isQueuedJob(payload)) {
+      const job = await waitForQuantumJob(payload.job_id, {
+        timeoutMs: timeout * 1000,
+        onProgress: options?.onProgress,
+      });
+      return flattenQuantumJob(payload as Record<string, unknown>, job) as {
+        task_id: string;
+        status: string;
+        stdout: string;
+        stderr: string;
+        error: string;
+        result?: unknown;
+      };
+    }
+
+    return payload;
   },
 
   /**
    * Run experiment with polling (for backwards compatibility)
-   * In microservice mode, execution is synchronous so polling completes immediately
+   * 走 `runExperiment`，它内部已经把 queued 轮询到终态，这里只做旧格式转换。
    */
   runAsync: async (code: string, options?: {
     plotCommand?: string;
@@ -341,7 +551,8 @@ export const api = {
   },
 
   /**
-   * Wait for job result - in microservice mode this returns immediately
+   * Wait for legacy Express job result (`GET /job/{id}`).
+   * 微服务作业请用 `waitForQuantumJob`（`/api/quantum/jobs/{id}`）；这里保留给老接口。
    */
   waitForJob: async (jobId: string, onProgress?: (job: JobResult) => void): Promise<JobResult> => {
     // Validate jobId
@@ -505,6 +716,58 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
     return res.json();
   },
 
+  // ── 硬件通道（task_queue lane）────────────────────────────────────────────
+  // 一次拿到：谁占着通道、排队中的流程（带位置）、排队中的实验数
+  //
+  // 走 Express 代理（/api/tasks/lane）。但 Express 是「改了源文件要手动重启」的服务，
+  // 而 Next dev server 会热更新——于是经常出现「前端已经是新版、Express 还是老版」，
+  // 代理路由 404 会返回 HTML，直接 res.json() 会抛 "Unexpected token '<'"。
+  // 所以这里带一个直连兜底：task_queue 每个响应都带 Access-Control-Allow-Origin: *，
+  // GET 属于简单请求，不需要预检，浏览器可以直连。
+
+  getLane: async (): Promise<LaneSnapshot> => {
+    if (!laneProxyMissing) {
+      try {
+        const res = await fetch(`${API_BASE}/api/tasks/lane`, { cache: "no-store" });
+        const ct = res.headers.get("content-type") || "";
+        if (res.ok && ct.includes("application/json")) {
+          return await res.json();
+        }
+        // 404 + text/html → Express 还没加载这条代理路由，之后直接走直连
+        if (res.status === 404) laneProxyMissing = true;
+      } catch {
+        /* 网络层失败也走兜底 */
+      }
+    }
+    const direct = await fetch(queueDirectUrl("/lane"), { cache: "no-store" });
+    if (!direct.ok) throw new Error(`task_queue /lane HTTP ${direct.status}`);
+    return direct.json();
+  },
+
+  releaseLease: async (leaseId: string) => {
+    const body = JSON.stringify({ lease_id: leaseId });
+    if (!laneProxyMissing) {
+      try {
+        const res = await fetch(`${API_BASE}/api/tasks/lease/release`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+        if (res.ok) return res.json();
+        if (res.status === 404) laneProxyMissing = true;
+      } catch {
+        /* fall through to direct */
+      }
+    }
+    // 直连时用 text/plain 规避 CORS 预检（服务端只按 Content-Length 读 body，不看类型）
+    const direct = await fetch(queueDirectUrl("/lease/release"), {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body,
+    });
+    return direct.json();
+  },
+
   runNode: async (node: WorkflowNode, context: Record<string, string>) => {
     const res = await fetch(`${API_BASE}/api/run-node`, {
       method: "POST",
@@ -515,26 +778,33 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
   },
 
   // ── Workflow Persistence ─────────────────────────────────────────────────
+  // 存档统一是 `.qwf` 文本（服务端 data/workflows/*.qwf）：
+  // 列表 → GET /api/workflows；读 → GET /api/workflows/:id；
+  // 存 → POST/PUT /api/workflows（服务端把画布转成 .qwf 再落盘）。
 
   listSavedWorkflows: async () => {
     const res = await fetch(`${API_BASE}/api/workflows`);
-    return res.json();
+    const data = await res.json();
+    // 服务端返回 { ok, workflows: [...] }；老代码期望的是数组
+    return Array.isArray(data) ? data : (data?.workflows ?? []);
   },
 
   getWorkflow: async (id: string) => {
-    const res = await fetch(`${API_BASE}/api/workflows/${id}`);
+    const res = await fetch(`${API_BASE}/api/workflows/${encodeURIComponent(id)}`);
     return res.json();
   },
 
   saveWorkflow: async (data: {
     id?: string;
-    name: string;
-    nodes: WorkflowNode[];
-    edges: Array<{ id: string; source: string; target: string }>;
-    settings?: Record<string, unknown>;
+    name?: string;
+    nodes: unknown[];
+    edges: unknown[];
+    context?: Record<string, unknown>;
+    workflow?: Record<string, unknown>;
+    baseIr?: unknown;
   }) => {
     const method = data.id ? "PUT" : "POST";
-    const url = data.id ? `${API_BASE}/api/workflows/${data.id}` : `${API_BASE}/api/workflows`;
+    const url = data.id ? `${API_BASE}/api/workflows/${encodeURIComponent(data.id)}` : `${API_BASE}/api/workflows`;
     const res = await fetch(url, {
       method,
       headers: { "Content-Type": "application/json" },
@@ -544,7 +814,75 @@ print(f"readout_fidelity=0.95 t1=2500.0 gate_fidelity=0.992")
   },
 
   deleteWorkflow: async (id: string) => {
-    const res = await fetch(`${API_BASE}/api/workflows/${id}`, { method: "DELETE" });
+    const res = await fetch(`${API_BASE}/api/workflows/${encodeURIComponent(id)}`, { method: "DELETE" });
+    return res.json();
+  },
+
+  // ── `.qwf` 文本工作流 DSL（见 docs/DSL_DESIGN.md）─────────────────────────
+
+  /** 列出服务端的 `.qwf` 示例（data/workflows/examples/*.qwf）。 */
+  listQwfExamples: async (includeText = false) => {
+    const res = await fetch(`${API_BASE}/api/workflow/qwf_examples`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ includeText }),
+    });
+    return res.json();
+  },
+
+  /** `.qwf` 文本 → 画布节点图（返回 { ok, canvas, ir, qwf }）。 */
+  qwfToCanvas: async (payload: { text?: string; path?: string }) => {
+    const res = await fetch(`${API_BASE}/api/workflow/qwf_to_canvas`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return res.json();
+  },
+
+  /** 画布节点图 → `.qwf` 文本（返回 { ok, ir, qwf, equivalent, diff }）。 */
+  canvasToQwf: async (payload: {
+    id?: string;
+    name?: string;
+    nodes: unknown[];
+    edges: unknown[];
+    context?: Record<string, unknown>;
+    workflow?: Record<string, unknown>;
+    baseIr?: unknown;
+  }) => {
+    const res = await fetch(`${API_BASE}/api/workflow/canvas_to_qwf`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return res.json();
+  },
+
+  /** 单条 IR 语句 → `.qwf` 片段（节点详情页的 "DSL" 标签页用）。 */
+  stmtToQwf: async (stmt: unknown) => {
+    const res = await fetch(`${API_BASE}/api/workflow/stmt_to_qwf`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stmt }),
+    });
+    return res.json();
+  },
+
+  /**
+   * 运行 IR（画布的统一运行入口）。
+   * 返回 { ok, workflowId, status, dryRun, irHash, warnings }；
+   * 进度用 `waitForWorkflow` 轮询（节点名 = IR 语句的 `as` 别名）。
+   */
+  runIr: async (payload: {
+    ir: unknown;
+    context?: Record<string, unknown>;
+    dryRun?: boolean;
+  }) => {
+    const res = await fetch(`${API_BASE}/api/workflow/run_ir`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
     return res.json();
   },
 

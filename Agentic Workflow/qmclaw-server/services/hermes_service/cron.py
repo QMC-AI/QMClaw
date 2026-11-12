@@ -629,6 +629,8 @@ def _execute_quantum_job(job: CronJob) -> dict:
 
     payload = {
         "prompt": job.prompt,
+        # 阶段 16a：/execute 默认异步（回 job_id）；cron 需要一个同步结果才能落日志
+        "wait": True,
     }
 
     # 如果指定了量子比特，加入参数

@@ -29,7 +29,7 @@
     },
     "session": {
       "default_user": "LQHL",
-      "default_path": ["test", "20260324"]
+      "default_path": ["test", "20251103_LD_SQ"]
     },
     "paths": {
       "measure_scripts": null,
