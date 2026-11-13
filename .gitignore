@@ -137,7 +137,9 @@ auth.lock
 /deepagents_cli/
 /lqcs_deploy/
 /measure_scripts/
-/skills/
+/skills/*
+!/skills/qmclaw-service-endpoints/
+!/skills/qubit-contrast-tuning/
 /state.db*
 /.tmp_*/
 /.deploy-logs/
